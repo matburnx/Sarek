@@ -86,8 +86,10 @@ let verify_results result expected =
   let size = Array.length exp_a in
   let epsilon = 0.001 in
   let errors = ref 0 in
-  find_mismatch res_a exp_a size epsilon errors ||
-  find_mismatch res_b exp_b size epsilon errors
+  let err_a = find_mismatch res_a exp_a size epsilon errors in
+  errors := 0;
+  let err_b = find_mismatch res_b exp_b size epsilon errors in
+  err_a && err_b
 
 let run_test dev size block_size =
   (* Standard runtime path for all devices *)
