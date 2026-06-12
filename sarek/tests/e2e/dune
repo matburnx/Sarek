@@ -55,6 +55,8 @@
 
 (executables
  (names
+  test_matrix_power
+  test_dft
   test_vector_add
   test_module_const
   test_ktype_record
@@ -92,6 +94,8 @@
   test_inline_pragma
   test_nested_types)
  (modules
+  test_matrix_power
+  test_dft
   test_vector_add
   test_module_const
   test_ktype_record
@@ -142,11 +146,13 @@
  (preprocess
   (pps sarek_ppx))
  (flags
-  (:standard -w -32-33-34-69)))
+  (:standard -w -26-27-32-33-34-69)))
 
 (alias
  (name runtest)
  (deps
+  test_matrix_power.exe
+  test_dft.exe
   test_vector_add.exe
   test_module_const.exe
   test_ktype_record.exe
