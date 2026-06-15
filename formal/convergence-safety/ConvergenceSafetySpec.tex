@@ -50,14 +50,18 @@ We give a formal specification of the convergence-safety analysis pass in
 OCaml GPU DSL. The analysis tracks an \emph{execution mode} ($\Converged$ or
 $\Diverged$) through an abstract expression type and collects barrier errors
 when a synchronisation point is reached inside diverged control flow.
-We prove twenty properties: five join-semilattice laws for the dimension-usage
-monoid, one homomorphism law for sequential composition, six T1 safety
-theorems about the mode-tracking state machine (including the F-01
-\texttt{ESuperstep} outer-diverged error property), three T2-WARP theorems
-for warp-collective safety (F-03), one T2-RETURN compositionality theorem
-for early-return barrier-skip (\texttt{EReturn}), and four T1 theorems
-for the env-threaded model introduced in T2-F02 to handle let-alias
-variability propagation.
+We prove 68 properties across the T1--T3 proof ladder: five join-semilattice
+laws for the dimension-usage monoid, one homomorphism law for sequential
+composition, six T1 safety theorems about the mode-tracking state machine
+(including the F-01 \texttt{ESuperstep} outer-diverged error property), three
+T2-WARP theorems for warp-collective safety (F-03), one T2-RETURN
+compositionality theorem for early-return barrier-skip (\texttt{EReturn}),
+four T1 theorems for the env-threaded model (T2-F02 let-alias variability),
+and 48 T3-SEMANTIC theorems grounding the checker in a fuel-indexed big-step
+evaluator with barrier traces (including \texttt{eval\_check\_uniform},
+\texttt{check\_env\_sound\_core}, \texttt{warp\_safe}, and the F-04
+\texttt{has\_varying\_return} / \texttt{hazard\_checker\_sound} extension).
+All theorems carry 0~admitted axioms; verified by \texttt{coqchk}.
 \end{abstract}
 
 %───────────────────────────────────────────────────────────────────────────────
@@ -108,11 +112,27 @@ variability propagation.
         (F-02, \cref{thm:env-check-let-alias-catches}).
 \end{enumerate}
 
-\subsection*{Out of scope (T2/T3)}
+\subsection*{T3 --- Uniformity soundness (ConvergenceSemantics.v)}
 
-Semantic soundness of \texttt{is\_varying} (needs $\texttt{texpr}$ execution
-semantics) and deadlock freedom (needs lockstep execution model).
+\begin{enumerate}
+  \item[\textbf{T3}] Non-varying expressions evaluate uniformly across thread ids
+        and variable environments (\cref{thm:not-varying-uniform}).
+  \item[\textbf{T3}] Closed non-varying expressions are fully uniform across all
+        thread ids and environments (\cref{thm:closed-uniform}).
+  \item[\textbf{T3}] Barrier-free, superstep-free expressions produce no
+        $\mathsf{EvBarrier}$ event at runtime
+        (\cref{thm:barrier-free-no-barriers}).
+  \item[\textbf{T3}] Diverged-clean, superstep-free expressions produce no
+        $\mathsf{EvBarrier}$ event at runtime --- the T1 flagship theorem acquires
+        semantic content (\cref{cor:diverged-clean-no-barriers}).
+\end{enumerate}
+
+\subsection*{Out of scope}
+
+Deadlock freedom (needs lockstep execution model).
 Warp divergence errors are now in scope (T2-WARP, \cref{thm:warp-diverged-error}).
+Semantic soundness of \texttt{is\_varying} via eval semantics is now in scope
+(T3-S2, \cref{thm:not-varying-uniform,thm:closed-uniform}).
 
 %───────────────────────────────────────────────────────────────────────────────
 \section{Notation and types}
@@ -509,6 +529,41 @@ control flow exits the function at this point.
   $\Converged$ mode.
 \end{theorem}
 
+\subsection{T3-S2 --- Uniformity soundness of \texttt{is\_strongly\_uniform}}
+\label{sec:uniformity-props}
+
+The big-step evaluator $\mathtt{eval}(\mathit{vary\_val},\,\mathit{fuel},\,t,\,\rho,\,e)$
+is defined in \texttt{ConvergenceSemantics.v} with a fuel parameter ensuring
+totality. $\mathtt{is\_strongly\_uniform}(\mathit{env},\,e)$ is a semantically
+correct uniformity predicate that, unlike $\mathtt{is\_varying\_in\_env}$, also
+requires the binding expression of $\mathsf{ELet}$ to be uniform.
+
+\begin{theorem}[Non-varying implies uniform evaluation (T3-S2)]
+  \label{thm:not-varying-uniform}
+  For all $\mathit{vary\_val}$, $\mathit{fuel}$, $\mathit{env}$, $e$, $t_1$,
+  $t_2$, $\rho_1$, $\rho_2$, if
+  $\mathtt{env\_agrees}(\mathit{env},\,\rho_1,\,\rho_2) = \mathsf{true}$ and
+  $\mathtt{is\_strongly\_uniform}(\mathit{env},\,e) = \mathsf{true}$, then
+  \[
+    \mathtt{eval}(\mathit{vary\_val},\,\mathit{fuel},\,t_1,\,\rho_1,\,e)
+    = \mathtt{eval}(\mathit{vary\_val},\,\mathit{fuel},\,t_2,\,\rho_2,\,e).
+  \]
+  ($\mathtt{env\_agrees}(\mathit{env},\,\rho_1,\,\rho_2)$ requires that all
+  variables marked uniform in $\mathit{env}$ map to the same value in $\rho_1$
+  and $\rho_2$.)
+\end{theorem}
+
+\begin{corollary}[Closed non-varying expressions are fully uniform (T3-S2)]
+  \label{thm:closed-uniform}
+  For all $e$, $\mathit{vary\_val}$, $\mathit{fuel}$, $t_1$, $t_2$, $\rho_1$,
+  $\rho_2$, if $\mathtt{is\_var\_free}(e) = \mathsf{true}$ and
+  $\isvarying{e} = \mathsf{false}$, then
+  \[
+    \mathtt{eval}(\mathit{vary\_val},\,\mathit{fuel},\,t_1,\,\rho_1,\,e)
+    = \mathtt{eval}(\mathit{vary\_val},\,\mathit{fuel},\,t_2,\,\rho_2,\,e).
+  \]
+\end{corollary}
+
 %───────────────────────────────────────────────────────────────────────────────
 \section{Env-threaded model}
 \label{sec:envthreaded}
@@ -620,6 +675,157 @@ projects to the abstract \texttt{error} type.
 \texttt{WarpConvergence} error class is now in scope as $\mathsf{EWarpPoint}$
 (T2-WARP); \texttt{TEReturn} is now in scope as $\mathsf{EReturn}$
 (T2-RETURN); see type-correspondence table.)
+
+%───────────────────────────────────────────────────────────────────────────────
+\section{T3-S3 --- Trace silence of barrier-free expressions}
+\label{sec:trace-silence}
+
+This section grounds the predicate $\barrierfree{e}$ in the execution semantics:
+a barrier-free, superstep-free expression produces no $\mathsf{EvBarrier}$ event
+at runtime.  The superstep-free side condition is necessary because
+$\mathsf{ESuperstep}$ emits an implicit $\mathsf{EvBarrier}$ event regardless of
+the divergent flag $b$, even when $\barrierfree{\mathsf{ESuperstep}(b,\_,\_)}$
+holds.  The semantic treatment of $\mathsf{ESuperstep}$ is deferred to T3-S6.
+
+\begin{definition}[$\mathtt{no\_barrier\_event}(\mathit{tr})$]
+\label{def:no-barrier-event}
+A Boolean predicate on traces:
+\[
+  \mathtt{no\_barrier\_event}(\mathit{tr}) = \mathsf{true}
+  \;\iff\;
+  \mathsf{EvBarrier} \notin \mathit{tr}.
+\]
+Defined by scanning each event: $\mathtt{no\_barrier\_event}([]) = \mathsf{true}$;
+$\mathtt{no\_barrier\_event}(\mathsf{EvBarrier} :: \_) = \mathsf{false}$;
+$\mathtt{no\_barrier\_event}(\mathsf{EvWarp} :: \mathit{tr'}) = \mathtt{no\_barrier\_event}(\mathit{tr'})$.
+\end{definition}
+
+\begin{definition}[$\mathtt{superstep\_free}(e)$]
+\label{def:superstep-free}
+A structural Boolean predicate: $\mathtt{superstep\_free}(e) = \mathsf{true}$
+iff $e$ contains no $\mathsf{ESuperstep}$ sub-expression.
+\end{definition}
+
+\begin{lemma}[Barrier-event concatenation]
+  \label{lem:no-barrier-app}
+  For all $\mathit{tr}_1$, $\mathit{tr}_2$:
+  \[
+    \mathtt{no\_barrier\_event}(\mathit{tr}_1) = \mathsf{true}
+    \;\land\;
+    \mathtt{no\_barrier\_event}(\mathit{tr}_2) = \mathsf{true}
+    \;\Rightarrow\;
+    \mathtt{no\_barrier\_event}(\mathit{tr}_1 \mathbin{++} \mathit{tr}_2) = \mathsf{true}.
+  \]
+\end{lemma}
+
+\begin{theorem}[Barrier-free implies no barrier events (T3-S3)]
+  \label{thm:barrier-free-no-barriers}
+  For all $\mathit{vary\_val}$, $\mathit{fuel}$, $t$, $\rho$, $e$, $o$, $\mathit{tr}$:
+  \[
+    \barrierfree{e} = \mathsf{true}
+    \;\land\;
+    \mathtt{superstep\_free}(e) = \mathsf{true}
+    \;\land\;
+    \mathtt{eval}(\mathit{vary\_val},\,\mathit{fuel},\,t,\,\rho,\,e)
+      = \mathsf{Some}(o,\,\mathit{tr})
+    \;\Rightarrow\;
+    \mathtt{no\_barrier\_event}(\mathit{tr}) = \mathsf{true}.
+  \]
+  A barrier-free, superstep-free expression cannot produce any
+  $\mathsf{EvBarrier}$ event at runtime.  Proved by structural induction on $e$
+  with a nested fuel induction for $\mathsf{EWhile}$.
+\end{theorem}
+
+\begin{corollary}[Diverged-clean implies no barrier events (T3-S3)]
+  \label{cor:diverged-clean-no-barriers}
+  For all $\mathit{vary\_val}$, $\mathit{fuel}$, $t$, $\rho$, $e$, $o$, $\mathit{tr}$:
+  \[
+    \chk{\Diverged}{e} = []
+    \;\land\;
+    \mathtt{superstep\_free}(e) = \mathsf{true}
+    \;\land\;
+    \mathtt{eval}(\mathit{vary\_val},\,\mathit{fuel},\,t,\,\rho,\,e)
+      = \mathsf{Some}(o,\,\mathit{tr})
+    \;\Rightarrow\;
+    \mathtt{no\_barrier\_event}(\mathit{tr}) = \mathsf{true}.
+  \]
+  Follows from \cref{thm:barrier-free-no-barriers} via the T1 flagship theorem
+  $\chk{\Diverged}{e} = [] \iff \barrierfree{e} = \mathsf{true}$
+  (\cref{thm:div-clean}), which now acquires semantic content.
+\end{corollary}
+
+%───────────────────────────────────────────────────────────────────────────────
+\section{T3-S8 --- Extraction and differential conformance of the semantics}
+\label{sec:t3s8-extraction}
+
+The static checkers ($\isvarying{\cdot}$, $\barrierfree{\cdot}$, $\chk{m}{\cdot}$,
+$\mathtt{check\_warp}$) are extracted to OCaml
+(\texttt{extraction/ConvergenceModel.ml}) and differentially tested against an
+inline reference (\texttt{test\_convergence\_extraction.ml}).  T3-S8 closes the
+\emph{operational} half of the CMBT chain by extracting the big-step evaluator
+itself.
+
+\begin{definition}[Concrete evaluator]
+  \label{def:eval-concrete}
+  $\mathtt{eval\_concrete}(\mathit{fuel},\,t,\,\rho,\,e) \;:=\;
+   \mathtt{eval}(\lambda\,\mathit{th}.\;\mathit{th},\,\mathit{fuel},\,t,\,\rho,\,e)$,
+  i.e.\ the fuel-indexed evaluator with the abstract per-thread varying value
+  $\mathit{vary\_val}$ instantiated as the identity.  Identity is
+  \emph{maximally discriminating}: distinct thread ids receive distinct
+  $\mathsf{EVary}$ values, so any thread-dependent control-flow divergence is
+  observable in the extracted traces.  All section theorems quantify over every
+  $\mathit{vary\_val}$, so they hold for this instantiation a fortiori.
+\end{definition}
+
+\begin{lemma}[Fuel monotonicity of the concrete evaluator (T3-S8)]
+  \label{lem:eval-concrete-fuel-monotone}
+  For all $n$, $t$, $\rho$, $e$, $r$:
+  \[
+    \mathtt{eval\_concrete}(n,\,t,\,\rho,\,e) = \mathsf{Some}(r)
+    \;\Rightarrow\;
+    \mathtt{eval\_concrete}(\mathsf{S}\,n,\,t,\,\rho,\,e) = \mathsf{Some}(r).
+  \]
+  Mirrored by the QCheck property \texttt{sem:eval\_fuel\_monotone}.
+\end{lemma}
+
+\begin{lemma}[Barrier silence of the concrete evaluator (T3-S8)]
+  \label{lem:eval-concrete-barrier-free-silent}
+  For all $\mathit{fuel}$, $t$, $\rho$, $e$, $o$, $\mathit{tr}$:
+  \[
+    \mathtt{superstep\_free}(e) = \mathsf{true}
+    \;\land\;
+    \barrierfree{e} = \mathsf{true}
+    \;\land\;
+    \mathtt{eval\_concrete}(\mathit{fuel},\,t,\,\rho,\,e) = \mathsf{Some}(o,\,\mathit{tr})
+    \;\Rightarrow\;
+    \mathtt{no\_barrier\_event}(\mathit{tr}) = \mathsf{true}.
+  \]
+  Mirrored by the QCheck property \texttt{sem:barrier\_free\_silent}.
+\end{lemma}
+
+\paragraph{Differential properties.}
+The suite \texttt{test\_convergence\_semantics.ml} runs four randomized
+properties against the extracted $\mathtt{eval\_concrete}$:
+\begin{enumerate}
+  \item \texttt{sem:eval\_fuel\_monotone} ---
+        \cref{lem:eval-concrete-fuel-monotone} over random $(\mathit{fuel},t,e)$.
+  \item \texttt{sem:barrier\_free\_silent} ---
+        \cref{lem:eval-concrete-barrier-free-silent} over random $(t,e)$.
+  \item \texttt{sem:differential\_barrier\_safe} --- the CMBT instance of the
+        core-fragment soundness theorem (T3-S4): for $e$ in the core fragment
+        with $\mathtt{check\_env}(\Converged,\,[],\,e) = []$, the barrier projections
+        $\mathtt{erase\_warp}(\mathit{tr_1}) = \mathtt{erase\_warp}(\mathit{tr_2})$
+        of two distinct threads' traces agree.
+  \item \texttt{sem:f04\_hazard\_counterexample} --- the F-04 regression: the
+        hazard $\mathsf{ESeq}\,[\mathsf{EIf}\,\mathsf{EVary}\,(\mathsf{EReturn}\,\mathsf{ELit})\,\mathsf{ELit};\;\mathsf{EBarrier}]$
+        passes the checker yet its barrier traces \emph{differ} across threads
+        (thread $0$ falls through to the barrier, thread $1$ early-returns),
+        confirming the counterexample is real in the operational semantics.
+\end{enumerate}
+
+The extraction plugin and OCaml compiler remain in the trusted computing base;
+the differential suites corroborate --- but do not prove --- the fidelity of the
+extracted code to the Rocq source.  See \texttt{ASSUMPTIONS.md} \S T3-S8.
 
 %───────────────────────────────────────────────────────────────────────────────
 \section{References}
