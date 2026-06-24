@@ -57,6 +57,7 @@
  (names
   test_matrix_power
   test_dft
+  test_dft64
   test_vector_add
   test_module_const
   test_ktype_record
@@ -96,6 +97,7 @@
  (modules
   test_matrix_power
   test_dft
+  test_dft64
   test_vector_add
   test_module_const
   test_ktype_record
@@ -146,13 +148,14 @@
  (preprocess
   (pps sarek_ppx))
  (flags
-  (:standard -w -26-27-32-33-34-69)))
+  (:standard -w -26-33-34-69)))
 
 (alias
  (name runtest)
  (deps
   test_matrix_power.exe
   test_dft.exe
+  test_dft64.exe
   test_vector_add.exe
   test_module_const.exe
   test_ktype_record.exe
