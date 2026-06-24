@@ -4,7 +4,7 @@
 (******************************************************************************)
 
 (******************************************************************************
- * E2E test for Sarek PPX - Discrete Fourier Transform
+ * E2E test for Sarek PPX - Discrete Fourier Transform in float64
  *
  * This test verifies that kernels compiled with the PPX can generate valid
  * GPU code and execute correctly via the GPU runtime.
@@ -30,48 +30,25 @@ let vector_dft =
         (size : int)
         (n : int) ->
         let open Sarek_float64 in
-        let open Std in
         let tid = global_thread_id in
-          if tid < n then begin
-          for i = 0 to size - 1 do
-            c.(tid) <- c.(tid) +. a.(i);
-            d.(tid) <- d.(tid) -. b.(i);
-            (*
-            *)
-          done;
-        end
-        (*
-        let tid = global_thread_id in
-          if tid < n then begin
-          let pi = float_of_int 4 *. Float64.atan(float_of_int 1) in
-          let value = float_of_int 2 *. pi *. float_of_int tid /. float_of_int n in
-          for i = 0 to size - 1 do
-            let angle = value *. float_of_int i in 
-            c.(tid) <- c.(tid) +. a.(i) *. Float64.cos(angle);
-            d.(tid) <- d.(tid) -. b.(i) *. Float64.sin(angle);
-            (*
-            *)
-          done;
-        end
-        *)
-        (*
-        let tid = global_thread_id in
+        
         if tid < n then begin
-          (*
-          let pi = Float64.mul_float64 (Float64.of_int32 4l) (Float64.atan(Float64.of_int32 1l)) in
-          let value = Float64.mul_float64 (Float64.of_int32 2l) (Float64.mul_float64 pi (Float64.div_float64 (Float64.of_int32 tid) (Float64.of_int32 n))) in
-          for i = 0 to size - 1l do
-            let angle = Float64.mul_float64 value (Float64.of_int32 i) in
-            c.(tid) <- Float64.add_float64 c.(tid) (Float64.mul_float64 a.(i) (Float64.cos(angle)));
-            d.(tid) <- Float64.sub_float64 d.(tid) (Float64.mul_float64 b.(i) (Float64.sin(angle)));
-          done
-          c.(tid) <- Float64.of_int32 0;
-          d.(tid) <- Float64.of_int32 0;
-          *)
-          c.(tid) <- float_of_int 0;
-          d.(tid) <- float_of_int 0;
+          let pi = Float64.of_int32 4l *. Float64.atan(Float64.of_int32 1l) in
+          let value = Float64.of_int32 2l *. pi *. Float64.of_int32 tid /. Float64.of_int32 n in
+
+          let sum_a = mut (Float64.of_int32 0l) in
+          let sum_b = mut (Float64.of_int32 0l) in
+
+          for i = 0 to size - 1 do
+            let angle = value *. Float64.of_int32 i in
+
+            sum_a := sum_a +. a.(i) *. Float64.cos angle;
+            sum_b := sum_b -. b.(i) *. Float64.sin angle;
+          done;
+
+          c.(tid) <- sum_a;
+          d.(tid) <- sum_b;
         end
-        *)
   ]
 
 
