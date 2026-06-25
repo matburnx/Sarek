@@ -58,6 +58,7 @@
   test_matrix_power
   test_dft
   test_dft64
+  test_saxpy
   test_vector_add
   test_module_const
   test_ktype_record
@@ -98,6 +99,7 @@
   test_matrix_power
   test_dft
   test_dft64
+  test_saxpy
   test_vector_add
   test_module_const
   test_ktype_record
@@ -156,6 +158,7 @@
   test_matrix_power.exe
   test_dft.exe
   test_dft64.exe
+  test_saxpy.exe
   test_vector_add.exe
   test_module_const.exe
   test_ktype_record.exe
