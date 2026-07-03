@@ -217,7 +217,9 @@ module Metal : Framework_sig.PLUGIN_BASE = struct
       | ArgFloat32 of {value : float; idx : int}
       | ArgFloat64 of {value : float; idx : int}
 
-    type args = arg list ref
+    (* Indexed by idx (last-set-wins) instead of accumulated by call order:
+       see Spoc_framework.Kernel_args. *)
+    type args = arg Spoc_framework.Kernel_args.t
 
     (* Cache: key -> compiled kernel *)
     let cache : (string, t) Hashtbl.t = Hashtbl.create 16
@@ -229,12 +231,18 @@ module Metal : Framework_sig.PLUGIN_BASE = struct
       {library; pipeline; function_name = name; device_id = device.id}
 
     let compile_cached device ~name ~source =
+      (* Cache key must include device ID and the kernel/entry name - a
+         source file may define more than one kernel, and a resolved kernel
+         handle for one name must never be returned for another (see
+         Compile_cache.mli). Delegates to the shared, collision-resistant
+         key builder used by CUDA/Vulkan instead of hand-rolling a
+         delimiter-unsafe Printf.sprintf join. *)
       let key =
-        Printf.sprintf
-          "%d:%s:%s"
-          device.Metal_api.Device.id
-          name
-          (Digest.string source |> Digest.to_hex)
+        Spoc_framework.Compile_cache.make_key
+          ~device:(string_of_int device.Metal_api.Device.id)
+          ~name
+          ~source
+          ()
       in
       match Hashtbl.find_opt cache key with
       | Some k -> k
@@ -254,21 +262,25 @@ module Metal : Framework_sig.PLUGIN_BASE = struct
     let load_from_ptx ~name:_ ~ptx:_ =
       Metal_error.raise_error (Metal_error.feature_not_supported "PTX kernels")
 
-    let create_args () = ref []
+    let create_args () = Spoc_framework.Kernel_args.create ()
 
     let set_arg_buffer args idx buf =
-      args :=
-        ArgBuffer {buf = buf.Memory.buf.Metal_api.Memory.handle; idx} :: !args
+      Spoc_framework.Kernel_args.set
+        args
+        idx
+        (ArgBuffer {buf = buf.Memory.buf.Metal_api.Memory.handle; idx})
 
-    let set_arg_int32 args idx value = args := ArgInt32 {value; idx} :: !args
+    let set_arg_int32 args idx value =
+      Spoc_framework.Kernel_args.set args idx (ArgInt32 {value; idx})
 
-    let set_arg_int64 args idx value = args := ArgInt64 {value; idx} :: !args
+    let set_arg_int64 args idx value =
+      Spoc_framework.Kernel_args.set args idx (ArgInt64 {value; idx})
 
     let set_arg_float32 args idx value =
-      args := ArgFloat32 {value; idx} :: !args
+      Spoc_framework.Kernel_args.set args idx (ArgFloat32 {value; idx})
 
     let set_arg_float64 args idx value =
-      args := ArgFloat64 {value; idx} :: !args
+      Spoc_framework.Kernel_args.set args idx (ArgFloat64 {value; idx})
 
     let set_arg_ptr _args _idx _ptr =
       Metal_error.raise_error
@@ -281,17 +293,34 @@ module Metal : Framework_sig.PLUGIN_BASE = struct
         match stream with Some s -> s.Stream.queue | None -> state.queue
       in
 
-      (* Convert args to Metal_api.Kernel.arg format *)
+      (* KNOWN GAP: Metal compiled-kernel handles carry no arity metadata, so
+         -- as with Native/CUDA -- expected_count falls back to the number
+         of distinct indices actually set. This still rejects internal
+         gaps/duplicates but cannot catch a caller that consistently omits a
+         trailing argument. *)
+      let expected_count = Spoc_framework.Kernel_args.count args in
+      let ordered_args =
+        match
+          Spoc_framework.Kernel_args.validate_and_extract args ~expected_count
+        with
+        | Ok arr -> arr
+        | Error reason ->
+            Metal_error.raise_error
+              (Metal_error.kernel_launch_failed kernel.function_name reason)
+      in
+      (* Convert to Metal_api.Kernel.arg format. Metal_api.Kernel.execute
+         binds each element of this list to its *position* in the list
+         (atIndex:), so ordering here -- by idx, via validate_and_extract --
+         is what makes the binding correct, not the arg's embedded idx
+         field. *)
       let metal_args =
-        List.map
-          (function
-            | ArgBuffer {buf; idx = _} -> Metal_api.Kernel.Buffer (buf, 0)
-            | ArgInt32 {value; idx = _} -> Metal_api.Kernel.Int32 value
-            | ArgInt64 {value; idx = _} -> Metal_api.Kernel.Int64 value
-            | ArgFloat32 {value; idx = _} -> Metal_api.Kernel.Float32 value
-            | ArgFloat64 {value; idx = _} -> Metal_api.Kernel.Float64 value)
-          !args
-        |> List.rev
+        Array.to_list ordered_args
+        |> List.map (function
+          | ArgBuffer {buf; idx = _} -> Metal_api.Kernel.Buffer (buf, 0)
+          | ArgInt32 {value; idx = _} -> Metal_api.Kernel.Int32 value
+          | ArgInt64 {value; idx = _} -> Metal_api.Kernel.Int64 value
+          | ArgFloat32 {value; idx = _} -> Metal_api.Kernel.Float32 value
+          | ArgFloat64 {value; idx = _} -> Metal_api.Kernel.Float64 value)
       in
 
       (* Calculate grid and block sizes *)

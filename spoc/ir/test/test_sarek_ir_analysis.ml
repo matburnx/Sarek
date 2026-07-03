@@ -377,6 +377,205 @@ let test_kernel_uses_float64_variants () =
 
   print_endline "  kernel_uses_float64 variants: OK"
 
+(** {1 is_atomic_intrinsic_name / expr_uses_atomics Tests} *)
+
+let test_is_atomic_intrinsic_name () =
+  assert (is_atomic_intrinsic_name "atomic_add_int32" = true) ;
+  assert (is_atomic_intrinsic_name "atomic_cas_int32" = true) ;
+  assert (is_atomic_intrinsic_name "atomic_add_global_int32" = true) ;
+  assert (is_atomic_intrinsic_name "thread_idx_x" = false) ;
+  assert (is_atomic_intrinsic_name "block_barrier" = false) ;
+  assert (is_atomic_intrinsic_name "" = false) ;
+  print_endline "  is_atomic_intrinsic_name: OK"
+
+let test_expr_uses_atomics () =
+  let non_atomic = EIntrinsic (["Gpu"], "thread_idx_x", []) in
+  assert (expr_uses_atomics non_atomic = false) ;
+  let direct_atomic =
+    EIntrinsic
+      ( [],
+        "atomic_add_int32",
+        [
+          EVar
+            {
+              var_name = "arr";
+              var_id = 0;
+              var_type = TInt32;
+              var_mutable = true;
+            };
+          EConst (CInt32 0l);
+          EConst (CInt32 1l);
+        ] )
+  in
+  assert (expr_uses_atomics direct_atomic = true) ;
+  (* Nested: atomic call buried inside an otherwise ordinary expression *)
+  let nested_atomic = EBinop (Add, EConst (CInt32 1l), direct_atomic) in
+  assert (expr_uses_atomics nested_atomic = true) ;
+  print_endline "  expr_uses_atomics: OK"
+
+(** {1 helper_uses_atomics / kernel_uses_atomics Tests} *)
+
+let test_helper_uses_atomics () =
+  let param : var =
+    {var_name = "x"; var_id = 0; var_type = TInt32; var_mutable = false}
+  in
+  let hf_atomic : helper_func =
+    {
+      hf_name = "bump";
+      hf_params = [param];
+      hf_ret_type = TInt32;
+      hf_body =
+        SReturn
+          (EIntrinsic ([], "atomic_add_int32", [EVar param; EConst (CInt32 1l)]));
+    }
+  in
+  assert (helper_uses_atomics hf_atomic = true) ;
+
+  let hf_no_atomic : helper_func =
+    {
+      hf_name = "identity";
+      hf_params = [param];
+      hf_ret_type = TInt32;
+      hf_body = SReturn (EVar param);
+    }
+  in
+  assert (helper_uses_atomics hf_no_atomic = false) ;
+  print_endline "  helper_uses_atomics: OK"
+
+let test_kernel_uses_atomics_direct () =
+  let k_direct : kernel =
+    {
+      kern_name = "test";
+      kern_params = [];
+      kern_locals = [];
+      kern_body =
+        SExpr
+          (EIntrinsic
+             ([], "atomic_add_int32", [EConst (CInt32 0l); EConst (CInt32 1l)]));
+      kern_types = [];
+      kern_variants = [];
+      kern_funcs = [];
+      kern_native_fn = None;
+    }
+  in
+  assert (kernel_uses_atomics k_direct = true) ;
+
+  let k_none : kernel =
+    {
+      kern_name = "test";
+      kern_params = [];
+      kern_locals = [];
+      kern_body = SEmpty;
+      kern_types = [];
+      kern_variants = [];
+      kern_funcs = [];
+      kern_native_fn = None;
+    }
+  in
+  assert (kernel_uses_atomics k_none = false) ;
+  print_endline "  kernel_uses_atomics direct: OK"
+
+let test_kernel_uses_atomics_in_helper () =
+  (* Load-bearing case: the atomic is only reachable through kern_funcs, not
+     kern_body. A body-only walk would wrongly report false. *)
+  let param : var =
+    {var_name = "x"; var_id = 0; var_type = TInt32; var_mutable = false}
+  in
+  let hf_atomic : helper_func =
+    {
+      hf_name = "bump";
+      hf_params = [param];
+      hf_ret_type = TInt32;
+      hf_body =
+        SReturn
+          (EIntrinsic ([], "atomic_add_int32", [EVar param; EConst (CInt32 1l)]));
+    }
+  in
+  let k_helper_atomic : kernel =
+    {
+      kern_name = "test";
+      kern_params = [];
+      kern_locals = [];
+      kern_body = SEmpty;
+      kern_types = [];
+      kern_variants = [];
+      kern_funcs = [hf_atomic];
+      kern_native_fn = None;
+    }
+  in
+  assert (kernel_uses_atomics k_helper_atomic = true) ;
+  print_endline "  kernel_uses_atomics via helper: OK"
+
+(** {1 lvalue_uses_atomics / SAssign lvalue Tests (finding 3)} *)
+
+let test_lvalue_uses_atomics () =
+  let atomic_idx =
+    EIntrinsic ([], "atomic_add_int32", [EConst (CInt32 0l); EConst (CInt32 1l)])
+  in
+  assert (
+    lvalue_uses_atomics
+      (LVar {var_name = "x"; var_id = 0; var_type = TInt32; var_mutable = true})
+    = false) ;
+  assert (lvalue_uses_atomics (LArrayElem ("arr", EConst (CInt32 0l))) = false) ;
+  assert (lvalue_uses_atomics (LArrayElem ("arr", atomic_idx)) = true) ;
+  assert (
+    lvalue_uses_atomics (LArrayElemExpr (EConst (CInt32 0l), atomic_idx)) = true) ;
+  assert (
+    lvalue_uses_atomics (LArrayElemExpr (atomic_idx, EConst (CInt32 0l))) = true) ;
+  assert (
+    lvalue_uses_atomics (LRecordField (LArrayElem ("arr", atomic_idx), "field"))
+    = true) ;
+  print_endline "  lvalue_uses_atomics: OK"
+
+(** Load-bearing case for finding 3: the only atomic in the kernel is inside an
+    [SAssign]'s lvalue index expression (e.g. [arr.(atomic_add ...) <- 5]), not
+    in the RHS. Pre-fix, [stmt_uses_atomics]'s [SAssign] case ignored the lvalue
+    entirely and only walked the RHS, so this wrongly returned false. *)
+let test_kernel_uses_atomics_in_assign_lvalue () =
+  let atomic_idx =
+    EIntrinsic ([], "atomic_add_int32", [EConst (CInt32 0l); EConst (CInt32 1l)])
+  in
+  let k_lvalue_atomic : kernel =
+    {
+      kern_name = "test";
+      kern_params = [];
+      kern_locals = [];
+      kern_body = SAssign (LArrayElem ("arr", atomic_idx), EConst (CInt32 5l));
+      kern_types = [];
+      kern_variants = [];
+      kern_funcs = [];
+      kern_native_fn = None;
+    }
+  in
+  assert (kernel_uses_atomics k_lvalue_atomic = true) ;
+  print_endline "  kernel_uses_atomics via assign lvalue: OK"
+
+(** {1 SNative conservative-atomics Tests (finding 4)} *)
+
+let dummy_native_gpu ~framework:_ = ""
+
+let dummy_native_ocaml : ocaml_closure =
+  {run = (fun ~block:_ ~grid:_ _args -> ())}
+
+let test_kernel_uses_atomics_snative () =
+  (* SNative is opaque inline GPU code; stmt_uses_atomics must treat it
+     conservatively as atomic-bearing rather than hard-coding "no atomics
+     here". Pre-fix this returned false unconditionally. *)
+  let k_native : kernel =
+    {
+      kern_name = "test";
+      kern_params = [];
+      kern_locals = [];
+      kern_body = SNative {gpu = dummy_native_gpu; ocaml = dummy_native_ocaml};
+      kern_types = [];
+      kern_variants = [];
+      kern_funcs = [];
+      kern_native_fn = None;
+    }
+  in
+  assert (kernel_uses_atomics k_native = true) ;
+  print_endline "  kernel_uses_atomics via SNative (conservative): OK"
+
 (** {1 Main} *)
 
 let () =
@@ -406,4 +605,12 @@ let () =
   test_kernel_uses_float64_params () ;
   test_kernel_uses_float64_types () ;
   test_kernel_uses_float64_variants () ;
+  test_is_atomic_intrinsic_name () ;
+  test_expr_uses_atomics () ;
+  test_helper_uses_atomics () ;
+  test_kernel_uses_atomics_direct () ;
+  test_kernel_uses_atomics_in_helper () ;
+  test_lvalue_uses_atomics () ;
+  test_kernel_uses_atomics_in_assign_lvalue () ;
+  test_kernel_uses_atomics_snative () ;
   print_endline "All Sarek_ir_analysis tests passed!"

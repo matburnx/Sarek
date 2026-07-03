@@ -351,183 +351,225 @@ and gen_binop = function
 
 and gen_unop = function Neg -> "-" | Not -> "!" | BitNot -> "~"
 
+(** GLSL has no [cbrt]/[hypot]/[expm1]/[log1p] builtins under any name (unlike
+    [fabs]/[rsqrt]/[atan2], which are simple renames — see
+    [Sarek_pure_registry.glsl_override_name]). These need a multi-token
+    expression instead of a function-name substitution, so they're special-cased
+    here ahead of both the unqualified match arms and the pure registry,
+    applying uniformly to qualified (Float32.cbrt) and unqualified calls alike.
+    [cbrt] uses [sign(x)*pow(abs(x),...)] rather than bare [pow] because GLSL's
+    [pow] is undefined for a negative base. *)
+and gen_glsl_polyfill buf name args =
+  match (name, args) with
+  | "cbrt", [x] ->
+      Buffer.add_string buf "(sign(" ;
+      gen_expr buf x ;
+      Buffer.add_string buf ") * pow(abs(" ;
+      gen_expr buf x ;
+      Buffer.add_string buf "), 1.0 / 3.0))"
+  | "hypot", [x; y] ->
+      Buffer.add_string buf "sqrt((" ;
+      gen_expr buf x ;
+      Buffer.add_string buf ") * (" ;
+      gen_expr buf x ;
+      Buffer.add_string buf ") + (" ;
+      gen_expr buf y ;
+      Buffer.add_string buf ") * (" ;
+      gen_expr buf y ;
+      Buffer.add_string buf "))"
+  | "expm1", [x] ->
+      Buffer.add_string buf "(exp(" ;
+      gen_expr buf x ;
+      Buffer.add_string buf ") - 1.0)"
+  | "log1p", [x] ->
+      Buffer.add_string buf "log(1.0 + (" ;
+      gen_expr buf x ;
+      Buffer.add_string buf "))"
+  | _ ->
+      Codegen_error.raise_error
+        (Codegen_error.unknown_intrinsic
+           (Printf.sprintf "%s (wrong arity for GLSL polyfill)" name))
+
 and gen_intrinsic buf path name args =
   let full_name =
     match path with [] -> name | _ -> String.concat "." path ^ "." ^ name
   in
-  (* For path-qualified intrinsics, query the pure registry first.
+  if List.mem name ["cbrt"; "hypot"; "expm1"; "log1p"] then
+    gen_glsl_polyfill buf name args
+  else
+    (* For path-qualified intrinsics, query the pure registry first.
      Float32.sin -> sin on GLSL (GLSL uses un-suffixed names). *)
-  let pure_registry_hit =
-    match path with
-    | [] -> None
-    | _ -> (
-        match
-          Sarek_pure_registry.fun_device_template ~module_path:path name
-        with
-        | Some f -> Some (f ~framework:"GLSL")
-        | None -> None)
-  in
-  match pure_registry_hit with
-  | Some device_name ->
-      Buffer.add_string buf device_name ;
-      Buffer.add_char buf '(' ;
-      List.iteri
-        (fun i e ->
-          if i > 0 then Buffer.add_string buf ", " ;
-          gen_expr buf e)
-        args ;
-      Buffer.add_char buf ')'
-  | None -> (
-      if
-        (* Try thread intrinsics *)
-        List.mem
-          name
-          [
-            "thread_id_x";
-            "thread_idx_x";
-            "thread_id_y";
-            "thread_idx_y";
-            "thread_id_z";
-            "thread_idx_z";
-            "block_id_x";
-            "block_idx_x";
-            "block_id_y";
-            "block_idx_y";
-            "block_id_z";
-            "block_idx_z";
-            "block_dim_x";
-            "block_dim_y";
-            "block_dim_z";
-            "grid_dim_x";
-            "grid_dim_y";
-            "grid_dim_z";
-            "global_thread_id";
-            "global_idx";
-            "global_idx_x";
-            "global_idx_y";
-            "global_idx_z";
-            "global_size";
-          ]
-      then Buffer.add_string buf (glsl_thread_intrinsic name)
-      else
-        (* Standard math intrinsics - GLSL versions *)
-        match name with
-        | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh"
-        | "tanh" | "exp" | "exp2" | "log" | "log2" | "sqrt" | "floor" | "ceil"
-        | "round" | "trunc" | "abs" ->
-            Buffer.add_string buf name ;
-            Buffer.add_char buf '(' ;
-            List.iteri
-              (fun i e ->
-                if i > 0 then Buffer.add_string buf ", " ;
-                gen_expr buf e)
-              args ;
-            Buffer.add_char buf ')'
-        | "fabs" ->
-            Buffer.add_string buf "abs" ;
-            Buffer.add_char buf '(' ;
-            List.iteri
-              (fun i e ->
-                if i > 0 then Buffer.add_string buf ", " ;
-                gen_expr buf e)
-              args ;
-            Buffer.add_char buf ')'
-        | "rsqrt" ->
-            Buffer.add_string buf "inversesqrt" ;
-            Buffer.add_char buf '(' ;
-            List.iteri
-              (fun i e ->
-                if i > 0 then Buffer.add_string buf ", " ;
-                gen_expr buf e)
-              args ;
-            Buffer.add_char buf ')'
-        | "atan2" | "pow" | "min" | "max" ->
-            Buffer.add_string buf name ;
-            Buffer.add_char buf '(' ;
-            List.iteri
-              (fun i e ->
-                if i > 0 then Buffer.add_string buf ", " ;
-                gen_expr buf e)
-              args ;
-            Buffer.add_char buf ')'
-        | "fma" ->
-            Buffer.add_string buf "fma" ;
-            Buffer.add_char buf '(' ;
-            List.iteri
-              (fun i e ->
-                if i > 0 then Buffer.add_string buf ", " ;
-                gen_expr buf e)
-              args ;
-            Buffer.add_char buf ')'
-        (* Barrier synchronization *)
-        | "block_barrier" -> Buffer.add_string buf "barrier()"
-        (* Atomic operations - GLSL uses atomicAdd etc. *)
-        | "atomic_add" | "atomic_add_int32" | "atomic_add_global_int32" ->
-            Buffer.add_string buf "atomicAdd(" ;
-            (match args with
-            | [addr; value] ->
-                gen_expr buf addr ;
-                Buffer.add_string buf ", " ;
-                gen_expr buf value
-            | [arr; idx; value] ->
-                gen_expr buf arr ;
-                Buffer.add_char buf '[' ;
-                gen_expr buf idx ;
-                Buffer.add_string buf "], " ;
-                gen_expr buf value
-            | args ->
-                Codegen_error.raise_error
-                  (Codegen_error.invalid_arg_count
-                     "atomic_add"
-                     2
-                     (List.length args))) ;
-            Buffer.add_char buf ')'
-        | "atomic_min" ->
-            Buffer.add_string buf "atomicMin(" ;
-            (match args with
-            | [addr; value] ->
-                gen_expr buf addr ;
-                Buffer.add_string buf ", " ;
-                gen_expr buf value
-            | args ->
-                Codegen_error.raise_error
-                  (Codegen_error.invalid_arg_count
-                     "atomic_min"
-                     2
-                     (List.length args))) ;
-            Buffer.add_char buf ')'
-        | "atomic_max" ->
-            Buffer.add_string buf "atomicMax(" ;
-            (match args with
-            | [addr; value] ->
-                gen_expr buf addr ;
-                Buffer.add_string buf ", " ;
-                gen_expr buf value
-            | args ->
-                Codegen_error.raise_error
-                  (Codegen_error.invalid_arg_count
-                     "atomic_max"
-                     2
-                     (List.length args))) ;
-            Buffer.add_char buf ')'
-        | "float" ->
-            Buffer.add_string buf "float(" ;
-            (match args with [e] -> gen_expr buf e | _ -> ()) ;
-            Buffer.add_char buf ')'
-        | "int_of_float" ->
-            Buffer.add_string buf "int(" ;
-            (match args with [e] -> gen_expr buf e | _ -> ()) ;
-            Buffer.add_char buf ')'
-        | _ ->
-            (* Unknown intrinsic - emit as function call *)
-            Buffer.add_string buf full_name ;
-            Buffer.add_char buf '(' ;
-            List.iteri
-              (fun i e ->
-                if i > 0 then Buffer.add_string buf ", " ;
-                gen_expr buf e)
-              args ;
-            Buffer.add_char buf ')')
+    let pure_registry_hit =
+      match path with
+      | [] -> None
+      | _ -> (
+          match
+            Sarek_pure_registry.fun_device_template ~module_path:path name
+          with
+          | Some f -> Some (f ~framework:"GLSL")
+          | None -> None)
+    in
+    match pure_registry_hit with
+    | Some device_name ->
+        Buffer.add_string buf device_name ;
+        Buffer.add_char buf '(' ;
+        List.iteri
+          (fun i e ->
+            if i > 0 then Buffer.add_string buf ", " ;
+            gen_expr buf e)
+          args ;
+        Buffer.add_char buf ')'
+    | None -> (
+        if
+          (* Try thread intrinsics *)
+          List.mem
+            name
+            [
+              "thread_id_x";
+              "thread_idx_x";
+              "thread_id_y";
+              "thread_idx_y";
+              "thread_id_z";
+              "thread_idx_z";
+              "block_id_x";
+              "block_idx_x";
+              "block_id_y";
+              "block_idx_y";
+              "block_id_z";
+              "block_idx_z";
+              "block_dim_x";
+              "block_dim_y";
+              "block_dim_z";
+              "grid_dim_x";
+              "grid_dim_y";
+              "grid_dim_z";
+              "global_thread_id";
+              "global_idx";
+              "global_idx_x";
+              "global_idx_y";
+              "global_idx_z";
+              "global_size";
+            ]
+        then Buffer.add_string buf (glsl_thread_intrinsic name)
+        else
+          (* Standard math intrinsics - GLSL versions *)
+          match name with
+          | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh"
+          | "tanh" | "exp" | "exp2" | "log" | "log2" | "sqrt" | "floor" | "ceil"
+          | "round" | "trunc" | "abs" ->
+              Buffer.add_string buf name ;
+              Buffer.add_char buf '(' ;
+              List.iteri
+                (fun i e ->
+                  if i > 0 then Buffer.add_string buf ", " ;
+                  gen_expr buf e)
+                args ;
+              Buffer.add_char buf ')'
+          | "fabs" ->
+              Buffer.add_string buf "abs" ;
+              Buffer.add_char buf '(' ;
+              List.iteri
+                (fun i e ->
+                  if i > 0 then Buffer.add_string buf ", " ;
+                  gen_expr buf e)
+                args ;
+              Buffer.add_char buf ')'
+          | "rsqrt" ->
+              Buffer.add_string buf "inversesqrt" ;
+              Buffer.add_char buf '(' ;
+              List.iteri
+                (fun i e ->
+                  if i > 0 then Buffer.add_string buf ", " ;
+                  gen_expr buf e)
+                args ;
+              Buffer.add_char buf ')'
+          | "atan2" | "pow" | "min" | "max" ->
+              Buffer.add_string buf name ;
+              Buffer.add_char buf '(' ;
+              List.iteri
+                (fun i e ->
+                  if i > 0 then Buffer.add_string buf ", " ;
+                  gen_expr buf e)
+                args ;
+              Buffer.add_char buf ')'
+          | "fma" ->
+              Buffer.add_string buf "fma" ;
+              Buffer.add_char buf '(' ;
+              List.iteri
+                (fun i e ->
+                  if i > 0 then Buffer.add_string buf ", " ;
+                  gen_expr buf e)
+                args ;
+              Buffer.add_char buf ')'
+          (* Barrier synchronization *)
+          | "block_barrier" -> Buffer.add_string buf "barrier()"
+          (* Atomic operations - GLSL uses atomicAdd etc. *)
+          | "atomic_add" | "atomic_add_int32" | "atomic_add_global_int32" ->
+              Buffer.add_string buf "atomicAdd(" ;
+              (match args with
+              | [addr; value] ->
+                  gen_expr buf addr ;
+                  Buffer.add_string buf ", " ;
+                  gen_expr buf value
+              | [arr; idx; value] ->
+                  gen_expr buf arr ;
+                  Buffer.add_char buf '[' ;
+                  gen_expr buf idx ;
+                  Buffer.add_string buf "], " ;
+                  gen_expr buf value
+              | args ->
+                  Codegen_error.raise_error
+                    (Codegen_error.invalid_arg_count
+                       "atomic_add"
+                       2
+                       (List.length args))) ;
+              Buffer.add_char buf ')'
+          | "atomic_min" ->
+              Buffer.add_string buf "atomicMin(" ;
+              (match args with
+              | [addr; value] ->
+                  gen_expr buf addr ;
+                  Buffer.add_string buf ", " ;
+                  gen_expr buf value
+              | args ->
+                  Codegen_error.raise_error
+                    (Codegen_error.invalid_arg_count
+                       "atomic_min"
+                       2
+                       (List.length args))) ;
+              Buffer.add_char buf ')'
+          | "atomic_max" ->
+              Buffer.add_string buf "atomicMax(" ;
+              (match args with
+              | [addr; value] ->
+                  gen_expr buf addr ;
+                  Buffer.add_string buf ", " ;
+                  gen_expr buf value
+              | args ->
+                  Codegen_error.raise_error
+                    (Codegen_error.invalid_arg_count
+                       "atomic_max"
+                       2
+                       (List.length args))) ;
+              Buffer.add_char buf ')'
+          | "float" ->
+              Buffer.add_string buf "float(" ;
+              (match args with [e] -> gen_expr buf e | _ -> ()) ;
+              Buffer.add_char buf ')'
+          | "int_of_float" ->
+              Buffer.add_string buf "int(" ;
+              (match args with [e] -> gen_expr buf e | _ -> ()) ;
+              Buffer.add_char buf ')'
+          | _ ->
+              (* Unknown intrinsic - emit as function call *)
+              Buffer.add_string buf full_name ;
+              Buffer.add_char buf '(' ;
+              List.iteri
+                (fun i e ->
+                  if i > 0 then Buffer.add_string buf ", " ;
+                  gen_expr buf e)
+                args ;
+              Buffer.add_char buf ')')
 
 (** {1 L-value Generation} *)
 
@@ -815,16 +857,28 @@ let count_vec_params params =
 
 (** Generate GLSL compute shader header.
     @param block Optional workgroup dimensions (x, y, z). Defaults to 256x1x1.
-*)
-let glsl_header ~kernel_name ?(block = (256, 1, 1)) () =
+    @param uses_float64
+      Whether the kernel uses [double] (Sarek [float64]) anywhere. When [true],
+      emits [#extension GL_ARB_gpu_shader_fp64 : require]. glslang does not
+      strictly require this pragma to compile [double] under [#version 450]
+      targeting SPIR-V (it auto-adds the SPIR-V [Float64] capability), but
+      declaring it explicitly keeps the generated source correct against
+      stricter/non-glslang GLSL compilers and documents the requirement in the
+      emitted shader. Defaults to [false] so kernels that do not use float64
+      never carry the extension. *)
+let glsl_header ~kernel_name ?(block = (256, 1, 1)) ?(uses_float64 = false) () =
   let bx, by, bz = block in
+  let fp64_extension =
+    if uses_float64 then "#extension GL_ARB_gpu_shader_fp64 : require\n" else ""
+  in
   Printf.sprintf
     {|#version 450
-
+%s
 // Sarek-generated compute shader: %s
 layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;
 
 |}
+    fp64_extension
     kernel_name
     bx
     by
@@ -940,7 +994,13 @@ let generate ?block ?(log : string -> unit = fun _ -> ()) (k : kernel) : string
   (* Clear per-kernel state *)
   Hashtbl.clear helper_vec_param_indices ;
   let buf = Buffer.create 1024 in
-  Buffer.add_string buf (glsl_header ~kernel_name:k.kern_name ?block ()) ;
+  Buffer.add_string
+    buf
+    (glsl_header
+       ~kernel_name:k.kern_name
+       ?block
+       ~uses_float64:(Sarek_ir_analysis.kernel_uses_float64 k)
+       ()) ;
 
   (* Generate buffer bindings *)
   let binding_idx = ref 0 in
@@ -1018,7 +1078,13 @@ let generate_with_types ?block ?(log : string -> unit = fun _ -> ())
   current_variants := k.kern_variants ;
 
   let buf = Buffer.create 1024 in
-  Buffer.add_string buf (glsl_header ~kernel_name:k.kern_name ?block ()) ;
+  Buffer.add_string
+    buf
+    (glsl_header
+       ~kernel_name:k.kern_name
+       ?block
+       ~uses_float64:(Sarek_ir_analysis.kernel_uses_float64 k)
+       ()) ;
 
   (* Generate record type definitions (simple structs without tag) *)
   List.iter (gen_record_def buf) types ;

@@ -299,6 +299,188 @@ let test_lower_param () =
       Alcotest.(check int) "id" 0 var.Ir.var_id
   | _ -> Alcotest.fail "expected DParam"
 
+(* Test: TEBinop (Lsr, _, _) / (Asr, _, _) with a NEGATIVE left operand.
+   Group G (shift semantics): Sarek_ast.Lsr and Asr both used to map to the
+   same Ir.Shr constructor, which every consumer emits as an *arithmetic*
+   shift ([>>] on signed CUDA/OpenCL/Metal/GLSL/WGSL int types, shr.s32 on
+   PTX, Int32.shift_right in the interpreter - see
+   briefs/fix-critical-semantics-evidence.md, G phase 1). [asr] is correct;
+   [lsr] on a negative operand silently returned the wrong (sign-extended)
+   value. These tests lower a real Sarek_ast.Lsr/Asr binop end-to-end
+   (lower_expr -> Sarek_ir_conv.conv_expr -> the runtime interpreter) and
+   check the executed result against the true logical/arithmetic shift, so
+   they fail pre-fix and pass post-fix - see the evidence file for the
+   captured pre-fix failure. *)
+
+(* Minimal, self-contained evaluator for the fragment of Sarek_ir_ppx.expr
+   that lower_lsr/ir_binop can produce for an int32 Lsr/Asr binop (EConst
+   CInt32/CBool, EBinop over Add/Sub/Shl/Shr/BitAnd/BitXor/Eq, EIf). This
+   exercises the REAL production lowering (Sarek_lower_ir.lower_expr /
+   lower_lsr) without reaching into sarek_transpile's private Sarek_ir_conv
+   (not part of that library's public .mli).
+   [BitAnd] was added to the fragment when [lower_lsr] started masking its
+   internal shift-count with [width - 1] (finding 2: PTX/WGSL evaluate both
+   [EIf] branches, so the else-branch's shift-by-[width-n] must itself be
+   well-defined for every [n], including [n = 0]). *)
+let rec eval_ir_int32 (e : Ir.expr) : int32 =
+  match e with
+  | Ir.EConst (Ir.CInt32 n) -> n
+  | Ir.EBinop (Ir.Add, a, b) -> Int32.add (eval_ir_int32 a) (eval_ir_int32 b)
+  | Ir.EBinop (Ir.Sub, a, b) -> Int32.sub (eval_ir_int32 a) (eval_ir_int32 b)
+  | Ir.EBinop (Ir.Shl, a, b) ->
+      Int32.shift_left (eval_ir_int32 a) (Int32.to_int (eval_ir_int32 b))
+  | Ir.EBinop (Ir.Shr, a, b) ->
+      (* Ir.Shr is arithmetic on every backend post-fix (G phase 1) *)
+      Int32.shift_right (eval_ir_int32 a) (Int32.to_int (eval_ir_int32 b))
+  | Ir.EBinop (Ir.BitAnd, a, b) ->
+      Int32.logand (eval_ir_int32 a) (eval_ir_int32 b)
+  | Ir.EBinop (Ir.BitXor, a, b) ->
+      Int32.logxor (eval_ir_int32 a) (eval_ir_int32 b)
+  | Ir.EIf (cond, then_, else_) ->
+      if eval_ir_bool cond then eval_ir_int32 then_ else eval_ir_int32 else_
+  | _ -> Alcotest.fail "eval_ir_int32: unsupported node"
+
+and eval_ir_bool (e : Ir.expr) : bool =
+  match e with
+  | Ir.EBinop (Ir.Eq, a, b) -> eval_ir_int32 a = eval_ir_int32 b
+  | _ -> Alcotest.fail "eval_ir_bool: unsupported node"
+
+let eval_int32_binop op a b =
+  let ty = Sarek_types.(TReg Int) in
+  let mk te = Sarek_typed_ast.{te; ty; te_loc = Sarek_ast.dummy_loc} in
+  let texpr =
+    mk (Sarek_typed_ast.TEBinop (op, mk (TEInt32 a), mk (TEInt32 b)))
+  in
+  let state = Sarek_lower_ir.create_state (Hashtbl.create 1) in
+  let ir_expr = Sarek_lower_ir.lower_expr state texpr in
+  eval_ir_int32 ir_expr
+
+let test_lsr_negative_is_logical () =
+  (* (-16) lsr 2 = 1073741820, NOT (-16) asr 2 = -4 *)
+  let result = eval_int32_binop Sarek_ast.Lsr (-16l) 2l in
+  Alcotest.(check int32) "(-16) lsr 2" 1073741820l result
+
+let test_asr_negative_is_arithmetic () =
+  let result = eval_int32_binop Sarek_ast.Asr (-16l) 2l in
+  Alcotest.(check int32) "(-16) asr 2" (-4l) result
+
+let test_lsr_negative_shift_by_zero () =
+  (* n = 0 must not hit the (width - n) = width shift-by-32 UB guard *)
+  let result = eval_int32_binop Sarek_ast.Lsr (-16l) 0l in
+  Alcotest.(check int32) "(-16) lsr 0" (-16l) result
+
+let test_lsr_negative_shift_by_31 () =
+  (* Top bit shifted all the way down to bit 0 *)
+  let result = eval_int32_binop Sarek_ast.Lsr (-16l) 31l in
+  Alcotest.(check int32) "(-16) lsr 31" 1l result
+
+let test_lsr_positive_matches_asr () =
+  (* For a non-negative operand, lsr and asr must agree *)
+  let lsr_result = eval_int32_binop Sarek_ast.Lsr 16l 2l in
+  let asr_result = eval_int32_binop Sarek_ast.Asr 16l 2l in
+  Alcotest.(check int32) "16 lsr 2" 4l lsr_result ;
+  Alcotest.(check int32) "16 asr 2 matches lsr" lsr_result asr_result
+
+(* Finding 1 (review pass): lower_lsr used to build a tree that references
+   its [a]/[b] IR operands three times each (sign_fill, top_bits, and the
+   final EIf's branches/condition) with no way to evaluate a non-trivial
+   operand once and reuse the result (Sarek_ir_ppx.expr has no let-binding
+   form - see the doc comment on lower_lsr). If the operand carried a side
+   effect (e.g. an EIntrinsic atomic call), it would be silently evaluated
+   multiple times. lower_lsr now raises a located Ppxlib PPX error instead of
+   building the unsafe tree whenever an operand is not a plain EVar/EConst.
+   This test lowers [(1 + 2) lsr n] - the left operand becomes
+   Ir.EBinop(Add, EConst, EConst) after lowering, which is not EVar/EConst,
+   so it is non-trivial - and asserts lower_expr raises. Fails pre-fix
+   (no check existed, so the duplicating tree was built silently) and
+   passes post-fix. *)
+let test_lsr_raises_on_nontrivial_operand () =
+  let ty = Sarek_types.(TReg Int) in
+  let mk te = Sarek_typed_ast.{te; ty; te_loc = Sarek_ast.dummy_loc} in
+  let non_trivial =
+    mk
+      (Sarek_typed_ast.TEBinop (Sarek_ast.Add, mk (TEInt32 1l), mk (TEInt32 2l)))
+  in
+  let texpr =
+    mk (Sarek_typed_ast.TEBinop (Sarek_ast.Lsr, non_trivial, mk (TEInt32 2l)))
+  in
+  let state = Sarek_lower_ir.create_state (Hashtbl.create 1) in
+  let raised =
+    try
+      let (_ : Ir.expr) = Sarek_lower_ir.lower_expr state texpr in
+      false
+    with Ppxlib.Location.Error _ -> true
+  in
+  Alcotest.(check bool) "lsr with non-trivial operand raises" true raised
+
+(* Companion case: a non-trivial *right* operand (the shift count) must also
+   be rejected, not just a non-trivial left operand. *)
+let test_lsr_raises_on_nontrivial_shift_count () =
+  let ty = Sarek_types.(TReg Int) in
+  let mk te = Sarek_typed_ast.{te; ty; te_loc = Sarek_ast.dummy_loc} in
+  let non_trivial_count =
+    mk
+      (Sarek_typed_ast.TEBinop (Sarek_ast.Add, mk (TEInt32 1l), mk (TEInt32 1l)))
+  in
+  let texpr =
+    mk
+      (Sarek_typed_ast.TEBinop
+         (Sarek_ast.Lsr, mk (TEInt32 16l), non_trivial_count))
+  in
+  let state = Sarek_lower_ir.create_state (Hashtbl.create 1) in
+  let raised =
+    try
+      let (_ : Ir.expr) = Sarek_lower_ir.lower_expr state texpr in
+      false
+    with Ppxlib.Location.Error _ -> true
+  in
+  Alcotest.(check bool) "lsr with non-trivial shift count raises" true raised
+
+(* Finding 1, negative check: trivial operands (plain int literals, which
+   lower to Ir.EConst) must NOT raise - this must not regress. *)
+let test_lsr_trivial_operands_do_not_raise () =
+  let result = eval_int32_binop Sarek_ast.Lsr (-16l) 2l in
+  Alcotest.(check int32) "(-16) lsr 2 (trivial operands)" 1073741820l result
+
+(* Finding 2 (review pass): PTX's selp / WGSL's select() evaluate BOTH
+   branches of the EIf lower_lsr builds, so the else-branch's internal
+   [width_bits - n] shift-count must itself be well-defined (in
+   [0..width_bits-1]) for every n, including n = 0 (where the unmasked
+   value would be exactly width_bits - a shift-by-32, undefined/rejected on
+   some backends - even though the EIf "selects" the then-branch for n = 0).
+   lower_lsr now wraps that shift-count in [BitAnd (_, width_bits - 1)].
+   This test lowers a real [x lsr n] end-to-end and inspects the resulting
+   Ir.expr tree structure directly (not just its evaluated value) for a
+   BitAnd node whose mask constant is 31 (= 32 - 1 for TInt32). Fails
+   pre-fix (no BitAnd node exists in the pre-fix tree) and passes
+   post-fix. *)
+let rec contains_bitand_mask (mask : int32) (e : Ir.expr) : bool =
+  match e with
+  | Ir.EBinop (Ir.BitAnd, _, Ir.EConst (Ir.CInt32 m)) when m = mask -> true
+  | Ir.EBinop (_, a, b) ->
+      contains_bitand_mask mask a || contains_bitand_mask mask b
+  | Ir.EIf (c, t, e2) ->
+      contains_bitand_mask mask c
+      || contains_bitand_mask mask t
+      || contains_bitand_mask mask e2
+  | Ir.EUnop (_, a) -> contains_bitand_mask mask a
+  | _ -> false
+
+let test_lsr_shift_count_is_masked () =
+  let ty = Sarek_types.(TReg Int) in
+  let mk te = Sarek_typed_ast.{te; ty; te_loc = Sarek_ast.dummy_loc} in
+  let texpr =
+    mk
+      (Sarek_typed_ast.TEBinop
+         (Sarek_ast.Lsr, mk (TEVar ("x", 0)), mk (TEInt32 0l)))
+  in
+  let state = Sarek_lower_ir.create_state (Hashtbl.create 1) in
+  let ir_expr = Sarek_lower_ir.lower_expr state texpr in
+  Alcotest.(check bool)
+    "lsr lowering masks the shift-count with (width - 1)"
+    true
+    (contains_bitand_mask 31l ir_expr)
+
 (* Test suite *)
 let () =
   Alcotest.run
@@ -410,5 +592,44 @@ let () =
             test_lower_decl_immutable;
           Alcotest.test_case "lower decl mutable" `Quick test_lower_decl_mutable;
           Alcotest.test_case "lower param" `Quick test_lower_param;
+        ] );
+      ( "shift_semantics",
+        [
+          Alcotest.test_case
+            "lsr negative is logical"
+            `Quick
+            test_lsr_negative_is_logical;
+          Alcotest.test_case
+            "asr negative is arithmetic"
+            `Quick
+            test_asr_negative_is_arithmetic;
+          Alcotest.test_case
+            "lsr negative shift by zero"
+            `Quick
+            test_lsr_negative_shift_by_zero;
+          Alcotest.test_case
+            "lsr negative shift by 31"
+            `Quick
+            test_lsr_negative_shift_by_31;
+          Alcotest.test_case
+            "lsr positive matches asr"
+            `Quick
+            test_lsr_positive_matches_asr;
+          Alcotest.test_case
+            "lsr raises on non-trivial operand"
+            `Quick
+            test_lsr_raises_on_nontrivial_operand;
+          Alcotest.test_case
+            "lsr raises on non-trivial shift count"
+            `Quick
+            test_lsr_raises_on_nontrivial_shift_count;
+          Alcotest.test_case
+            "lsr trivial operands do not raise"
+            `Quick
+            test_lsr_trivial_operands_do_not_raise;
+          Alcotest.test_case
+            "lsr shift count is masked"
+            `Quick
+            test_lsr_shift_count_is_masked;
         ] );
     ]

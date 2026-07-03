@@ -24,11 +24,32 @@ let max_ptx_header_preview = 200
 
 (** {1 Exceptions} *)
 
-exception Cuda_error of cu_result * string
+(** Deprecated: no longer raised. [check] below now raises the canonical
+    {!Cuda_error.Cuda_error} (a [Backend_error] alias) via the shared
+    {!Sarek_backend_error.Backend_error.Make.check} funnel, so every handler in
+    the codebase can catch one exception shape across backends. This declaration
+    is kept only so that out-of-tree code matching on
+    [Cuda_api.Cuda_error (code, ctx)] still compiles (this library is
+    opam-published). *)
+exception
+  Cuda_error of cu_result * string
+      [@ocaml.deprecated
+        "no longer raised; Cuda_api.check now raises Cuda_error.Cuda_error \
+         (Backend_error) - catch that instead"]
 
-(** Check CUDA result and raise exception on error *)
+(** Check CUDA result and raise a canonical {!Backend_error} on failure. *)
 let check (ctx : string) (result : cu_result) : unit =
-  match result with CUDA_SUCCESS -> () | err -> raise (Cuda_error (err, ctx))
+  Cuda_error.check
+    ~is_success:(fun r -> r = CUDA_SUCCESS)
+    ~to_string:string_of_cu_result
+    ctx
+    result
+
+(** Hooks invoked with a device id right before its context is destroyed.
+    [Kernel] registers an eviction hook here (after [Kernel.cache] is defined
+    below) so that [Device.destroy] can retire per-device compiled kernels
+    without a circular module dependency. *)
+let device_destroy_hooks : (int -> unit) list ref = ref []
 
 (** {1 Device Management} *)
 
@@ -175,7 +196,17 @@ module Device = struct
     set_current dev ;
     check "cuCtxSynchronize" (cuCtxSynchronize ())
 
-  let destroy dev = check "cuCtxDestroy" (cuCtxDestroy dev.context)
+  let destroy dev =
+    (* Evict from device_cache first: leaving a stale entry means a later
+       [get idx] returns a handle whose context has already been destroyed
+       (mirrors the Vulkan fix in Vulkan_api_device.ml). Also run the
+       registered destroy hooks (Kernel.cache eviction) while the context
+       is still current, so stale module/function handles for this device
+       can't be returned by [Kernel.compile_cached] after the context is
+       recreated. *)
+    Hashtbl.remove device_cache dev.id ;
+    List.iter (fun hook -> hook dev.id) !device_destroy_hooks ;
+    check "cuCtxDestroy" (cuCtxDestroy dev.context)
 end
 
 (** {1 Memory Management} *)
@@ -312,6 +343,35 @@ module Kernel = struct
   (* Compilation cache *)
   let cache : (string, t) Hashtbl.t = Hashtbl.create 16
 
+  (* Cache keys grouped by device id, so a device destroy/recreate cycle can
+     evict exactly its own stale module/function handles from [cache]
+     without needing to reverse the (digested, opaque) cache key. *)
+  let keys_by_device : (int, string list ref) Hashtbl.t = Hashtbl.create 16
+
+  let record_key_for_device device_id key =
+    match Hashtbl.find_opt keys_by_device device_id with
+    | Some keys -> keys := key :: !keys
+    | None -> Hashtbl.add keys_by_device device_id (ref [key])
+
+  (* Evict every cached kernel compiled for [device_id]. Registered as a
+     [device_destroy_hooks] callback below so [Device.destroy] retires
+     these handles before the underlying CUDA context is destroyed. *)
+  let evict_device device_id =
+    match Hashtbl.find_opt keys_by_device device_id with
+    | None -> ()
+    | Some keys ->
+        List.iter
+          (fun key ->
+            match Hashtbl.find_opt cache key with
+            | None -> ()
+            | Some k ->
+                let _ = cuModuleUnload k.module_ in
+                Hashtbl.remove cache key)
+          !keys ;
+        Hashtbl.remove keys_by_device device_id
+
+  let () = device_destroy_hooks := evict_device :: !device_destroy_hooks
+
   (* Replace the .target directive in a PTX string to match the given SM version.
      This makes a static PTX string portable: PTX written for sm_86 loads fine
      on sm_61 as long as it doesn't use sm_86-specific instructions. *)
@@ -368,7 +428,10 @@ module Kernel = struct
           "cuModuleLoadData failed: %s\nPTX header: %s"
           (string_of_cu_result err)
           ptx_header ;
-        raise (Cuda_error (err, "cuModuleLoadData"))) ;
+        Cuda_error.raise_error
+          (Cuda_error.module_load_failed
+             (String.length ptx)
+             (Printf.sprintf "cuModuleLoadData: %s" (string_of_cu_result err)))) ;
     let func = allocate cu_function_ptr (from_voidp cu_function null) in
     check "cuModuleGetFunction" (cuModuleGetFunction func !@module_ name) ;
     {module_ = !@module_; function_ = !@func; name}
@@ -430,18 +493,22 @@ module Kernel = struct
     load_module_from_ptx ~name ptx
 
   let compile_cached device ~name ~source =
-    (* Cache key must include device ID - modules are device-specific *)
+    (* Cache key must include device ID and the kernel name - a source file
+       may define more than one kernel, and a resolved kernel handle for one
+       name must never be returned for another (see Compile_cache.mli). *)
     let key =
-      Printf.sprintf
-        "%d:%s"
-        device.Device.id
-        (Digest.string source |> Digest.to_hex)
+      Spoc_framework.Compile_cache.make_key
+        ~device:(string_of_int device.Device.id)
+        ~name
+        ~source
+        ()
     in
     match Hashtbl.find_opt cache key with
     | Some k -> k
     | None ->
         let k = compile device ~name ~source in
         Hashtbl.add cache key k ;
+        record_key_for_device device.Device.id key ;
         k
 
   let clear_cache () =
@@ -450,7 +517,8 @@ module Kernel = struct
         let _ = cuModuleUnload k.module_ in
         ())
       cache ;
-    Hashtbl.clear cache
+    Hashtbl.clear cache ;
+    Hashtbl.clear keys_by_device
 
   (** Existential wrapper for keeping Ctypes-allocated values alive during FFI
       calls *)

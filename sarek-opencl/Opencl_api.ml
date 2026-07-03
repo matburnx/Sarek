@@ -16,12 +16,24 @@ open Opencl_bindings
 
 (** {1 Exceptions} *)
 
-exception Opencl_error of cl_error * string
+(** Deprecated: no longer raised. [check] below now raises the canonical
+    {!Opencl_error.Opencl_error} (a [Backend_error] alias) via the shared
+    {!Sarek_backend_error.Backend_error.Make.check} funnel. Kept only so
+    out-of-tree code matching on [Opencl_api.Opencl_error (code, ctx)] still
+    compiles (this library is opam-published). *)
+exception
+  Opencl_error of cl_error * string
+      [@ocaml.deprecated
+        "no longer raised; Opencl_api.check now raises \
+         Opencl_error.Opencl_error (Backend_error) - catch that instead"]
 
-(** Check OpenCL result and raise exception on error *)
+(** Check OpenCL result and raise a canonical {!Backend_error} on failure. *)
 let check (ctx : string) (result : int32) : unit =
-  let err = cl_error_of_int32 result in
-  match err with CL_SUCCESS -> () | _ -> raise (Opencl_error (err, ctx))
+  Opencl_error.check
+    ~is_success:(fun r -> cl_error_of_int32 r = CL_SUCCESS)
+    ~to_string:(fun r -> string_of_cl_error (cl_error_of_int32 r))
+    ctx
+    result
 
 (** {1 Platform Management} *)
 
@@ -588,8 +600,11 @@ module Kernel = struct
 
   let release kernel = check "clReleaseKernel" (clReleaseKernel kernel.handle)
 
-  let set_arg_buffer kernel idx buf =
-    let mem_ptr = allocate cl_mem buf.Memory.handle in
+  (** Bind a raw [cl_mem] handle directly, routed through the checked
+      [clSetKernelArg] funnel so failures (e.g. [CL_INVALID_MEM_OBJECT],
+      [CL_INVALID_ARG_INDEX]) raise the canonical {!Opencl_error}. *)
+  let set_arg_mem kernel idx (mem : cl_mem) =
+    let mem_ptr = allocate cl_mem mem in
     check
       "clSetKernelArg"
       (clSetKernelArg
@@ -597,6 +612,8 @@ module Kernel = struct
          (Unsigned.UInt32.of_int idx)
          (Unsigned.Size_t.of_int (sizeof cl_mem))
          (to_voidp mem_ptr))
+
+  let set_arg_buffer kernel idx buf = set_arg_mem kernel idx buf.Memory.handle
 
   let set_arg_int32 kernel idx value =
     let v = allocate int32_t value in
