@@ -11,7 +11,7 @@
 (library
  (name registered_defs)
  (modules registered_defs)
- (libraries sarek sarek_stdlib spoc_core)
+ (libraries sarek sarek_stdlib spoc_core floatml)
  (preprocess
   (pps sarek_ppx)))
 
@@ -59,6 +59,7 @@
   test_dft
   test_dft64
   test_saxpy
+  test_convolution2D
   test_vector_add
   test_module_const
   test_ktype_record
@@ -100,6 +101,7 @@
   test_dft
   test_dft64
   test_saxpy
+  test_convolution2D
   test_vector_add
   test_module_const
   test_ktype_record
@@ -150,7 +152,7 @@
  (preprocess
   (pps sarek_ppx))
  (flags
-  (:standard -w -32-33-34-69)))
+  (:standard -w -26-32-33-34-69)))
 
 (alias
  (name runtest)
@@ -159,6 +161,7 @@
   test_dft.exe
   test_dft64.exe
   test_saxpy.exe
+  test_convolution2D.exe
   test_vector_add.exe
   test_module_const.exe
   test_ktype_record.exe

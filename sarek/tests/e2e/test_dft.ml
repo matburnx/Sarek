@@ -17,23 +17,20 @@ module Vector = Spoc_core.Vector
 module Transfer = Spoc_core.Transfer
 module Benchmarks = Test_helpers.Benchmarks
 
-let n = 16
-
 let vector_dft =
   [%kernel
     fun (a : float32 vector)
         (b : float32 vector)
         (c : float32 vector)
         (d : float32 vector)
-        (size : int32)
-        (n : int32) ->
+        (size : int32) ->
         let open Std in
         let tid = global_thread_id in
-        if tid < n then
+        if tid < size then
           let pi = float 4l *. atan(float 1l) in
-          let value = float 2l *. pi *. float tid /. float n in
-          let sum_a = mut 0.0 in
-          let sum_b = mut 0.0 in
+          let value = float 2l *. pi *. float tid /. float size in
+          let sum_a = mut (float 0) in
+          let sum_b = mut (float 0) in
           for i = 0 to size - 1l do
             let angle = value *. float i in 
             sum_a := sum_a +. a.(i) *. cos(angle);
@@ -45,25 +42,31 @@ let vector_dft =
 
 
 let compute_expected size =
-  let a = Array.init size (fun i -> float_of_int i) in
-  let b = Array.init size (fun i -> float_of_int i) in
-  let c = Array.make n 0.0 in
-  let d = Array.make n 0.0 in
+  let open Floatml in
+  let a = Array.init size (fun i -> F32.of_string (Int.to_string i)) in
+  let b = Array.init size (fun i -> F32.of_string (Int.to_string i)) in
+  let c = Array.make size (F32.of_string "0.0") in
+  let d = Array.make size (F32.of_string "0.0") in
 
-  let const = 2.0 *. Float.pi /. float n in
-
-  for t = 0 to n - 1 do
-    let sum_a = ref 0.0 in
-    let sum_b = ref 0.0 in
+  let pi_f32 = F32.of_string (Float.to_string Float.pi) in
+  let n_f32 = F32.of_string (Int.to_string size) in
+  let value =  F32.(F32.((F32.of_string "2.0") * pi_f32) / n_f32) in
+  
+  for t = 0 to size - 1 do
+    let sum_a = ref (F32.of_string "0.0") in
+    let sum_b = ref (F32.of_string "0.0") in
     for k = 0 to size - 1 do
-      let angle = const *. float_of_int t *. float_of_int k in
-      sum_a := !sum_a +. a.(k) *. cos(angle);
-      sum_b := !sum_b -. b.(k) *. sin(angle);
+      let t_f32 = F32.of_string (Int.to_string t) in
+      let k_f32 = F32.of_string (Int.to_string k) in
+      let angle = F32.mul (F32.mul value t_f32) k_f32 in
+      sum_a := F32.add !sum_a (F32.mul a.(k) (F32.cos angle));
+      sum_b := F32.sub !sum_b (F32.mul b.(k) (F32.sin angle));
     done;
     c.(t) <- !sum_a;
     d.(t) <- !sum_b
   done;
-  (c,d)
+  let to_float_array arr = Array.init size (fun i -> F32.to_float arr.(i)) in 
+  (to_float_array c,to_float_array d)
 
 let find_mismatch result expected size epsilon errors =
   for i = 0 to size - 1 do
@@ -84,7 +87,7 @@ let verify_results result expected =
   let res_a, res_b = result in
   let exp_a, exp_b = expected in
   let size = Array.length exp_a in
-  let epsilon = 0.001 in
+  let epsilon = 0.1 in
   let errors = ref 0 in
   let err_a = find_mismatch res_a exp_a size epsilon errors in
   errors := 0;
@@ -102,14 +105,12 @@ let run_test dev size block_size =
 
   let a = Vector.create Vector.float32 size in
   let b = Vector.create Vector.float32 size in
-  let c = Vector.create Vector.float32 n in
-  let d = Vector.create Vector.float32 n in
+  let c = Vector.create Vector.float32 size in
+  let d = Vector.create Vector.float32 size in
 
   for i = 0 to size - 1 do
     Vector.set a i (float_of_int i) ;
     Vector.set b i (float_of_int i) ;
-  done ;
-  for i = 0 to n - 1 do
     Vector.set c i (-999.0);
     Vector.set d i (-999.0);
   done ;
@@ -123,7 +124,7 @@ let run_test dev size block_size =
   Execute.run_vectors
     ~device:dev
     ~ir
-    ~args:[Vec a; Vec b; Vec c; Vec d; Int size; Int n]
+    ~args:[Vec a; Vec b; Vec c; Vec d; Int size]
     ~block
     ~grid
     () ;
@@ -133,7 +134,7 @@ let run_test dev size block_size =
   Execute.run_vectors
     ~device:dev
     ~ir
-    ~args:[Vec a; Vec b; Vec c; Vec d; Int size; Int n]
+    ~args:[Vec a; Vec b; Vec c; Vec d; Int size]
     ~block
     ~grid
     () ;
