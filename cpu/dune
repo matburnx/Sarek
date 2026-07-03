@@ -1,0 +1,6 @@
+(executables
+ (names
+  dft
+  )
+ (libraries unix)
+ (flags (:standard -w -a)))
