@@ -1,4 +1,6 @@
 (dirs
+ floatml
+ cpu
  spoc
  sarek
  sarek-cuda

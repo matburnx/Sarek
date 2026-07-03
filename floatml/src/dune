@@ -1,0 +1,10 @@
+(library
+ (name floatml)
+ (public_name floatml)
+ (libraries zarith)
+ (foreign_stubs
+  (language c)
+  (names floatml_stubs)
+  (flags
+   (:standard -O2 -std=c23 -Wno-unused-function)))
+  (c_library_flags -lquadmath))
