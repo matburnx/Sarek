@@ -109,6 +109,58 @@ let eval_barrier_intrinsic name =
       Some VUnit
   | _ -> None
 
+(* Serialises global-memory atomics. The sequential interpreter needs no lock,
+   but the parallel interpreter distributes blocks across a domain pool sharing
+   the same global VArray, so the read-modify-write must be atomic. *)
+let atomic_global_mutex = Mutex.create ()
+
+let with_atomic_lock f =
+  Mutex.lock atomic_global_mutex ;
+  Fun.protect ~finally:(fun () -> Mutex.unlock atomic_global_mutex) f
+
+(* Bounds-checked index into an atomic's target array, mirroring
+   eval_array_expr's Array_bounds_error path so the interpreter oracle rejects
+   out-of-range atomics the same way an ordinary array access would. *)
+
+(** Global-memory atomics and memory fences.
+
+    Atomics on global vectors return the OLD value and update in place. The
+    interpreter models global memory as a shared mutable [VArray]; fences are
+    no-ops because a single logical memory is already sequentially consistent
+    here. Sufficient for the Sarek_worklist queue pattern (atomic HEAD/TAIL
+    counters + ring slots). *)
+let atomic_index name a idx =
+  let i = to_int idx in
+  if i < 0 || i >= Array.length a then
+    Interp_error.raise_error
+      (Array_bounds_error
+         {array_name = name; index = i; length = Array.length a}) ;
+  i
+
+let atomic_arity name n _args =
+  Interp_error.raise_error
+    (Unsupported_operation
+       {operation = name; reason = Printf.sprintf "requires %d arguments" n})
+
+let eval_atomic_intrinsic name args =
+  match (name, args) with
+  | "atomic_add_global_int32", [VArray a; idx; delta] ->
+      with_atomic_lock (fun () ->
+          let i = atomic_index "atomic_add_global_int32" a idx in
+          let old = to_int32 a.(i) in
+          a.(i) <- VInt32 (Int32.add old (to_int32 delta)) ;
+          Some (VInt32 old))
+  | "atomic_add_global_int32", _ -> atomic_arity name 3 args
+  | "atomic_inc_global_int32", [VArray a; idx] ->
+      with_atomic_lock (fun () ->
+          let i = atomic_index "atomic_inc_global_int32" a idx in
+          let old = to_int32 a.(i) in
+          a.(i) <- VInt32 (Int32.add old 1l) ;
+          Some (VInt32 old))
+  | "atomic_inc_global_int32", _ -> atomic_arity name 2 args
+  | ("memory_fence_block" | "memory_fence_device"), _ -> Some VUnit
+  | _ -> None
+
 (** Float32 math intrinsics *)
 let eval_float32_math_intrinsic name args =
   match name with
@@ -133,6 +185,56 @@ let eval_float32_math_intrinsic name args =
           Interp_error.raise_error
             (Unsupported_operation
                {operation = "tan"; reason = "requires 1 argument"}))
+  | "asin" -> (
+      match args with
+      | arg :: _ -> Some (VFloat32 (F32.asin (to_float32 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "asin"; reason = "requires 1 argument"}))
+  | "acos" -> (
+      match args with
+      | arg :: _ -> Some (VFloat32 (F32.acos (to_float32 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "acos"; reason = "requires 1 argument"}))
+  | "atan" -> (
+      match args with
+      | arg :: _ -> Some (VFloat32 (F32.atan (to_float32 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "atan"; reason = "requires 1 argument"}))
+  | "atan2" -> (
+      match args with
+      | arg1 :: arg2 :: _ ->
+          Some (VFloat32 (F32.atan2 (to_float32 arg1) (to_float32 arg2)))
+      | _ ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "atan2"; reason = "requires 2 arguments"}))
+  | "sinh" -> (
+      match args with
+      | arg :: _ -> Some (VFloat32 (F32.sinh (to_float32 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "sinh"; reason = "requires 1 argument"}))
+  | "cosh" -> (
+      match args with
+      | arg :: _ -> Some (VFloat32 (F32.cosh (to_float32 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "cosh"; reason = "requires 1 argument"}))
+  | "tanh" -> (
+      match args with
+      | arg :: _ -> Some (VFloat32 (F32.tanh (to_float32 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "tanh"; reason = "requires 1 argument"}))
   | "sqrt" -> (
       match args with
       | arg :: _ -> Some (VFloat32 (F32.sqrt (to_float32 arg)))
@@ -183,6 +285,16 @@ let eval_float32_math_intrinsic name args =
           Interp_error.raise_error
             (Unsupported_operation
                {operation = "pow"; reason = "requires 2 arguments"}))
+  | "fma" -> (
+      match args with
+      | arg1 :: arg2 :: arg3 :: _ ->
+          Some
+            (VFloat32
+               (F32.fma (to_float32 arg1) (to_float32 arg2) (to_float32 arg3)))
+      | _ ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "fma"; reason = "requires 3 arguments"}))
   | "min" -> (
       match args with
       | arg1 :: arg2 :: _ ->
@@ -225,6 +337,64 @@ let eval_float64_math_intrinsic name args =
           Interp_error.raise_error
             (Unsupported_operation
                {operation = "cos (float64)"; reason = "requires 1 argument"}))
+  | "tan" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (tan (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "tan (float64)"; reason = "requires 1 argument"}))
+  | "asin" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (asin (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "asin (float64)"; reason = "requires 1 argument"}))
+  | "acos" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (acos (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "acos (float64)"; reason = "requires 1 argument"}))
+  | "atan" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (atan (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "atan (float64)"; reason = "requires 1 argument"}))
+  | "atan2" -> (
+      match args with
+      | arg1 :: arg2 :: _ ->
+          Some (VFloat64 (atan2 (to_float64 arg1) (to_float64 arg2)))
+      | _ ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "atan2 (float64)"; reason = "requires 2 arguments"})
+      )
+  | "sinh" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (sinh (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "sinh (float64)"; reason = "requires 1 argument"}))
+  | "cosh" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (cosh (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "cosh (float64)"; reason = "requires 1 argument"}))
+  | "tanh" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (tanh (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "tanh (float64)"; reason = "requires 1 argument"}))
   | "sqrt" -> (
       match args with
       | arg :: _ -> Some (VFloat64 (sqrt (to_float64 arg)))
@@ -253,6 +423,44 @@ let eval_float64_math_intrinsic name args =
           Interp_error.raise_error
             (Unsupported_operation
                {operation = "abs (float64)"; reason = "requires 1 argument"}))
+  | "floor" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (floor (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "floor (float64)"; reason = "requires 1 argument"}))
+  | "ceil" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (ceil (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "ceil (float64)"; reason = "requires 1 argument"}))
+  | "pow" -> (
+      match args with
+      | arg1 :: arg2 :: _ ->
+          Some (VFloat64 (Float.pow (to_float64 arg1) (to_float64 arg2)))
+      | _ ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "pow (float64)"; reason = "requires 2 arguments"}))
+  | "min" -> (
+      match args with
+      | arg1 :: arg2 :: _ ->
+          Some (VFloat64 (min (to_float64 arg1) (to_float64 arg2)))
+      | _ ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "min (float64)"; reason = "requires 2 arguments"}))
+  | "max" -> (
+      match args with
+      | arg1 :: arg2 :: _ ->
+          Some (VFloat64 (max (to_float64 arg1) (to_float64 arg2)))
+      | _ ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "max (float64)"; reason = "requires 2 arguments"}))
   | "of_int" -> (
       match args with
       | arg :: _ -> Some (VFloat64 (Float.of_int (to_int arg)))
@@ -261,6 +469,64 @@ let eval_float64_math_intrinsic name args =
             (Unsupported_operation
                {operation = "of_int (float64)"; reason = "requires 1 argument"})
       )
+  | "expm1" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (Float.expm1 (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "expm1 (float64)"; reason = "requires 1 argument"}))
+  | "log10" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (Float.log10 (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "log10 (float64)"; reason = "requires 1 argument"}))
+  | "log1p" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (Float.log1p (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "log1p (float64)"; reason = "requires 1 argument"}))
+  | "rsqrt" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (1.0 /. Float.sqrt (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "rsqrt (float64)"; reason = "requires 1 argument"}))
+  | "abs_float" -> (
+      match args with
+      | arg :: _ -> Some (VFloat64 (Float.abs (to_float64 arg)))
+      | [] ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {
+                 operation = "abs_float (float64)";
+                 reason = "requires 1 argument";
+               }))
+  | "hypot" -> (
+      match args with
+      | arg1 :: arg2 :: _ ->
+          Some (VFloat64 (Float.hypot (to_float64 arg1) (to_float64 arg2)))
+      | _ ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {operation = "hypot (float64)"; reason = "requires 2 arguments"})
+      )
+  | "copysign" -> (
+      match args with
+      | arg1 :: arg2 :: _ ->
+          Some (VFloat64 (Float.copy_sign (to_float64 arg1) (to_float64 arg2)))
+      | _ ->
+          Interp_error.raise_error
+            (Unsupported_operation
+               {
+                 operation = "copysign (float64)";
+                 reason = "requires 2 arguments";
+               }))
   | _ -> None
 
 (** Int32 math intrinsics *)

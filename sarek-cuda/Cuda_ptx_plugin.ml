@@ -10,8 +10,10 @@
  * Sarek_ir_ptx; loads kernels with cuModuleLoadData (no NVRTC).
  * Auto-registered on module load unless SPOC_DISABLE_GPU/CUDA is set.
  *
- * Unsupported IR nodes (records, variants) cause generate_source to return
- * None. Use Cuda_c_plugin for those constructs.
+ * Records, variants and tuples are supported (SROA registers + field-wise
+ * global access; see spoc/ir/Sarek_ir_layout.ml). Remaining unsupported IR
+ * nodes (e.g. bounded recursion, f64 transcendentals) cause generate_source
+ * to return None.
  ******************************************************************************)
 
 open Spoc_framework
@@ -21,6 +23,10 @@ module Backend : Framework_sig.BACKEND = struct
   include Cuda_plugin_base.Cuda
 
   let name = "CUDA/PTX"
+
+  (* Unlike the C backend, PTX loading needs only the driver API — no NVRTC.
+     Keeps this backend usable on ZLUDA and other libnvrtc-less stacks. *)
+  let is_available = Cuda_api.is_driver_available
 
   let execution_model = Framework_sig.JIT
 

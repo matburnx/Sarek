@@ -70,8 +70,8 @@
   test_ray_ppx
   test_registered_type
   test_registered_variant
-  ; test_cross_module_type     ; DISABLED: PPX registration issue with add_vec
-  ; test_registered_const       ; DISABLED: PPX registration issue with scale_fun
+  test_cross_module_type
+  test_registered_const
   test_visibility_private
   test_convention
   test_convention_kernel
@@ -95,7 +95,8 @@
   test_module_poly
   test_bounded_recursion
   test_inline_pragma
-  test_nested_types)
+  test_nested_types
+  test_ktype_mixed_align)
  (modules
   test_matrix_power
   test_dft
@@ -105,6 +106,7 @@
   test_vector_add
   test_module_const
   test_ktype_record
+  test_ktype_mixed_align
   test_klet_fun
   test_klet_variant
   test_ktype_helper
@@ -112,8 +114,8 @@
   test_ray_ppx
   test_registered_type
   test_registered_variant
-  ; test_cross_module_type     ; DISABLED: PPX registration issue with add_vec
-  ; test_registered_const       ; DISABLED: PPX registration issue with scale_fun
+  test_cross_module_type
+  test_registered_const
   test_visibility_private
   test_convention
   test_convention_kernel
@@ -149,6 +151,7 @@
   spoc_core
   test_helpers
   unix)
+ (preprocessor_deps registered_defs.ml)
  (preprocess
   (pps sarek_ppx))
  (flags
@@ -195,6 +198,11 @@
 (rule
  (alias runtest)
  (action
+  (run %{dep:test_ktype_mixed_align.exe})))
+
+(rule
+ (alias runtest)
+ (action
   (run %{dep:test_klet_fun.exe})))
 
 (rule
@@ -227,8 +235,15 @@
  (action
   (run %{dep:test_registered_variant.exe})))
 
-; test_cross_module_type.exe     ; DISABLED: PPX registration issue
-; test_registered_const.exe       ; DISABLED: PPX registration issue
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_cross_module_type.exe})))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_registered_const.exe})))
 
 (rule
  (alias runtest)
@@ -537,3 +552,101 @@
 (alias
  (name e2e-manual)
  (deps test_debug_native.exe test_float64_math_intrinsics.exe))
+
+(executable
+ (name test_df64)
+ (modules test_df64)
+ (libraries sarek sarek.stdlib sarek.df64 spoc_core test_helpers unix)
+ (preprocessor_deps
+  (file ../../Sarek_df64/Sarek_df64.ml))
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_df64.exe})))
+
+(executable
+ (name test_real64)
+ (modules test_real64)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek.df64
+  sarek.float64
+  sarek.real64
+  spoc_core
+  test_helpers
+  unix)
+ (preprocessor_deps
+  (file ../../Sarek_df64/Sarek_df64.ml))
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_real64.exe})))
+
+(executable
+ (name test_worklist)
+ (modules test_worklist)
+ (libraries sarek sarek.stdlib sarek.worklist spoc_core test_helpers unix)
+ (preprocessor_deps
+  (file ../../Sarek_worklist/Sarek_worklist.ml))
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_worklist.exe})))
+
+(executable
+ (name test_sarek_gemm)
+ (modules test_sarek_gemm)
+ (libraries sarek sarek.stdlib sarek.gemm spoc_core test_helpers unix)
+ (preprocessor_deps
+  (file ../../Sarek_gemm/Sarek_gemm.ml))
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_sarek_gemm.exe})))
+
+; E2E proof for float64 arithmetic written in the [%kernel] DSL via the `G`
+; float64-literal suffix (Sarek_parse.ml). A real DSL kernel - f64 literals,
+; +. -. *. /. , comparisons, `mut`, `while`, and the Float64.sqrt intrinsic -
+; compiled, lowered and run against an OCaml binary64 reference. Gates on the
+; native/interpreter device; other fp64 devices are verified and reported.
+; Run with: dune exec sarek/tests/e2e/test_float64_kernel_arith.exe
+
+(executable
+ (name test_float64_kernel_arith)
+ (modules test_float64_kernel_arith)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek.float64
+  sarek_ir
+  spoc_core
+  test_helpers
+  unix)
+ (preprocess
+  (pps sarek_ppx)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_float64_kernel_arith.exe})))
