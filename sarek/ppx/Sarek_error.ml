@@ -38,6 +38,7 @@ type error =
   | Barrier_in_diverged_flow of loc
   | Warp_collective_in_diverged_flow of string * loc
   | Reserved_keyword of string * loc
+  | Reserved_prefix of string * loc
   (* Lowering errors - occur during typed AST → IR transformation *)
   | Unsupported_type_in_registration of string * loc
   | Unsupported_constructor_form of loc
@@ -47,6 +48,7 @@ type error =
   | Unknown_variant_type of string * loc
   | Expression_needs_statement_context of string * loc
   | Invalid_lvalue of loc
+  | Function_value_escapes of string * typ * loc
 
 (** Get the location from an error *)
 let error_loc = function
@@ -73,6 +75,7 @@ let error_loc = function
   | Barrier_in_diverged_flow loc -> loc
   | Warp_collective_in_diverged_flow (_, loc) -> loc
   | Reserved_keyword (_, loc) -> loc
+  | Reserved_prefix (_, loc) -> loc
   | Unsupported_type_in_registration (_, loc) -> loc
   | Unsupported_constructor_form loc -> loc
   | Unsupported_registration_form loc -> loc
@@ -81,6 +84,7 @@ let error_loc = function
   | Unknown_variant_type (_, loc) -> loc
   | Expression_needs_statement_context (_, loc) -> loc
   | Invalid_lvalue loc -> loc
+  | Function_value_escapes (_, _, loc) -> loc
 
 (** Pretty print an error *)
 let pp_error fmt = function
@@ -150,6 +154,12 @@ let pp_error fmt = function
         "'%s' is a reserved C/CUDA/OpenCL keyword and cannot be used as a \
          function or variable name"
         name
+  | Reserved_prefix (name, _) ->
+      Format.fprintf
+        fmt
+        "identifiers beginning with 'sarek_' are reserved by the Sarek code \
+         generator; rename '%s'"
+        name
   | Unsupported_type_in_registration (type_desc, _) ->
       Format.fprintf
         fmt
@@ -189,6 +199,15 @@ let pp_error fmt = function
         fmt
         "Invalid left-hand side of assignment. Expected variable, field \
          access, or array element"
+  | Function_value_escapes (msg, t, _) ->
+      Format.fprintf
+        fmt
+        "Function value escapes: %s. Offending type: %a. Function values in \
+         kernels must be bound to a `let` and applied directly (they have no \
+         runtime representation)."
+        msg
+        pp_typ
+        t
 
 (** Convert error to string *)
 let error_to_string e = Format.asprintf "%a" pp_error e

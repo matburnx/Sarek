@@ -51,7 +51,8 @@
    from
    (sarek_metal -> backend_metal.available.ml)
    (-> backend_metal.unavailable.ml))
-  unix))
+  unix
+  sarek_backend_error))
 
 (executables
  (names
@@ -96,7 +97,8 @@
   test_bounded_recursion
   test_inline_pragma
   test_nested_types
-  test_ktype_mixed_align)
+  test_ktype_mixed_align
+  test_ktype_record_f64_arith)
  (modules
   test_matrix_power
   test_dft
@@ -139,9 +141,11 @@
   test_module_poly
   test_bounded_recursion
   test_inline_pragma
-  test_nested_types)
+  test_nested_types
+  test_ktype_record_f64_arith)
  (libraries
   sarek
+  spoc.ir
   sarek.stdlib
   sarek.float64
   sarek_geometry
@@ -150,7 +154,8 @@
   registered_defs
   spoc_core
   test_helpers
-  unix)
+  unix
+  sarek_backend_error)
  (preprocessor_deps registered_defs.ml)
  (preprocess
   (pps sarek_ppx))
@@ -380,7 +385,8 @@
   test_pragma.exe
   test_barrier_converged.exe
   test_superstep.exe
-  test_inline_pragma.exe))
+  test_inline_pragma.exe
+  test_ppx_scan_failure_warning.exe))
 
 ; Build-gate the compile-only tests under default `runtest` too, so a
 ; compile regression still fails CI, without executing them (this is the
@@ -396,7 +402,34 @@
   test_pragma.exe
   test_barrier_converged.exe
   test_superstep.exe
-  test_inline_pragma.exe))
+  test_inline_pragma.exe
+  test_ppx_scan_failure_warning.exe))
+
+; Regression tests wired to executing runtest rules (found unwired by
+; scripts/check-test-alias-coverage.sh - the guard added after the 2026-07
+; vacuous-e2e fix). test_vulkan_interleaved_push_constants self-skips
+; without a Vulkan device.
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_native_create_array.exe})))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_native_downto.exe})))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_bare_float_is_float32.exe})))
+
+(rule
+ (alias runtest)
+ (enabled_if %{lib-available:sarek_vulkan})
+ (action
+  (run %{dep:test_vulkan_interleaved_push_constants.exe})))
 
 ; e2e-gpu alias: requires an actual GPU backend (no Native/Interpreter
 ; fallback path exists in the test). Not part of default `runtest`.
@@ -533,6 +566,23 @@
  (action
   (run %{dep:test_vulkan_float64.exe})))
 
+; Recursion + vector-parameter helper on Vulkan: builds a loop-form
+; vector-reduction helper (the shape tail-recursion elimination produces) and
+; runs it end-to-end, exercising the vector-helper inlining pass through GLSL
+; and glslangValidator to a real device. Device-filtered to Vulkan; skips
+; cleanly if none present.
+
+(executable
+ (name test_vulkan_recursion_vector)
+ (modules test_vulkan_recursion_vector)
+ (optional)
+ (libraries sarek_ir sarek_execute sarek_vulkan spoc_core))
+
+(rule
+ (alias e2e-gpu)
+ (action
+  (run %{dep:test_vulkan_recursion_vector.exe})))
+
 ; PR-5a proof: FFI-free stdlib metadata population
 ; Asserts that sarek_stdlib_meta populates Sarek_ppx_registry without
 ; any Ctypes or Spoc_core dependency (sarek_frontend + sarek_stdlib_meta only).
@@ -580,7 +630,8 @@
   sarek.real64
   spoc_core
   test_helpers
-  unix)
+  unix
+  sarek_backend_error)
  (preprocessor_deps
   (file ../../Sarek_df64/Sarek_df64.ml))
  (preprocess
@@ -642,7 +693,8 @@
   sarek_ir
   spoc_core
   test_helpers
-  unix)
+  unix
+  sarek_backend_error)
  (preprocess
   (pps sarek_ppx)))
 
@@ -650,3 +702,376 @@
  (alias runtest)
  (action
   (run %{dep:test_float64_kernel_arith.exe})))
+
+; L12 Tier-0 defunctionalization E2E (Sarek_defunc). Self-verifying against a
+; pure-OCaml reference on every available device (Native/Interpreter always,
+; plus any GPU backend present). int32-only, no custom types.
+
+(executable
+ (name test_defunc)
+ (modules test_defunc)
+ (libraries sarek sarek.stdlib sarek_ir spoc_core test_helpers unix)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_defunc.exe})))
+
+; L13 tuple-typed vectors E2E ((float32 * int32) vector). Builds the host
+; custom_type with sarek.tuple_vec, runs a read-modify-write kernel on every
+; available device, checks against a pure-OCaml reference. GPU devices
+; (CUDA/PTX under ZLUDA, Vulkan, OpenCL) AND Native must pass; only the
+; Interpreter is reported NOT-YET-SUPPORTED (its evaluator's tuple
+; value-model unification is a follow-up — see L13 design doc).
+
+(executable
+ (name test_tuple_vector)
+ (modules test_tuple_vector)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  spoc_core
+  sarek.tuple_vec
+  sarek_native
+  sarek_interpreter
+  sarek_cuda
+  sarek_opencl
+  sarek_vulkan
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_tuple_vector.exe})))
+
+; L14 static tag erasure E2E (Sarek_tag_erasure). A variant-typed kernel-local
+; slot written once by a literal constructor and read only as a match scrutinee
+; has its tag/branch erased for codegen. Self-verifying: (1) emitted CUDA-C
+; carries no tag/switch for the erasable kernels but does for a runtime-selected
+; control, and (2) behaviour matches a pure-OCaml reference on every device
+; (Native/Interpreter always, plus any GPU backend present).
+
+(executable
+ (name test_static_tag_erasure)
+ (modules test_static_tag_erasure)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  sarek.codegen
+  spoc_core
+  test_helpers
+  sarek_native
+  sarek_interpreter
+  sarek_cuda
+  sarek_opencl
+  sarek_vulkan
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_static_tag_erasure.exe})))
+
+; Tier 1a SoA correctness: AoS and SoA kernels produce identical values on
+; every device (Spoc_core.Soa host transpose + scalar transfer path).
+
+(executable
+ (name test_soa_aos_equiv)
+ (modules test_soa_aos_equiv)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  spoc_core
+  test_helpers
+  sarek_native
+  sarek_interpreter
+  sarek_cuda
+  sarek_opencl
+  sarek_vulkan
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_soa_aos_equiv.exe})))
+
+; Tier 1b SoA emitter equivalence: a single custom-vector kernel param lowered
+; SoA (Sarek_ir_ptx.generate ~soa_params) computes identical results to the AoS
+; lowering of the same IR and to an OCaml reference, on CUDA/PTX (ZLUDA).
+
+(executable
+ (name test_soa_emitter_equiv)
+ (modules test_soa_emitter_equiv)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek.codegen
+  sarek_ir
+  spoc_core
+  test_helpers
+  sarek_native
+  sarek_interpreter
+  sarek_cuda
+  sarek_opencl
+  sarek_vulkan
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_soa_emitter_equiv.exe})))
+
+; L17b polymorphic bare float literals: bare (unsuffixed) literals inferred as
+; float64 from an f64 context, executed on all devices vs an OCaml f64 reference.
+
+(executable
+ (name test_bare_float_infers_f64)
+ (modules test_bare_float_infers_f64)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek.float64
+  sarek_ir
+  spoc_core
+  test_helpers
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_bare_float_infers_f64.exe})))
+
+; Palier B: single-source real64 kernel ([%kernel.real64]). ONE authored body
+; expands to both the native-f64 and df64 lowerings; same op-check coverage as
+; test_real64, both substrates forced on every device.
+
+(executable
+ (name test_real64_single_source)
+ (modules test_real64_single_source)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek.df64
+  sarek.float64
+  sarek.real64
+  spoc_core
+  test_helpers
+  unix
+  sarek_backend_error)
+ (preprocessor_deps
+  (file ../../Sarek_df64/Sarek_df64.ml))
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_real64_single_source.exe})))
+
+; L14 S2: record-field static tag erasure. A kernel-local record whose
+; variant-typed field is written by a literal constructor and read only as a
+; match scrutinee is lowered to a synthesized all-scalar record ([_erec_*]),
+; erasing the nested variant and unblocking every backend. Self-verifying:
+; emitted CUDA-C carries no tag and the synthesized record for the erasable
+; kernels, keeps the tag for a runtime-selected control, and leaves a
+; variant-free record untouched; behaviour matches a pure-OCaml reference on
+; every device (Native-only for the retained control).
+
+(executable
+ (name test_record_field_tag_erasure)
+ (modules test_record_field_tag_erasure)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  sarek.codegen
+  spoc_core
+  test_helpers
+  sarek_native
+  sarek_interpreter
+  sarek_cuda
+  sarek_opencl
+  sarek_vulkan
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_record_field_tag_erasure.exe})))
+
+; H1 signed int32 div/rem hardware probe. Plain DSL [/] and [mod] on int32
+; run against OCaml Int32.div/Int32.rem on every available device (Native /
+; Interpreter always, plus CUDA/PTX under ZLUDA and any other GPU backend).
+; A wrong result from any device that ran is a hard failure - this is the
+; executed proof of the div.s32/rem.s32 retarget the snapshot only asserts.
+; Run with:
+;   LD_LIBRARY_PATH=$HOME/opt/zluda \
+;     dune exec sarek/tests/e2e/test_ptx_signed_arith.exe
+
+(executable
+ (name test_ptx_signed_arith)
+ (modules test_ptx_signed_arith)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  spoc_core
+  test_helpers
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_ptx_signed_arith.exe})))
+
+(executable
+ (name test_glsl_mod_single_eval)
+ (modules test_glsl_mod_single_eval)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  spoc_core
+  test_helpers
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_glsl_mod_single_eval.exe})))
+
+(executable
+ (name test_reserved_prefix_positive)
+ (modules test_reserved_prefix_positive)
+ (libraries sarek sarek.stdlib sarek_ir)
+ (preprocess
+  (pps sarek_ppx)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_reserved_prefix_positive.exe})))
+
+; local-tuple E2E: kernel-LOCAL primitive tuple bindings (let-bound literal,
+; let-pattern / match destructure, tuple through an if-branch, mixed
+; float32*int32) lowered to the L13 synthesized [_tup_*] positional record.
+; Axis 1 asserts the emitted CUDA/OpenCL/GLSL declares the slot with the
+; struct type (not the placeholder int); Axis 2 runs every position on every
+; available device (Native/Interpreter always, plus any GPU backend) against a
+; pure-OCaml reference. Self-verifying: exits nonzero on any mismatch.
+
+(executable
+ (name test_local_tuple)
+ (modules test_local_tuple)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  sarek.codegen
+  spoc_core
+  test_helpers
+  sarek_native
+  sarek_interpreter
+  sarek_cuda
+  sarek_opencl
+  sarek_vulkan
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_local_tuple.exe})))
+
+; deriver-variant-fields: a [@@sarek.type] record with a VARIANT-typed field as
+; a vector element, round-tripping host->device->host on the value-based
+; backends (Interpreter + Native). Fixes the L14-S2 PR #251
+; `Field 'kind' expected record` boundary bug; also covers a standalone variant
+; vector round-trip. Device backends stay out of scope (nested-variant byte
+; layout is Rocq-coupled); the erasable case already runs there via L14-S2.
+
+(executable
+ (name test_ktype_record_variant_field)
+ (modules test_ktype_record_variant_field)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  spoc_core
+  test_helpers
+  sarek_native
+  sarek_interpreter
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_ktype_record_variant_field.exe})))
+
+; ktype-record-f64-arith: a [@@sarek.type] record with float64 fields used as a
+; vector, with float64 ARITHMETIC on the fields. CPU-safe and self-verifying
+; (exits nonzero on a verified-device mismatch), so it gates in the default
+; runtest alias. RUSTICL_FEATURES=fp64 is set so the rusticl OpenCL ICD
+; advertises cl_khr_fp64 and the OpenCL leg is actually exercised (rather than
+; skipped); devices that still lack fp64 are skipped, never failed. Harmless on
+; non-rusticl ICDs, which ignore the variable.
+
+(rule
+ (alias runtest)
+ (action
+  (setenv
+   RUSTICL_FEATURES
+   fp64
+   (run %{dep:test_ktype_record_f64_arith.exe}))))

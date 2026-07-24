@@ -87,6 +87,106 @@ let custom_descriptor_expr_of_lid ~loc lid =
       Ast_builder.Default.pexp_ident ~loc {txt = ident; loc}
   | [] -> Ast_builder.Default.evar ~loc "unknown_custom"
 
+(** Interpreter value-model converters, shared by the record and variant helper
+    generators ([generate_interp_helpers]).
+
+    [value_to_ocaml]: extract the OCaml scalar / nested-custom value of type
+    [ct] from a runtime [value] expression (used by record [from_values] field
+    converters and variant [from_value] payload reconstruction).
+
+    [value_from_ocaml]: wrap an OCaml scalar / nested-custom value of type [ct]
+    into the corresponding runtime [value] (used by record [to_values]/
+    [get_field] and variant [to_value]).
+
+    A nested custom type (record OR variant) is delegated to its registered
+    helper via [lookup_typed <ct>_custom.type_id]; the [value_to_ocaml] nested
+    arm accepts BOTH [VRecord] and [VVariant] — a variant-typed field is no
+    longer rejected with "expected record" (the L14-S2 PR #251 break). [what]
+    names the field/argument for error messages. *)
+let value_to_ocaml ~loc ~(what : string) (ct : core_type)
+    (value_expr : expression) : expression =
+  let estr s = Ast_builder.Default.estring ~loc s in
+  match ct.ptyp_desc with
+  | Ptyp_constr ({txt = Lident ("float32" | "float"); _}, _) ->
+      [%expr
+        match [%e value_expr] with
+        | Sarek.Sarek_value.VFloat32 f -> f
+        | Sarek.Sarek_value.VFloat64 f -> f
+        | _ -> failwith [%e estr (what ^ " expected float32, got wrong type")]]
+  | Ptyp_constr ({txt = Lident "float64"; _}, _) ->
+      [%expr
+        match [%e value_expr] with
+        | Sarek.Sarek_value.VFloat64 f -> f
+        | Sarek.Sarek_value.VFloat32 f -> f
+        | _ -> failwith [%e estr (what ^ " expected float64, got wrong type")]]
+  | Ptyp_constr ({txt = Lident "int32"; _}, _) ->
+      [%expr
+        match [%e value_expr] with
+        | Sarek.Sarek_value.VInt32 n -> n
+        | _ -> failwith [%e estr (what ^ " expected int32, got wrong type")]]
+  | Ptyp_constr ({txt = Lident "int"; _}, _) ->
+      (* Bare [int] fields are 4-byte on the host ABI and carried through the
+         VInt32 value model; convert the int32 payload back to a native int. *)
+      [%expr
+        match [%e value_expr] with
+        | Sarek.Sarek_value.VInt32 n -> Int32.to_int n
+        | _ -> failwith [%e estr (what ^ " expected int, got wrong type")]]
+  | Ptyp_constr ({txt = Lident "int64"; _}, _) ->
+      [%expr
+        match [%e value_expr] with
+        | Sarek.Sarek_value.VInt64 n -> n
+        | _ -> failwith [%e estr (what ^ " expected int64, got wrong type")]]
+  | Ptyp_constr ({txt = Lident "bool"; _}, _) ->
+      [%expr
+        match [%e value_expr] with
+        | Sarek.Sarek_value.VBool b -> b
+        | _ -> failwith [%e estr (what ^ " expected bool")]]
+  | Ptyp_constr ({txt; _}, _) ->
+      let custom_type = String.concat "." (flatten_longident txt) in
+      let custom_expr = custom_descriptor_expr_of_lid ~loc txt in
+      [%expr
+        match [%e value_expr] with
+        | (Sarek.Sarek_value.VRecord _ | Sarek.Sarek_value.VVariant _) as nested
+          -> (
+            match
+              Sarek.Sarek_type_helpers.lookup_typed
+                [%e custom_expr].Spoc_core.Vector.type_id
+            with
+            | Some (module H) -> H.from_value nested
+            | None ->
+                failwith [%e estr ("No helper for nested type " ^ custom_type)])
+        | _ -> failwith [%e estr (what ^ " expected record or variant")]]
+  | _ -> [%expr failwith [%e estr ("Unsupported field type: " ^ what)]]
+
+let value_from_ocaml ~loc ~(what : string) (ct : core_type)
+    (ocaml_expr : expression) : expression =
+  let estr s = Ast_builder.Default.estring ~loc s in
+  match ct.ptyp_desc with
+  | Ptyp_constr ({txt = Lident ("float32" | "float"); _}, _) ->
+      [%expr Sarek.Sarek_value.VFloat32 [%e ocaml_expr]]
+  | Ptyp_constr ({txt = Lident "float64"; _}, _) ->
+      [%expr Sarek.Sarek_value.VFloat64 [%e ocaml_expr]]
+  | Ptyp_constr ({txt = Lident "int32"; _}, _) ->
+      [%expr Sarek.Sarek_value.VInt32 [%e ocaml_expr]]
+  | Ptyp_constr ({txt = Lident "int"; _}, _) ->
+      (* Bare [int] field: wrap the native int as VInt32 (host ABI is 4-byte). *)
+      [%expr Sarek.Sarek_value.VInt32 (Int32.of_int [%e ocaml_expr])]
+  | Ptyp_constr ({txt = Lident "int64"; _}, _) ->
+      [%expr Sarek.Sarek_value.VInt64 [%e ocaml_expr]]
+  | Ptyp_constr ({txt = Lident "bool"; _}, _) ->
+      [%expr Sarek.Sarek_value.VBool [%e ocaml_expr]]
+  | Ptyp_constr ({txt; _}, _) ->
+      let custom_type = String.concat "." (flatten_longident txt) in
+      let custom_expr = custom_descriptor_expr_of_lid ~loc txt in
+      [%expr
+        match
+          Sarek.Sarek_type_helpers.lookup_typed
+            [%e custom_expr].Spoc_core.Vector.type_id
+        with
+        | Some (module H) -> H.to_value [%e ocaml_expr]
+        | None -> failwith [%e estr ("No helper for type " ^ custom_type)]]
+  | _ -> [%expr failwith [%e estr ("Unsupported field type: " ^ what)]]
+
 let rec core_type_to_sarek_type_expr ~loc (ct : core_type) =
   match ct.ptyp_desc with
   | Ptyp_constr ({txt; _}, args) ->
@@ -120,7 +220,12 @@ let type_align_registry : (string, int) Hashtbl.t = Hashtbl.create 16
    positive power of two (4 or 8) here; [a <= 1] is the identity. *)
 let align_up off a = if a <= 1 then off else (off + a - 1) / a * a
 
-(* Get size of a type, checking registry for custom types *)
+(* Get size of a type, checking registry for custom types.
+
+   Unknown or non-simple field types are a HARD ERROR, not a silent 4-byte
+   default: these sizes feed the aligned host ABI (L8), and a wrong
+   size/alignment silently desynchronizes host bytes from the device layout
+   (audit finding M6). *)
 let get_type_size_from_core_type (ct : core_type) : int =
   match ct.ptyp_desc with
   | Ptyp_constr ({txt = Lident "int32"; _}, _) -> 4
@@ -129,10 +234,23 @@ let get_type_size_from_core_type (ct : core_type) : int =
   | Ptyp_constr ({txt = Lident "float"; _}, _) -> 4 (* GPU float32 *)
   | Ptyp_constr ({txt = Lident "float64"; _}, _) -> 8
   | Ptyp_constr ({txt = Lident "int"; _}, _) -> 4
+  | Ptyp_constr ({txt = Lident "bool"; _}, _) -> 4
+  | Ptyp_constr ({txt = Lident "unit"; _}, _) -> 4
   | Ptyp_constr ({txt = Lident type_name; _}, _) -> (
       (* Check if it's a known custom type *)
-      try Hashtbl.find type_size_registry type_name with Not_found -> 4)
-  | _ -> 4
+      try Hashtbl.find type_size_registry type_name
+      with Not_found ->
+        Location.raise_errorf
+          ~loc:ct.ptyp_loc
+          "sarek: unknown size for field type '%s' - register it with \
+           [%%ktype] before using it as a record/variant field (a silent \
+           default would corrupt the host/device layout)"
+          type_name)
+  | _ ->
+      Location.raise_errorf
+        ~loc:ct.ptyp_loc
+        "sarek: unsupported field type in a GPU record/variant - only scalar \
+         types and [%%ktype]-registered names are supported here"
 
 (* Natural alignment of a field type, mirroring Sarek_ir_layout.elttype_align:
    4 for 32-bit scalars, 8 for int64/float64, and the registered alignment for a
@@ -145,9 +263,22 @@ let get_type_align_from_core_type (ct : core_type) : int =
   | Ptyp_constr ({txt = Lident "float"; _}, _) -> 4 (* GPU float32 *)
   | Ptyp_constr ({txt = Lident "float64"; _}, _) -> 8
   | Ptyp_constr ({txt = Lident "int"; _}, _) -> 4
+  | Ptyp_constr ({txt = Lident "bool"; _}, _) -> 4
+  | Ptyp_constr ({txt = Lident "unit"; _}, _) -> 4
   | Ptyp_constr ({txt = Lident type_name; _}, _) -> (
-      try Hashtbl.find type_align_registry type_name with Not_found -> 4)
-  | _ -> 4
+      try Hashtbl.find type_align_registry type_name
+      with Not_found ->
+        Location.raise_errorf
+          ~loc:ct.ptyp_loc
+          "sarek: unknown alignment for field type '%s' - register it with \
+           [%%ktype] before using it as a record/variant field (a silent \
+           default would corrupt the host/device layout)"
+          type_name)
+  | _ ->
+      Location.raise_errorf
+        ~loc:ct.ptyp_loc
+        "sarek: unsupported field type in a GPU record/variant - only scalar \
+         types and [%%ktype]-registered names are supported here"
 
 (* Aligned immediate-field offset table for a record: each field placed at the
    next offset satisfying its natural alignment. Returns (name, offset, type)
@@ -1137,96 +1268,11 @@ let generate_interp_helpers ~loc (td : type_declaration) : structure_item list =
               [%expr arr.([%e Ast_builder.Default.eint ~loc i])]
             in
             let converter =
-              match field_type.ptyp_desc with
-              | Ptyp_constr ({txt = Lident "float32"; _}, _)
-              | Ptyp_constr ({txt = Lident "float"; _}, _) ->
-                  [%expr
-                    match [%e array_access] with
-                    | Sarek.Sarek_value.VFloat32 f -> f
-                    | Sarek.Sarek_value.VFloat64 f -> f
-                    | _ ->
-                        failwith
-                          [%e
-                            Ast_builder.Default.estring
-                              ~loc
-                              ("Field '" ^ field_name
-                             ^ "' expected float32, got wrong type")]]
-              | Ptyp_constr ({txt = Lident "float64"; _}, _) ->
-                  [%expr
-                    match [%e array_access] with
-                    | Sarek.Sarek_value.VFloat64 f -> f
-                    | Sarek.Sarek_value.VFloat32 f -> f
-                    | _ ->
-                        failwith
-                          [%e
-                            Ast_builder.Default.estring
-                              ~loc
-                              ("Field '" ^ field_name
-                             ^ "' expected float64, got wrong type")]]
-              | Ptyp_constr ({txt = Lident "int32"; _}, _)
-              | Ptyp_constr ({txt = Lident "int"; _}, _) ->
-                  [%expr
-                    match [%e array_access] with
-                    | Sarek.Sarek_value.VInt32 n -> n
-                    | _ ->
-                        failwith
-                          [%e
-                            Ast_builder.Default.estring
-                              ~loc
-                              ("Field '" ^ field_name
-                             ^ "' expected int32, got wrong type")]]
-              | Ptyp_constr ({txt = Lident "int64"; _}, _) ->
-                  [%expr
-                    match [%e array_access] with
-                    | Sarek.Sarek_value.VInt64 n -> n
-                    | _ ->
-                        failwith
-                          [%e
-                            Ast_builder.Default.estring
-                              ~loc
-                              ("Field '" ^ field_name
-                             ^ "' expected int64, got wrong type")]]
-              | Ptyp_constr ({txt = Lident "bool"; _}, _) ->
-                  [%expr
-                    match [%e array_access] with
-                    | Sarek.Sarek_value.VBool b -> b
-                    | _ ->
-                        failwith
-                          [%e
-                            Ast_builder.Default.estring
-                              ~loc
-                              ("Field '" ^ field_name ^ "' expected bool")]]
-              | Ptyp_constr ({txt; _}, _) ->
-                  (* Nested custom type - recursively call its helper *)
-                  let custom_type = String.concat "." (flatten_longident txt) in
-                  let custom_expr = custom_descriptor_expr_of_lid ~loc txt in
-                  [%expr
-                    match [%e array_access] with
-                    | Sarek.Sarek_value.VRecord _ as nested_vrec -> (
-                        match
-                          Sarek.Sarek_type_helpers.lookup_typed
-                            [%e custom_expr].Spoc_core.Vector.type_id
-                        with
-                        | Some (module H) -> H.from_value nested_vrec
-                        | None ->
-                            failwith
-                              [%e
-                                Ast_builder.Default.estring
-                                  ~loc
-                                  ("No helper for nested type " ^ custom_type)])
-                    | _ ->
-                        failwith
-                          [%e
-                            Ast_builder.Default.estring
-                              ~loc
-                              ("Field '" ^ field_name ^ "' expected record")]]
-              | _ ->
-                  [%expr
-                    failwith
-                      [%e
-                        Ast_builder.Default.estring
-                          ~loc
-                          ("Unsupported field type: " ^ field_name)]]
+              value_to_ocaml
+                ~loc
+                ~what:("Field '" ^ field_name ^ "'")
+                field_type
+                array_access
             in
             (Ast_builder.Default.Located.lident ~loc field_name, converter))
           labels
@@ -1248,47 +1294,11 @@ let generate_interp_helpers ~loc (td : type_declaration) : structure_item list =
               let field_access =
                 Ast_builder.Default.pexp_field ~loc [%expr record] field_lid
               in
-              let converter =
-                match ld.pld_type.ptyp_desc with
-                | Ptyp_constr ({txt = Lident "float32"; _}, _)
-                | Ptyp_constr ({txt = Lident "float"; _}, _) ->
-                    [%expr Sarek.Sarek_value.VFloat32 [%e field_access]]
-                | Ptyp_constr ({txt = Lident "float64"; _}, _) ->
-                    [%expr Sarek.Sarek_value.VFloat64 [%e field_access]]
-                | Ptyp_constr ({txt = Lident "int32"; _}, _)
-                | Ptyp_constr ({txt = Lident "int"; _}, _) ->
-                    [%expr Sarek.Sarek_value.VInt32 [%e field_access]]
-                | Ptyp_constr ({txt = Lident "int64"; _}, _) ->
-                    [%expr Sarek.Sarek_value.VInt64 [%e field_access]]
-                | Ptyp_constr ({txt = Lident "bool"; _}, _) ->
-                    [%expr Sarek.Sarek_value.VBool [%e field_access]]
-                | Ptyp_constr ({txt; _}, _) ->
-                    (* Nested custom type - use helper to convert *)
-                    let custom_type =
-                      String.concat "." (flatten_longident txt)
-                    in
-                    let custom_expr = custom_descriptor_expr_of_lid ~loc txt in
-                    [%expr
-                      match
-                        Sarek.Sarek_type_helpers.lookup_typed
-                          [%e custom_expr].Spoc_core.Vector.type_id
-                      with
-                      | Some (module H) -> H.to_value [%e field_access]
-                      | None ->
-                          failwith
-                            [%e
-                              Ast_builder.Default.estring
-                                ~loc
-                                ("No helper for type " ^ custom_type)]]
-                | _ ->
-                    [%expr
-                      failwith
-                        [%e
-                          Ast_builder.Default.estring
-                            ~loc
-                            ("Unsupported field type: " ^ field_name)]]
-              in
-              converter)
+              value_from_ocaml
+                ~loc
+                ~what:("field " ^ field_name)
+                ld.pld_type
+                field_access)
             labels
         in
         let array_expr = Ast_builder.Default.elist ~loc field_conversions in
@@ -1308,41 +1318,11 @@ let generate_interp_helpers ~loc (td : type_declaration) : structure_item list =
               Ast_builder.Default.pexp_field ~loc [%expr record] field_lid
             in
             let converter =
-              match ld.pld_type.ptyp_desc with
-              | Ptyp_constr ({txt = Lident "float32"; _}, _)
-              | Ptyp_constr ({txt = Lident "float"; _}, _) ->
-                  [%expr Sarek.Sarek_value.VFloat32 [%e field_access]]
-              | Ptyp_constr ({txt = Lident "float64"; _}, _) ->
-                  [%expr Sarek.Sarek_value.VFloat64 [%e field_access]]
-              | Ptyp_constr ({txt = Lident "int32"; _}, _)
-              | Ptyp_constr ({txt = Lident "int"; _}, _) ->
-                  [%expr Sarek.Sarek_value.VInt32 [%e field_access]]
-              | Ptyp_constr ({txt = Lident "int64"; _}, _) ->
-                  [%expr Sarek.Sarek_value.VInt64 [%e field_access]]
-              | Ptyp_constr ({txt = Lident "bool"; _}, _) ->
-                  [%expr Sarek.Sarek_value.VBool [%e field_access]]
-              | Ptyp_constr ({txt; _}, _) ->
-                  let custom_type = String.concat "." (flatten_longident txt) in
-                  let custom_expr = custom_descriptor_expr_of_lid ~loc txt in
-                  [%expr
-                    match
-                      Sarek.Sarek_type_helpers.lookup_typed
-                        [%e custom_expr].Spoc_core.Vector.type_id
-                    with
-                    | Some (module H) -> H.to_value [%e field_access]
-                    | None ->
-                        failwith
-                          [%e
-                            Ast_builder.Default.estring
-                              ~loc
-                              ("No helper for type " ^ custom_type)]]
-              | _ ->
-                  [%expr
-                    failwith
-                      [%e
-                        Ast_builder.Default.estring
-                          ~loc
-                          ("Unsupported field type: " ^ field_name)]]
+              value_from_ocaml
+                ~loc
+                ~what:("field " ^ field_name)
+                ld.pld_type
+                field_access
             in
             Ast_builder.Default.case
               ~lhs:
@@ -1425,8 +1405,200 @@ let generate_interp_helpers ~loc (td : type_declaration) : structure_item list =
               [%e full_name_expr]
               (Sarek.Sarek_type_helpers.AnyHelpers (module H))];
       ]
+  | Ptype_variant constrs ->
+      (* Interpreter value-model helper for a variant type: convert the native
+         OCaml constructor to/from a [VVariant]. The interpreter tags a variant
+         by [Hashtbl.hash ctor mod 256] (Sarek_ir_interp_eval EVariant/EMatch/
+         SMatch), NOT by the declaration index the byte path uses; the tag is
+         emitted as a runtime [Hashtbl.hash "C" mod 256] expression so it
+         matches that convention byte-for-byte regardless of compile vs runtime.
+
+         This makes a variant field of a [@@sarek.type] record round-trip on the
+         Interpreter/Native value path (the record helper delegates the field to
+         this helper's [from_value]/[to_value]) and lets a standalone variant
+         vector element decode to a [VVariant]. It does NOT give the variant a
+         nested byte layout (that stays a Sarek_ir_layout Nested_variant
+         rejection — Rocq-coupled, out of scope), so device backends are
+         unaffected. *)
+      let cvar i = "x" ^ string_of_int i in
+      let tag_of cname =
+        [%expr Hashtbl.hash [%e Ast_builder.Default.estring ~loc cname] mod 256]
+      in
+      let payload_cts (cd : constructor_declaration) : core_type list =
+        match cd.pcd_args with
+        | Pcstr_tuple cts -> cts
+        | Pcstr_record _ ->
+            Location.raise_errorf
+              ~loc
+              "sarek: inline records in [@@sarek.type] variant constructors \
+               are not supported"
+      in
+      (* to_value: C (a, b, ..) -> VVariant (full_name, tag, [Va; Vb; ..]) *)
+      let to_value_cases =
+        List.map
+          (fun (cd : constructor_declaration) ->
+            let cname = cd.pcd_name.txt in
+            let cts = payload_cts cd in
+            let arg_pat, arg_values =
+              match cts with
+              | [] -> (None, [])
+              | [ct] ->
+                  ( Some (Ast_builder.Default.pvar ~loc (cvar 0)),
+                    [
+                      value_from_ocaml
+                        ~loc
+                        ~what:cname
+                        ct
+                        (Ast_builder.Default.evar ~loc (cvar 0));
+                    ] )
+              | cts ->
+                  let pats =
+                    List.mapi
+                      (fun i _ -> Ast_builder.Default.pvar ~loc (cvar i))
+                      cts
+                  in
+                  let vals =
+                    List.mapi
+                      (fun i ct ->
+                        value_from_ocaml
+                          ~loc
+                          ~what:cname
+                          ct
+                          (Ast_builder.Default.evar ~loc (cvar i)))
+                      cts
+                  in
+                  (Some (Ast_builder.Default.ppat_tuple ~loc pats), vals)
+            in
+            let lhs =
+              Ast_builder.Default.ppat_construct
+                ~loc
+                (Ast_builder.Default.Located.lident ~loc cname)
+                arg_pat
+            in
+            let rhs =
+              [%expr
+                Sarek.Sarek_value.VVariant
+                  ( [%e full_name_expr],
+                    [%e tag_of cname],
+                    [%e Ast_builder.Default.elist ~loc arg_values] )]
+            in
+            Ast_builder.Default.case ~lhs ~guard:None ~rhs)
+          constrs
+      in
+      let to_value_fn =
+        [%expr
+          fun v ->
+            [%e Ast_builder.Default.pexp_match ~loc [%expr v] to_value_cases]]
+      in
+      (* from_value: VVariant (_, tag, args) -> the constructor whose hashed name
+         equals [tag]; payload rebuilt positionally from [args]. Falls back to
+         the first constructor on an unknown tag (mirrors the byte-path get
+         fallback). *)
+      let build_ctor (cd : constructor_declaration) : expression =
+        let cname = cd.pcd_name.txt in
+        let cts = payload_cts cd in
+        let nth i =
+          value_to_ocaml
+            ~loc
+            ~what:(cname ^ " arg " ^ string_of_int i)
+            (List.nth cts i)
+            [%expr List.nth args [%e Ast_builder.Default.eint ~loc i]]
+        in
+        let arg =
+          match cts with
+          | [] -> None
+          | [_] -> Some (nth 0)
+          | cts ->
+              Some
+                (Ast_builder.Default.pexp_tuple
+                   ~loc
+                   (List.mapi (fun i _ -> nth i) cts))
+        in
+        Ast_builder.Default.pexp_construct
+          ~loc
+          (Ast_builder.Default.Located.lident ~loc cname)
+          arg
+      in
+      let from_value_chain =
+        let fallback =
+          match constrs with
+          | first :: _ -> build_ctor first
+          | [] -> [%expr failwith "empty variant"]
+        in
+        List.fold_right
+          (fun (cd : constructor_declaration) acc ->
+            [%expr
+              if tag = [%e tag_of cd.pcd_name.txt] then [%e build_ctor cd]
+              else [%e acc]])
+          constrs
+          fallback
+      in
+      let from_value_fn =
+        [%expr
+          fun v ->
+            match v with
+            | Sarek.Sarek_value.VVariant (_, tag, args) ->
+                ignore args ;
+                [%e from_value_chain]
+            | _ ->
+                failwith
+                  [%e
+                    Ast_builder.Default.estring
+                      ~loc
+                      ("Expected " ^ type_name ^ " VVariant")]]
+      in
+      let helper_module_name = type_name ^ "_interp_helpers" in
+      let type_lid = Ast_builder.Default.Located.lident ~loc type_name in
+      let helper_module_lid =
+        Ast_builder.Default.Located.lident ~loc helper_module_name
+      in
+      [
+        Ast_builder.Default.pstr_module
+          ~loc
+          (Ast_builder.Default.module_binding
+             ~loc
+             ~name:
+               (Ast_builder.Default.Located.mk ~loc (Some helper_module_name))
+             ~expr:
+               (Ast_builder.Default.pmod_structure
+                  ~loc
+                  [
+                    [%stri
+                      type t =
+                        [%t Ast_builder.Default.ptyp_constr ~loc type_lid []]];
+                    [%stri
+                      let type_id =
+                        [%e
+                          Ast_builder.Default.evar ~loc (type_name ^ "_custom")]
+                          .Spoc_core.Vector.type_id];
+                    [%stri let to_value = [%e to_value_fn]];
+                    [%stri let from_value = [%e from_value_fn]];
+                    (* A variant is not a named-field aggregate; the HELPERS
+                       [from_values]/[to_values]/[get_field] members exist only
+                       to satisfy the signature and are defined in terms of the
+                       single-value converters. *)
+                    [%stri let to_values v = [|to_value v|]];
+                    [%stri let from_values arr = from_value arr.(0)];
+                    [%stri
+                      let get_field _ _ =
+                        failwith
+                          [%e
+                            Ast_builder.Default.estring
+                              ~loc
+                              (type_name ^ " is a variant: no named fields")]];
+                  ]));
+        [%stri
+          let () =
+            let module H =
+              [%m
+              Ast_builder.Default.pmod_ident ~loc helper_module_lid]
+            in
+            Sarek.Sarek_type_helpers.register
+              [%e full_name_expr]
+              (Sarek.Sarek_type_helpers.AnyHelpers (module H))];
+      ]
   | _ ->
-      (* Only generate helpers for records *)
+      (* Abstract / open / extensible types have no value-model helper. *)
       []
 
 (** Generate runtime registration code for a type. The PPX emits calls to
@@ -1665,6 +1837,16 @@ let expand_kernel ~ctxt payload : expression =
             Sarek_debug.log_to_file "  step 5: monomorphization done" ;
             Sarek_debug.log_exit "monomorphize" ;
 
+            (* 5b. Defunctionalization pass (Tier 0) - eliminate first-class
+               function values bound to `let` variables by distributing
+               applications into if/match selectors, so lowering only ever
+               sees directly-named callees. See Sarek_defunc.ml. *)
+            Sarek_debug.log_to_file "  step 5b: defunctionalization start" ;
+            Sarek_debug.log_enter "defunctionalize" ;
+            let tkernel = Sarek_defunc.defunctionalize tkernel in
+            Sarek_debug.log_to_file "  step 5b: defunctionalization done" ;
+            Sarek_debug.log_exit "defunctionalize" ;
+
             (* 6. Tail recursion elimination pass (for GPU code) *)
             (* Keep original kernel for native OCaml which handles recursion *)
             let native_kernel = tkernel in
@@ -1673,6 +1855,16 @@ let expand_kernel ~ctxt payload : expression =
             let tkernel = Sarek_tailrec.transform_kernel tkernel in
             Sarek_debug.log_to_file "  step 6: tailrec transform done" ;
             Sarek_debug.log_exit "transform_kernel" ;
+
+            (* 6b. Static tag erasure (L14, scoped tier) - device path only.
+               Erase statically-known variant tags from kernel-local slots
+               before lowering; [native_kernel] captured above keeps the tag
+               and stays the OCaml reference. See Sarek_tag_erasure.ml. *)
+            Sarek_debug.log_to_file "  step 6b: tag erasure start" ;
+            Sarek_debug.log_enter "erase_tags" ;
+            let tkernel = Sarek_tag_erasure.erase_tags tkernel in
+            Sarek_debug.log_to_file "  step 6b: tag erasure done" ;
+            Sarek_debug.log_exit "erase_tags" ;
 
             (* 7. Lower to Sarek_ir *)
             let kern_name = Option.value ~default:"anon" tkernel.tkern_name in
@@ -1740,6 +1932,253 @@ let kernel_extension =
     Extension.Context.expression
     Ast_pattern.(single_expr_payload __)
     expand_kernel
+
+(* ==========================================================================
+   Single-source real64 kernels ([%kernel.real64 ...], palier B)
+
+   Authors write ONE kernel body over an abstract [real64 vector] element type
+   using +. -. *. /. and sqrt. The extension expands the SAME surface AST TWICE
+   - once as a native IEEE-754 float64 kernel, once as a df64 double-float
+   kernel - and returns the pair [(native, fallback)]. Both variants are then
+   the ordinary [%kernel] outputs Sarek_real64.select / kernel_ir already know
+   how to consume: no IR or codegen change, everything downstream is reused.
+
+   The df64 substitution maps arithmetic operators and sqrt to the df64 helper
+   calls, G-suffix literals to df64 records, the element type to Sarek_df64.df64,
+   and REJECTS constructs df64 lacks (transcendentals) with a clear error. The
+   native substitution maps sqrt to Float64.sqrt and rejects the same
+   unsupported set (real64 promises neither path more than the intersection).
+   ========================================================================== *)
+module Real64_lowering = struct
+  (* real64's op set is the INTERSECTION of the native-f64 and df64 substrates.
+     df64 has no transcendentals, so reject them at expansion rather than
+     lowering only one variant of the pair. *)
+  let unsupported_ops =
+    [
+      "sin";
+      "cos";
+      "tan";
+      "asin";
+      "acos";
+      "atan";
+      "atan2";
+      "sinh";
+      "cosh";
+      "tanh";
+      "exp";
+      "expm1";
+      "log";
+      "log2";
+      "log10";
+      "log1p";
+      "pow";
+      "**";
+      "cbrt";
+      "hypot";
+      "fabs";
+      "floor";
+      "ceil";
+      "round";
+      "trunc";
+    ]
+
+  let arith_fn = function
+    | "+." -> Some "df64_add"
+    | "-." -> Some "df64_sub"
+    | "*." -> Some "df64_mul"
+    | "/." -> Some "df64_div"
+    | _ -> None
+
+  (* real64 element type -> concrete substrate element type in every core-type
+     position (kernel param annotations, let-bound annotations, ...). *)
+  let subst_type (replacement : Longident.t) =
+    object
+      inherit Ast_traverse.map as super
+
+      method! core_type ct =
+        let ct = super#core_type ct in
+        match ct.ptyp_desc with
+        | Ptyp_constr ({txt = Lident "real64"; loc}, args) ->
+            {ct with ptyp_desc = Ptyp_constr ({txt = replacement; loc}, args)}
+        | _ -> ct
+    end
+
+  let ident ~loc name =
+    Ast_builder.Default.pexp_ident ~loc {txt = Lident name; loc}
+
+  let reject_unsupported ~loc op =
+    Location.raise_errorf
+      ~loc
+      "[%%kernel.real64]: operation '%s' is not part of the real64 contract. \
+       real64 exposes only +. -. *. /. and sqrt (the intersection of the \
+       native-f64 and df64 fallback substrates; the df64 fallback has no \
+       transcendentals)."
+      op
+
+  (* df64 fallback body: operators and sqrt become df64 helper calls, G-suffix
+     literals become df64 records, transcendentals are rejected. *)
+  let df64_expr =
+    object (self)
+      inherit Ast_traverse.map as super
+
+      method! expression e =
+        let loc = e.pexp_loc in
+        match e.pexp_desc with
+        | Pexp_apply
+            ( {pexp_desc = Pexp_ident {txt = Lident op; _}; _},
+              [(Nolabel, a); (Nolabel, b)] )
+          when arith_fn op <> None ->
+            let fn = Option.get (arith_fn op) in
+            Ast_builder.Default.eapply
+              ~loc
+              (ident ~loc fn)
+              [self#expression a; self#expression b]
+        | Pexp_apply
+            ( {pexp_desc = Pexp_ident {txt = Lident "sqrt"; _}; _},
+              [(Nolabel, x)] ) ->
+            Ast_builder.Default.eapply
+              ~loc
+              (ident ~loc "df64_sqrt")
+              [self#expression x]
+        | Pexp_apply
+            ({pexp_desc = Pexp_ident {txt = Lident op; loc = oloc}; _}, _)
+          when List.mem op unsupported_ops ->
+            reject_unsupported ~loc:oloc op
+        | Pexp_constant (Pconst_float (s, (Some 'g' | Some 'G'))) ->
+            (* Faithful two-float32 split of the binary64 literal into a df64
+               record {hi; lo}: hi carries the leading ~24 bits, lo the next. *)
+            let round_f32 x = Int32.float_of_bits (Int32.bits_of_float x) in
+            let x = float_of_string s in
+            let hi = round_f32 x in
+            let lo = round_f32 (x -. hi) in
+            let flit v =
+              Ast_builder.Default.pexp_constant
+                ~loc
+                (Pconst_float (Printf.sprintf "%h" v, None))
+            in
+            Ast_builder.Default.pexp_record
+              ~loc
+              [
+                ({txt = Lident "hi"; loc}, flit hi);
+                ({txt = Lident "lo"; loc}, flit lo);
+              ]
+              None
+        | _ -> super#expression e
+    end
+
+  (* Native f64 body: sqrt -> Float64.sqrt, transcendentals rejected. Operators
+     and G-suffix literals lower unchanged (float64). *)
+  let native_expr =
+    object (self)
+      inherit Ast_traverse.map as super
+
+      method! expression e =
+        let loc = e.pexp_loc in
+        match e.pexp_desc with
+        | Pexp_apply
+            ( {pexp_desc = Pexp_ident {txt = Lident "sqrt"; _}; _},
+              [(Nolabel, x)] ) ->
+            Ast_builder.Default.eapply
+              ~loc
+              (Ast_builder.Default.pexp_ident
+                 ~loc
+                 {txt = Ldot (Lident "Float64", "sqrt"); loc})
+              [self#expression x]
+        | Pexp_apply
+            ({pexp_desc = Pexp_ident {txt = Lident op; loc = oloc}; _}, _)
+          when List.mem op unsupported_ops ->
+            reject_unsupported ~loc:oloc op
+        | _ -> super#expression e
+    end
+
+  (* Inject a [let open M in] around the innermost function body so the
+     substrate's ops (df64_* helpers, float64 operators) resolve exactly as in
+     a hand-written body.
+
+     Done in the frozen Ast_502 representation via the repo's own converters
+     (Sarek_parse_helpers.expression_{to,of}_502), mirroring how
+     collect_fun_params walks the fun chain. This is version-robust: the
+     ambient ppxlib AST merged [Pexp_fun] into [Pexp_function] in 5.2+, but
+     Ast_502 always exposes [Pexp_function (params, _, Pfunction_body body)]. *)
+  let open_in_body modname (e : expression) : expression =
+    let module P = Astlib.Ast_502.Parsetree in
+    let module A = Astlib.Ast_502.Asttypes in
+    let mk_open (body : P.expression) : P.expression =
+      let loc = body.P.pexp_loc in
+      let md : P.module_expr =
+        {
+          P.pmod_desc = P.Pmod_ident {txt = Longident.Lident modname; loc};
+          P.pmod_loc = loc;
+          P.pmod_attributes = [];
+        }
+      in
+      let od : P.open_declaration =
+        {
+          P.popen_expr = md;
+          P.popen_override = A.Fresh;
+          P.popen_loc = loc;
+          P.popen_attributes = [];
+        }
+      in
+      {body with P.pexp_desc = P.Pexp_open (od, body)}
+    in
+    let rec wrap (fn : P.expression) : P.expression =
+      match fn.P.pexp_desc with
+      | P.Pexp_function (params, constr, P.Pfunction_body body) ->
+          let body' =
+            match body.P.pexp_desc with
+            (* nested [fun a -> fun b -> ...]: descend to the real body *)
+            | P.Pexp_function _ -> wrap body
+            | _ -> mk_open body
+          in
+          {
+            fn with
+            P.pexp_desc =
+              P.Pexp_function (params, constr, P.Pfunction_body body');
+          }
+      (* not a function: expand_kernel will report "Kernel must be a function" *)
+      | _ -> fn
+    in
+    let e502 = Sarek_parse_helpers.expression_to_502 e in
+    Sarek_parse_helpers.expression_of_502 (wrap e502)
+
+  let build_variant ~(expr_map : Ast_traverse.map) ~replacement ~open_mod
+      (payload : expression) =
+    let e = expr_map#expression payload in
+    let e = (subst_type replacement)#expression e in
+    open_in_body open_mod e
+end
+
+(** [%kernel.real64 ...] - single-source dual lowering (palier B). See the
+    [Real64_lowering] module comment above. Returns the [(native, fallback)]
+    kernel pair; consume it with {!Sarek_real64.kernel_ir}. *)
+let expand_kernel_real64 ~ctxt (payload : expression) : expression =
+  let loc = payload.pexp_loc in
+  let native =
+    Real64_lowering.build_variant
+      ~expr_map:Real64_lowering.native_expr
+      ~replacement:(Lident "float64")
+      ~open_mod:"Sarek_float64"
+      payload
+  in
+  let fallback =
+    Real64_lowering.build_variant
+      ~expr_map:Real64_lowering.df64_expr
+      ~replacement:(Ldot (Lident "Sarek_df64", "df64"))
+      ~open_mod:"Sarek_df64"
+      payload
+  in
+  let native_k = expand_kernel ~ctxt native in
+  let fallback_k = expand_kernel ~ctxt fallback in
+  [%expr [%e native_k], [%e fallback_k]]
+
+(** The [%kernel.real64 ...] extension for expressions (palier B). *)
+let kernel_real64_extension =
+  Extension.V3.declare
+    "kernel.real64"
+    Extension.Context.expression
+    Ast_pattern.(single_expr_payload __)
+    expand_kernel_real64
 
 (* Register top-level Sarek type declarations *)
 let expand_sarek_type ~ctxt payload =
@@ -2003,6 +2442,7 @@ let () =
       sarek_type_rule;
       sarek_type_private_rule;
       Context_free.Rule.extension kernel_extension;
+      Context_free.Rule.extension kernel_real64_extension;
       Context_free.Rule.extension sarek_include_extension;
       (* NOTE: %sarek_intrinsic and %sarek_extend are handled by sarek_ppx_intrinsic *)
     ]

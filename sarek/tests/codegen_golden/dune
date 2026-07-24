@@ -32,6 +32,20 @@
 (test
  (name test_codegen_golden)
  (modules test_codegen_golden)
- (libraries codegen_golden_backends sarek_ir alcotest)
+ (libraries codegen_golden_backends sarek_ir alcotest unix)
+ (instrumentation
+  (backend bisect_ppx)))
+
+(test
+ (name test_glsl_name_collision)
+ (modules test_glsl_name_collision)
+ (libraries sarek_ir sarek_codegen alcotest)
+ (instrumentation
+  (backend bisect_ppx)))
+
+(test
+ (name test_glsl_intrinsic_fallback)
+ (modules test_glsl_intrinsic_fallback)
+ (libraries sarek_ir sarek_codegen sarek_backend_error alcotest)
  (instrumentation
   (backend bisect_ppx)))

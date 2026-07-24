@@ -19,10 +19,40 @@ jobs:
           - true
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Test alias coverage guard
+        run: ./scripts/check-test-alias-coverage.sh
+
+      - name: Formal proofs admit gate
+        run: |
+          # The formal projects claim 0 admits; fail if an Admitted/admit/Axiom
+          # sneaks into a .v file. Word-boundary regex with optional space
+          # before the terminating dot catches bulleted tactics (`- admit.`),
+          # same-line sequences (`Proof. Admitted.`) and `Axiom(`/`Axioms`.
+          # Note: `Parameter` remains a sanctioned escape hatch (see
+          # AGpuSemantics.v) - this gate enforces the textual invariant only;
+          # full assurance needs a proof-building CI job (tracked follow-up).
+          set +e
+          ls formal/*/theories/*.v >/dev/null 2>&1 || { echo "::error::admit gate could not find formal .v files"; exit 1; }
+          matches=$(grep -rnE "(^|[^[:alnum:]_'])((Admitted|admit)[[:space:]]*\.|Axioms?([[:space:]]|\())" formal --include='*.v')
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "$matches"
+            echo "::error::Admitted/admit/Axiom found in formal/ .v files"
+            exit 1
+          elif [ "$rc" -ge 2 ]; then
+            echo "::error::admit gate grep failed (rc=$rc)"
+            exit 1
+          fi
+          echo "OK: no Admitted/admit/Axiom in formal/ .v files"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -137,10 +167,13 @@ jobs:
 
   check-generated-code:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

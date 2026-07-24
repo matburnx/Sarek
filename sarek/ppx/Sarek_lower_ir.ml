@@ -45,9 +45,7 @@ let rec elttype_of_typ (ty : typ) : Ir.elttype =
       Ir.TVariant
         ( name,
           List.map
-            (fun (n, ty_opt) ->
-              ( n,
-                match ty_opt with None -> [] | Some ty -> [elttype_of_typ ty] ))
+            (fun (n, ty_opt) -> (n, constr_payload_elttypes ty_opt))
             constrs )
   (* NOTE: TTuple/TFun are NOT rejected here even though this is where the
      original bug report pointed. This function converts the type of *any*
@@ -67,6 +65,128 @@ let rec elttype_of_typ (ty : typ) : Ir.elttype =
         "Kernel parameter type is a type variable — polymorphic kernels are \
          not supported. Annotate the parameter with a concrete type (e.g. \
          float32, int32)."
+
+(** Flatten a variant constructor's payload type into its IR field list. A
+    multi-argument constructor ([MkPair of float32 * float32]) carries a tuple
+    payload type; it is FLATTENED to one IR field per component
+    ([TFloat32; TFloat32]) so it lines up field-for-field with the multi-binder
+    pattern ([PConstr ("MkPair", ["x"; "y"])]) and the flat [_0/_1] tagged-union
+    payload every source generator already emits. A single, non-tuple payload
+    stays one field. Only scalar-primitive tuple components flatten; any other
+    tuple keeps the (placeholder) single-field mapping. *)
+and constr_payload_elttypes (ty_opt : typ option) : Ir.elttype list =
+  match ty_opt with
+  | None -> []
+  | Some ty -> (
+      match repr ty with
+      | TTuple tys when List.for_all is_scalar_prim_typ tys ->
+          List.map elttype_of_typ tys
+      | _ -> [elttype_of_typ ty])
+
+(** Scalar-primitive predicate on a source [typ], matching the component set
+    accepted for flattened tuple payloads (mirrors [prim_component_elttype]). *)
+and is_scalar_prim_typ (t : typ) : bool =
+  match repr t with
+  | TPrim TInt32 | TPrim TBool | TReg Int64 | TReg Float32 | TReg Float64 ->
+      true
+  | _ -> false
+
+(* L13: tuple-typed vector elements. A tuple used as a vector element type is
+   lowered to a synthesized packed record with positional fields [_0], [_1],
+   ..., reusing the record/aggregate codegen path unchanged (the layout is
+   computed by Sarek_ir_layout, byte-for-byte identically on host and device).
+   Only scalar-primitive components are supported in this tier; nested tuples,
+   records, vectors or functions as components are rejected. *)
+let elttype_prim_tag (e : Ir.elttype) : string option =
+  match e with
+  | Ir.TInt32 -> Some "int32"
+  | Ir.TInt64 -> Some "int64"
+  | Ir.TFloat32 -> Some "float32"
+  | Ir.TFloat64 -> Some "float64"
+  | Ir.TBool -> Some "bool"
+  | _ -> None
+
+(** Scalar-primitive check on the SOURCE type of a tuple component. This must
+    match on [Sarek_types.typ] directly, NOT via [elttype_of_typ]: that
+    conversion maps [TTuple]/[TFun] to a placeholder [Ir.TInt32] (see its NOTE),
+    so routing the primitivity check through it would silently accept nested
+    tuples or function components as int32 fields and synthesize a wrong layout.
+    Returns the component's IR type iff it is a supported scalar. *)
+let prim_component_elttype (t : typ) : Ir.elttype option =
+  match repr t with
+  | TPrim TInt32 -> Some Ir.TInt32
+  | TPrim TBool -> Some Ir.TBool
+  | TReg Int64 -> Some Ir.TInt64
+  | TReg Float32 -> Some Ir.TFloat32
+  | TReg Float64 -> Some Ir.TFloat64
+  | _ -> None
+
+let tuple_field_name i = Printf.sprintf "_%d" i
+
+(** Mangled nominal name of the record synthesized for a tuple shape, e.g.
+    [_tup_float32_int32] for [float32 * int32]. Kept in sync with the host-side
+    [Sarek_tuple_vec] builder so both agree on the element identity. *)
+let tuple_record_name (comps : Ir.elttype list) : string =
+  "_tup"
+  ^ String.concat
+      ""
+      (List.map
+         (fun e ->
+           match elttype_prim_tag e with Some t -> "_" ^ t | None -> "_x")
+         comps)
+
+(** The single located error raised for any tuple whose components are not all
+    scalar primitives — shared by the vector-element path, the kernel-local slot
+    path ({!slot_elttype_of_typ}), and the match-scrutinee guard in
+    {!lower_stmt}. [loc] should be the offending source expression when known
+    ([Ppxlib.Location.none] otherwise). *)
+let raise_tuple_component_error ~loc : 'a =
+  Ppxlib.Location.raise_errorf
+    ~loc
+    "Tuple values support only scalar components \
+     (float32/float64/int32/int64/bool); nested tuples, records, vectors or \
+     functions as tuple components are not supported (applies to vector \
+     elements, kernel-local tuple bindings and tuple match scrutinees)."
+
+(** Synthesized record fields (positional [_0.._n]) for a tuple's component
+    types. Raises if any component is not a scalar primitive. *)
+let tuple_record_fields (tys : typ list) : string * (string * Ir.elttype) list =
+  let comps =
+    List.map
+      (fun t ->
+        match prim_component_elttype t with
+        | Some e -> e
+        | None -> raise_tuple_component_error ~loc:Ppxlib.Location.none)
+      tys
+  in
+  let name = tuple_record_name comps in
+  (name, List.mapi (fun i e -> (tuple_field_name i, e)) comps)
+
+let tuple_tmp_counter = ref 0
+
+(** Is [t] a tuple whose components are all scalar primitives (the shape we
+    synthesize a record for)? *)
+let is_primitive_tuple (t : typ) : bool =
+  match repr t with
+  | TTuple tys -> List.for_all (fun t -> prim_component_elttype t <> None) tys
+  | _ -> false
+
+(** IR type for a value that occupies a *data slot* — a vector element, or a
+    kernel-local binding ([let]/[match]-bound). A primitive-component tuple
+    becomes its synthesized positional record ([_tup_*], fields [_0.._n]) so the
+    struct backends (CUDA/OpenCL/GLSL/Metal) emit the right compound type
+    instead of the [elttype_of_typ] placeholder [int] (see that function's
+    NOTE); every other type uses the ordinary mapping. A non-primitive tuple
+    raises the located tuple-component error via {!tuple_record_fields},
+    mirroring vector-of-tuple scope. This is the sole difference from
+    {!elttype_of_typ}: the placeholder there stays intact for genuinely non-data
+    flows (function-typed helper bindings), while data uses route here. *)
+let slot_elttype_of_typ (t : typ) : Ir.elttype =
+  match repr t with
+  | TTuple tys ->
+      let name, fields = tuple_record_fields tys in
+      Ir.TRecord (name, fields)
+  | _ -> elttype_of_typ t
 
 (** Convert Sarek_types.memspace to Sarek_ir_ppx.memspace *)
 let memspace_of_memspace (mem : Sarek_types.memspace) : Ir.memspace =
@@ -213,6 +333,24 @@ let fresh_id state =
   state.next_var_id <- id + 1 ;
   id
 
+(** Register the synthesized [_tup_*] record for a primitive-component tuple in
+    the codegen types table, so a kernel-local slot typed by that record (see
+    {!make_var}/{!slot_elttype_of_typ}) has its [struct] definition emitted.
+    Idempotent; a no-op for non-tuple or non-primitive-tuple types (the latter
+    is rejected at the slot-typing site by {!tuple_record_fields}). The
+    realistic data sources for a local tuple (a tuple literal, an [if]/[match]
+    whose branches are tuple literals, a tuple-typed vector element) already
+    register it elsewhere; this call makes the binding site self-sufficient
+    regardless. *)
+let register_tuple_type (state : state) (ty : typ) : unit =
+  match repr ty with
+  | TTuple tys when List.for_all (fun t -> prim_component_elttype t <> None) tys
+    ->
+      let name, fields = tuple_record_fields tys in
+      if not (Hashtbl.mem state.types name) then
+        Hashtbl.add state.types name fields
+  | _ -> ()
+
 (** Convert Sarek_ast.binop to Sarek_ir_ppx.binop *)
 let ir_binop (op : binop) (_ty : typ) : Ir.binop =
   match op with
@@ -253,12 +391,16 @@ let lower_memspace = function
   | Shared -> Ir.Shared
   | Global -> Ir.Global
 
-(** Create a var from typed var info *)
+(** Create a var from typed var info. Uses {!slot_elttype_of_typ} (not the bare
+    {!elttype_of_typ}) so a kernel-local binding of primitive-tuple type is
+    typed by its synthesized [_tup_*] record rather than the placeholder [int] —
+    the struct backends then declare and read the slot as the right compound
+    type. Function-typed references still fall through to the placeholder. *)
 let make_var name id ty mutable_ : Ir.var =
   {
     var_name = name;
     var_id = id;
-    var_type = elttype_of_typ ty;
+    var_type = slot_elttype_of_typ ty;
     var_mutable = mutable_;
   }
 
@@ -397,7 +539,12 @@ let rec lower_expr (state : state) (te : texpr) : Ir.expr =
   | TEInt i -> Ir.EConst (Ir.CInt32 (Int32.of_int i))
   | TEInt32 i -> Ir.EConst (Ir.CInt32 i)
   | TEInt64 i -> Ir.EConst (Ir.CInt64 i)
-  | TEFloat f -> Ir.EConst (Ir.CFloat32 f)
+  | TEFloat f -> (
+      (* L17b: a bare float literal is lowered by its resolved type — float64 if
+         context unified it to Float64, float32 otherwise (the default). *)
+      match repr te.ty with
+      | TReg Float64 -> Ir.EConst (Ir.CFloat64 f)
+      | _ -> Ir.EConst (Ir.CFloat32 f))
   | TEDouble f -> Ir.EConst (Ir.CFloat64 f)
   | TEVar (name, id) -> (
       match repr te.ty with
@@ -423,6 +570,18 @@ let rec lower_expr (state : state) (te : texpr) : Ir.expr =
         (lower_expr state a)
         (lower_expr state b)
         (elttype_of_typ te.ty)
+  | TEBinop (And, a, b) ->
+      (* Short-circuit && (audit finding H3): a strict Ir.And evaluates both
+         operands eagerly on the PTX and Interpreter backends while the
+         C-family backends emit C's short-circuiting &&, so the classic
+         [i < n && a.(i) > 0.] bounds guard read out of bounds on PTX and
+         raised on the Interpreter. Lowering to EIf gives every backend
+         short-circuit semantics (the PTX EIf emitter already refuses to
+         evaluate memory-reading/effectful branches speculatively). *)
+      Ir.EIf (lower_expr state a, lower_expr state b, Ir.EConst (Ir.CBool false))
+  | TEBinop (Or, a, b) ->
+      (* Short-circuit || - see the && case above. *)
+      Ir.EIf (lower_expr state a, Ir.EConst (Ir.CBool true), lower_expr state b)
   | TEBinop (op, a, b) ->
       Ir.EBinop (ir_binop op te.ty, lower_expr state a, lower_expr state b)
   | TEUnop (op, a) -> Ir.EUnop (ir_unop op, lower_expr state a)
@@ -482,19 +641,58 @@ let rec lower_expr (state : state) (te : texpr) : Ir.expr =
         | TVariant (_, constrs) ->
             let constr_types =
               List.map
-                (fun (cname, ty_opt) ->
-                  ( cname,
-                    match ty_opt with
-                    | None -> []
-                    | Some ty -> [elttype_of_typ ty] ))
+                (fun (cname, ty_opt) -> (cname, constr_payload_elttypes ty_opt))
                 constrs
             in
             Hashtbl.add state.variants ty_name constr_types
         | _ -> ()
       end ;
-      let args = match arg with None -> [] | Some e -> [lower_expr state e] in
+      (* Flatten a multi-argument constructor's tuple payload into one IR
+         argument per component, matching the flattened field registration
+         above and the multi-binder pattern side. A literal tuple whose
+         components are all scalar primitives is the shape the typer produces
+         for [MkPair (a, b)]; everything else stays a single argument. *)
+      let args =
+        match arg with
+        | None -> []
+        | Some {te = TETuple comps; ty = tup_ty; _}
+          when match repr tup_ty with
+               | TTuple tys -> List.for_all is_scalar_prim_typ tys
+               | _ -> false ->
+            List.map (lower_expr state) comps
+        | Some e -> [lower_expr state e]
+      in
       Ir.EVariant (ty_name, constr, args)
-  | TETuple exprs -> Ir.ETuple (List.map (lower_expr state) exprs)
+  | TETuple exprs -> (
+      (* L13: a tuple literal whose components are scalar primitives is lowered
+         to the same synthesized record ([_0], [_1], ...) used for tuple vector
+         elements. This carries the nominal type name so struct-based backends
+         (OpenCL/GLSL/CUDA/Metal) emit a typed compound literal rather than a
+         bare, type-less brace initializer, and it matches what a tuple vector
+         slot stores. Non-primitive tuples keep the generic [Ir.ETuple]. *)
+      match repr te.ty with
+      | TTuple tys
+        when List.for_all (fun t -> prim_component_elttype t <> None) tys ->
+          let comps =
+            List.map
+              (fun t ->
+                match prim_component_elttype t with
+                | Some e -> e
+                | None -> assert false (* guarded above *))
+              tys
+          in
+          let name = tuple_record_name comps in
+          if not (Hashtbl.mem state.types name) then
+            Hashtbl.add
+              state.types
+              name
+              (List.mapi (fun i e -> (tuple_field_name i, e)) comps) ;
+          Ir.ERecord
+            ( name,
+              List.mapi
+                (fun i e -> (tuple_field_name i, lower_expr state e))
+                exprs )
+      | _ -> Ir.ETuple (List.map (lower_expr state) exprs))
   | TEGlobalRef (name, ty) ->
       let v = make_var name 0 ty false in
       Ir.EVar v
@@ -516,6 +714,13 @@ let rec lower_expr (state : state) (te : texpr) : Ir.expr =
       (* No else branch - only valid for unit-returning expressions *)
       Ir.EIf (lower_expr state cond, lower_expr state then_, Ir.EConst Ir.CUnit)
   (* Match as expression *)
+  | TEMatch (e, _)
+    when (match repr e.ty with TTuple _ -> true | _ -> false)
+         && not (is_primitive_tuple e.ty) ->
+      (* Same non-primitive tuple-scrutinee guard as the statement path (see
+         {!lower_stmt}); reachable when a non-primitive tuple match is used in
+         value position. *)
+      raise_tuple_component_error ~loc:(Sarek_ast.loc_to_ppxlib e.te_loc)
   | TEMatch (e, cases) ->
       let ir_cases =
         List.map
@@ -579,9 +784,11 @@ and lower_stmt (state : state) (te : texpr) : Ir.stmt =
               body_ir )
       (* Normal let binding *)
       | _ ->
+          register_tuple_type state value.ty ;
           let v = make_var name id value.ty false in
           Ir.SLet (v, lower_expr state value, lower_stmt state body))
   | TELetMut (name, id, value, body) ->
+      register_tuple_type state value.ty ;
       let v = make_var name id value.ty true in
       Ir.SLetMut (v, lower_expr state value, lower_stmt state body)
   | TELetRec (name, _id, params, fn_body, cont) ->
@@ -604,6 +811,58 @@ and lower_stmt (state : state) (te : texpr) : Ir.stmt =
           lower_stmt state body )
   | TEWhile (cond, body) ->
       Ir.SWhile (lower_expr state cond, lower_stmt state body)
+  | TEMatch (e, [({tpat = TPTuple pats; _}, body)])
+    when is_primitive_tuple e.ty
+         && List.for_all
+              (fun p ->
+                match p.tpat with TPVar _ | TPAny -> true | _ -> false)
+              pats ->
+      (* L13: a single-arm tuple-pattern match is not a variant dispatch; the
+         C-like backends (OpenCL/GLSL/CUDA/Metal) would otherwise emit a bogus
+         [switch (x.tag)]. Rewrite it to a record destructure: bind the
+         scrutinee once, then bind each component to its [_i] field. This works
+         uniformly on every backend (field access is already supported). *)
+      register_tuple_type state e.ty ;
+      let rec_elt = slot_elttype_of_typ e.ty in
+      incr tuple_tmp_counter ;
+      let tmp_name = Printf.sprintf "__sarek_tup_%d" !tuple_tmp_counter in
+      let tmp_var : Ir.var =
+        {
+          var_name = tmp_name;
+          var_id = - !tuple_tmp_counter;
+          var_type = rec_elt;
+          var_mutable = false;
+        }
+      in
+      let body_ir = lower_stmt state body in
+      let bound =
+        List.fold_right
+          (fun (i, p) acc ->
+            match p.tpat with
+            | TPVar (name, id) ->
+                let field =
+                  Ir.ERecordField (Ir.EVar tmp_var, tuple_field_name i)
+                in
+                Ir.SLet (make_var name id p.tpat_ty false, field, acc)
+            | _ -> acc)
+          (List.mapi (fun i p -> (i, p)) pats)
+          body_ir
+      in
+      Ir.SLet (tmp_var, lower_expr state e, bound)
+  | TEMatch (e, _)
+    when (match repr e.ty with TTuple _ -> true | _ -> false)
+         && not (is_primitive_tuple e.ty) ->
+      (* A tuple-typed match scrutinee that did NOT take the primitive
+         single-arm destructure path above is a NON-PRIMITIVE tuple (nested
+         tuple / record / vector / function component), reachable with a
+         non-variable scrutinee that never passes through [slot_elttype_of_typ]
+         (e.g. [let ((a, b), c) = ((x, y), z) in ...], which the parser desugars
+         to this match, or the equivalent [match] spelling). Without this guard
+         it would lower to [Ir.ETuple] + an [SMatch] and die as a confusing
+         backend C error ([switch ((...).tag)]). Raise the same located
+         tuple-component error the slot path raises. Only tuple scrutinees reach
+         here; variant matches have a [TVariant] scrutinee and fall through. *)
+      raise_tuple_component_error ~loc:(Sarek_ast.loc_to_ppxlib e.te_loc)
   | TEMatch (e, cases) ->
       let ir_cases =
         List.map
@@ -705,26 +964,39 @@ let lower_param (p : tparam) : Ir.decl =
       Ppxlib.Location.raise_errorf
         ~loc:Ppxlib.Location.none
         "Function-typed kernel parameters are not supported."
-  | (TVec t | TArr (t, _)) as container -> (
-      (* A vector/array of tuples or functions would silently collapse to
-         TInt32 in elttype_of_typ (wrong stride, garbage layout) — reject
-         at the formal-parameter boundary like the bare cases above. *)
-      let kind = match container with TArr _ -> "Arrays" | _ -> "Vectors" in
+  | TArr (t, _) -> (
+      (* An array of tuples or functions would silently collapse to TInt32 in
+         elttype_of_typ (wrong stride, garbage layout) — reject at the
+         formal-parameter boundary. (L13: local-array-of-tuple aggregate
+         support is a follow-up; only global vector elements are lowered.) *)
       match repr t with
       | TTuple _ ->
           Ppxlib.Location.raise_errorf
             ~loc:Ppxlib.Location.none
-            "%s of tuples are not supported as kernel parameters; declare a \
-             record type with [@@sarek.type] instead."
-            kind
+            "Arrays of tuples are not supported as kernel parameters; declare \
+             a record type with [@@sarek.type] instead, or use a vector."
       | TFun _ ->
           Ppxlib.Location.raise_errorf
             ~loc:Ppxlib.Location.none
-            "%s of functions are not supported as kernel parameters."
-            kind
+            "Arrays of functions are not supported as kernel parameters."
+      | _ -> ())
+  | TVec t -> (
+      match repr t with
+      | TFun _ ->
+          Ppxlib.Location.raise_errorf
+            ~loc:Ppxlib.Location.none
+            "Vectors of functions are not supported as kernel parameters."
+      | TTuple tys ->
+          (* L13: a vector of tuples is lowered to a vector of the synthesized
+             packed record; validate the components eagerly for a clear error. *)
+          ignore (tuple_record_fields tys)
       | _ -> ())
   | _ -> ()) ;
-  let elt = elttype_of_typ p.tparam_type in
+  let elt =
+    match repr p.tparam_type with
+    | TVec t -> Ir.TVec (slot_elttype_of_typ t)
+    | _ -> elttype_of_typ p.tparam_type
+  in
   let v =
     {
       Ir.var_name = p.tparam_name;
@@ -735,7 +1007,7 @@ let lower_param (p : tparam) : Ir.decl =
   in
   if p.tparam_is_vec then
     let elem_ty =
-      match repr p.tparam_type with TVec t -> elttype_of_typ t | _ -> elt
+      match repr p.tparam_type with TVec t -> slot_elttype_of_typ t | _ -> elt
     in
     Ir.DParam (v, Some {arr_elttype = elem_ty; arr_memspace = Ir.Global})
   else Ir.DParam (v, None)
@@ -772,7 +1044,27 @@ let lower_kernel (kernel : tkernel) : Ir.kernel * string list =
         List.iter (fun (_, t) -> register_types_from_typ t) fields
     | TVec elem_ty -> register_types_from_typ elem_ty
     | TArr (elem_ty, _) -> register_types_from_typ elem_ty
-    | TTuple tys -> List.iter register_types_from_typ tys
+    | TTuple tys ->
+        (* L13: register the synthesized record for a tuple aggregate so the
+           codegen types table knows its field layout, mirroring records.
+           Primitivity is checked on the SOURCE types (prim_component_elttype),
+           never via elttype_of_typ, whose TTuple/TFun placeholder would let a
+           nested tuple register as an int32 field. *)
+        (match
+           List.map prim_component_elttype tys |> fun opts ->
+           if List.for_all Option.is_some opts then
+             Some (List.map Option.get opts)
+           else None
+         with
+        | Some comps ->
+            let name = tuple_record_name comps in
+            if not (Hashtbl.mem state.types name) then
+              Hashtbl.add
+                state.types
+                name
+                (List.mapi (fun i e -> (tuple_field_name i, e)) comps)
+        | None -> ()) ;
+        List.iter register_types_from_typ tys
     | _ -> ()
   in
   List.iter

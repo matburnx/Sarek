@@ -285,6 +285,131 @@ let rec zero_binding buf (b : binding) : unit =
       emit buf "mov.u32 %s, 0;" tag_reg ;
       List.iter (fun (_, bs) -> List.iter (zero_binding buf) bs) ctors
 
+(** Exact C-semantics fmod (audit finding M1): the single-pass
+    [x - trunc(x/y)*y] formula is only exact while the quotient fits the
+    mantissa; beyond 2^53 (f64) / 2^24 (f32) the rounded quotient carries
+    absolute error >> 1 and the result can leave [0, |y|) or flip sign.
+    This emits an iterative reduction instead:
+
+    - outer loop: while |r| >= |y|, subtract trunc(r/y)*y via a single fma
+      (each round shrinks |r| by ~2^-mantissa, so it terminates in <= ~20
+      rounds for f64 / ~6 for f32; once |r| < |y| the quotient truncates
+      to 0 and further rounds are exact no-ops);
+    - overflow branch: if r/y overflows to inf (huge x with tiny/subnormal
+      y), reduce against y * 2^k (k = 1022 f64 / 126 f32, exact scaling and
+      still a multiple of y, so congruence mod y is preserved), retrying
+      with a larger scale while the scaled quotient is still inf;
+    - sign fix: the last fma can land one |y| past zero on the wrong side;
+      one conditional +/-|y| restores the dividend's sign, and a final
+      copysign fixes the sign of a +/-0 result;
+    - domain guard: y = 0, y = NaN, |x| = inf and x = NaN all produce NaN
+      (C fmod contract); x mod inf = x falls out naturally.
+
+    Validated bit-exact against OCaml's [Float.rem] (C fmod) on 200k
+    full-exponent-range fuzz cases including subnormals and the
+    overflow-scaling path (see commit message). *)
+let emit_float_fmod buf alloc ~is64 rx ry : string =
+  let newf () = if is64 then new_f64 alloc else new_f32 alloc in
+  let s = if is64 then "f64" else "f32" in
+  let const b64 b32 =
+    if is64 then Printf.sprintf "0D%016LX" b64 else Printf.sprintf "0F%08lX" b32
+  in
+  let c_inf = const 0x7FF0000000000000L 0x7F800000l in
+  let c_nan = const 0x7FF8000000000000L 0x7FC00000l in
+  (* 2^1022 / 2^126: largest power-of-two scale that keeps y * scale exact
+     and finite for every y small enough to make x/y overflow. *)
+  let c_scale = const 0x7FD0000000000000L 0x7E800000l in
+  let c_zero = const 0L 0l in
+  let rz = newf () in
+  emit buf "mov.%s %s, %s;" s rz c_zero ;
+  let rinf = newf () in
+  emit buf "mov.%s %s, %s;" s rinf c_inf ;
+  let rscale = newf () in
+  emit buf "mov.%s %s, %s;" s rscale c_scale ;
+  let ay = newf () in
+  emit buf "abs.%s %s, %s;" s ay ry ;
+  let ax = newf () in
+  emit buf "abs.%s %s, %s;" s ax rx ;
+  let r = newf () in
+  emit buf "mov.%s %s, %s;" s r rx ;
+  let l_outer = new_label alloc in
+  let l_scale = new_label alloc in
+  let l_scale_loop = new_label alloc in
+  let l_fix = new_label alloc in
+  (* Domain guard: ay > 0 rejects y = 0 and y = NaN; ax < inf rejects
+     x = +/-inf and x = NaN. *)
+  let p_y = new_pred alloc in
+  emit buf "setp.gt.%s %s, %s, %s;" s p_y ay rz ;
+  let p_x = new_pred alloc in
+  emit buf "setp.lt.%s %s, %s, %s;" s p_x ax rinf ;
+  let p_ok = new_pred alloc in
+  emit buf "and.pred %s, %s, %s;" p_ok p_y p_x ;
+  emit buf "@%s bra %s;" p_ok l_outer ;
+  emit buf "mov.%s %s, %s;" s r c_nan ;
+  emit buf "bra %s;" l_fix ;
+  emit_label buf l_outer ;
+  let ar = newf () in
+  emit buf "abs.%s %s, %s;" s ar r ;
+  let p_done = new_pred alloc in
+  emit buf "setp.lt.%s %s, %s, %s;" s p_done ar ay ;
+  emit buf "@%s bra %s;" p_done l_fix ;
+  let q = newf () in
+  emit buf "div.rn.%s %s, %s, %s;" s q r ry ;
+  let aq = newf () in
+  emit buf "abs.%s %s, %s;" s aq q ;
+  let p_qinf = new_pred alloc in
+  emit buf "setp.eq.%s %s, %s, %s;" s p_qinf aq rinf ;
+  emit buf "@%s bra %s;" p_qinf l_scale ;
+  let t = newf () in
+  emit buf "cvt.rzi.%s.%s %s, %s;" s s t q ;
+  let nt = newf () in
+  emit buf "neg.%s %s, %s;" s nt t ;
+  emit buf "fma.rn.%s %s, %s, %s, %s;" s r nt ry r ;
+  emit buf "bra %s;" l_outer ;
+  emit_label buf l_scale ;
+  let ys = newf () in
+  emit buf "mov.%s %s, %s;" s ys ry ;
+  emit_label buf l_scale_loop ;
+  emit buf "mul.%s %s, %s, %s;" s ys ys rscale ;
+  let q2 = newf () in
+  emit buf "div.rn.%s %s, %s, %s;" s q2 r ys ;
+  let aq2 = newf () in
+  emit buf "abs.%s %s, %s;" s aq2 q2 ;
+  let p_q2inf = new_pred alloc in
+  emit buf "setp.eq.%s %s, %s, %s;" s p_q2inf aq2 rinf ;
+  emit buf "@%s bra %s;" p_q2inf l_scale_loop ;
+  let t2 = newf () in
+  emit buf "cvt.rzi.%s.%s %s, %s;" s s t2 q2 ;
+  let nt2 = newf () in
+  emit buf "neg.%s %s, %s;" s nt2 t2 ;
+  emit buf "fma.rn.%s %s, %s, %s, %s;" s r nt2 ys r ;
+  emit buf "bra %s;" l_outer ;
+  emit_label buf l_fix ;
+  let p_rn = new_pred alloc in
+  emit buf "setp.lt.%s %s, %s, %s;" s p_rn r rz ;
+  let p_xp = new_pred alloc in
+  emit buf "setp.ge.%s %s, %s, %s;" s p_xp rx rz ;
+  let p_c1 = new_pred alloc in
+  emit buf "and.pred %s, %s, %s;" p_c1 p_rn p_xp ;
+  let p_rp = new_pred alloc in
+  emit buf "setp.gt.%s %s, %s, %s;" s p_rp r rz ;
+  let p_xn = new_pred alloc in
+  emit buf "setp.lt.%s %s, %s, %s;" s p_xn rx rz ;
+  let p_c2 = new_pred alloc in
+  emit buf "and.pred %s, %s, %s;" p_c2 p_rp p_xn ;
+  let c = newf () in
+  emit buf "selp.%s %s, %s, %s, %s;" s c ay rz p_c1 ;
+  let nay = newf () in
+  emit buf "neg.%s %s, %s;" s nay ay ;
+  emit buf "selp.%s %s, %s, %s, %s;" s c nay c p_c2 ;
+  emit buf "add.%s %s, %s, %s;" s r r c ;
+  (* copysign d, a, b = |b| with a's sign: post-fix sign(r) already matches
+     sign(x) for r <> 0, so this only normalizes the sign of a zero result
+     (fmod(-x, y) must return -0 when the remainder is exact). *)
+  let res = newf () in
+  emit buf "copysign.%s %s, %s, %s;" s res rx r ;
+  res
+
 (** {1 Expression emitter}
 
     Returns the PTX register name holding the result. Emits instructions into
@@ -343,17 +468,27 @@ let rec emit_expr buf alloc (env : env) (expr : expr) : string =
         emit buf "neg.s32 %s, %s;" r r_src ;
         r
   | EUnop (Not, e) ->
+      (* Bools are u32 0/1 post-typer, but be class-aware so a 64-bit
+         operand cannot produce invalid setp.eq.u32-on-%rd PTX (H2). *)
       let r_src = emit_expr buf alloc env e in
+      let is_u64 r = String.length r >= 3 && r.[1] = 'r' && r.[2] = 'd' in
       let p = new_pred alloc in
-      emit buf "setp.eq.u32 %s, %s, 0;" p r_src ;
+      if is_u64 r_src then emit buf "setp.eq.s64 %s, %s, 0;" p r_src
+      else emit buf "setp.eq.u32 %s, %s, 0;" p r_src ;
       let r = new_u32 alloc in
       emit buf "selp.u32 %s, 1, 0, %s;" r p ;
       r
   | EUnop (BitNot, e) ->
       let r_src = emit_expr buf alloc env e in
-      let r = new_u32 alloc in
-      emit buf "not.b32 %s, %s;" r r_src ;
-      r
+      let is_u64 r = String.length r >= 3 && r.[1] = 'r' && r.[2] = 'd' in
+      if is_u64 r_src then (
+        let r = new_u64 alloc in
+        emit buf "not.b64 %s, %s;" r r_src ;
+        r)
+      else
+        let r = new_u32 alloc in
+        emit buf "not.b32 %s, %s;" r r_src ;
+        r
   | EArrayRead (arr_name, idx_expr) ->
       let r_base = env_lookup env arr_name in
       let r_idx = emit_expr buf alloc env idx_expr in
@@ -703,20 +838,25 @@ and emit_value buf alloc (env : env) (e : expr) : binding =
     (used by [emit_value] for [v.(i)] reads of record/variant vectors). Stride
     and offsets come from Sarek_ir_layout (FR-001, FR-010). *)
 and emit_agg_array_read buf alloc env arr_name idx_expr : binding =
-  let elt = infer_elt_type alloc arr_name in
-  let r_base = env_lookup env arr_name in
-  let r_idx = emit_expr buf alloc env idx_expr in
-  let r_addr =
-    emit_agg_elem_addr
-      buf
-      alloc
-      r_base
-      r_idx
-      ~stride:(elt_stride elt)
-      ~space:(arr_space_of alloc arr_name)
-      ~arr_name
-  in
-  emit_agg_elem_load buf alloc r_addr ~offset:0 elt
+  if is_soa alloc arr_name then
+    (* SoA: one coalesced scalar load per leaf from its own base. *)
+    let r_idx = emit_expr buf alloc env idx_expr in
+    emit_soa_elem_load buf alloc r_idx arr_name
+  else
+    let elt = infer_elt_type alloc arr_name in
+    let r_base = env_lookup env arr_name in
+    let r_idx = emit_expr buf alloc env idx_expr in
+    let r_addr =
+      emit_agg_elem_addr
+        buf
+        alloc
+        r_base
+        r_idx
+        ~stride:(elt_stride elt)
+        ~space:(arr_space_of alloc arr_name)
+        ~arr_name
+    in
+    emit_agg_elem_load buf alloc r_addr ~offset:0 elt
 
 (** When [base.field] roots at an element of an aggregate-element array
     ([v.(i).f], possibly through nested projections [v.(i).f.g]), return the
@@ -741,6 +881,10 @@ and split_elem_field_read alloc base field :
     evaluation so the untouched fields are never loaded. *)
 and emit_record_field buf alloc env base field : binding =
   match split_elem_field_read alloc base field with
+  | Some (arr_name, idx_expr, path) when is_soa alloc arr_name ->
+      (* SoA: one coalesced scalar load at the addressed leaf's own base. *)
+      let r_idx = emit_expr buf alloc env idx_expr in
+      emit_soa_field_load buf alloc r_idx arr_name path
   | Some (arr_name, idx_expr, path) ->
       let elt = infer_elt_type alloc arr_name in
       let offset, fty = agg_field_path elt path in
@@ -898,97 +1042,66 @@ and emit_binop buf alloc env op e1 e2 : string =
         emit buf "div.rn.f64 %s, %s, %s;" r r1 r2 ;
         r)
       else if is_f32 r1 then (
+        (* Correctly-rounded division (audit finding M2): div.approx.f32 is
+           ~2 ulp and badly wrong at exponent extremes, which made PTX the
+           least-accurate backend for ordinary /. and eroded Sarek_df64's
+           error budget. Fast approximate division stays available to
+           intrinsics that are already approximate (tan, tanh). *)
         let r = new_f32 alloc in
-        emit buf "div.approx.f32 %s, %s, %s;" r r1 r2 ;
+        emit buf "div.rn.f32 %s, %s, %s;" r r1 r2 ;
         r)
       else if is_u64 r1 then (
+        (* Sarek int64 is signed: div.u64 on negative operands is silently
+           wrong ((-7)/2 = huge). add/sub/mul are sign-agnostic in two's
+           complement; div/rem are not (audit finding H1). *)
         let r = new_u64 alloc in
-        emit buf "div.u64 %s, %s, %s;" r r1 r2 ;
+        emit buf "div.s64 %s, %s, %s;" r r1 r2 ;
         r)
       else
         let r = new_u32 alloc in
-        emit buf "div.u32 %s, %s, %s;" r r1 r2 ;
+        emit buf "div.s32 %s, %s, %s;" r r1 r2 ;
         r
   | Mod ->
-      (* Float Mod is C fmod: x - trunc(x/y)*y, result sign follows the
-         dividend x. OCaml's Float.rem has the same contract (it is C fmod),
-         so this matches mod_float on the host. rn-rounded div (not the fast
-         .approx form): the trunc snaps the quotient to an integer, so the
-         quotient's rounding error only shows within 1 ulp of an integer
-         boundary; the final fma is a single rounding. *)
-      if is_f64 r1 then (
-        let q = new_f64 alloc in
-        emit buf "div.rn.f64 %s, %s, %s;" q r1 r2 ;
-        let t = new_f64 alloc in
-        emit buf "cvt.rzi.f64.f64 %s, %s;" t q ;
-        let nt = new_f64 alloc in
-        emit buf "neg.f64 %s, %s;" nt t ;
-        let r = new_f64 alloc in
-        emit buf "fma.rn.f64 %s, %s, %s, %s;" r nt r2 r1 ;
-        r)
-      else if is_f32 r1 then (
-        let q = new_f32 alloc in
-        emit buf "div.rn.f32 %s, %s, %s;" q r1 r2 ;
-        let t = new_f32 alloc in
-        emit buf "cvt.rzi.f32.f32 %s, %s;" t q ;
-        let nt = new_f32 alloc in
-        emit buf "neg.f32 %s, %s;" nt t ;
-        let r = new_f32 alloc in
-        emit buf "fma.rn.f32 %s, %s, %s, %s;" r nt r2 r1 ;
-        r)
+      (* Float Mod is C fmod (exact for all finite inputs, result sign
+         follows the dividend). Lowered by emit_float_fmod's iterative
+         reduction - see its doc comment (audit finding M1). *)
+      if is_f64 r1 then emit_float_fmod buf alloc ~is64:true r1 r2
+      else if is_f32 r1 then emit_float_fmod buf alloc ~is64:false r1 r2
       else if is_u64 r1 then (
+        (* Signed rem, matching C's % (result sign follows the dividend),
+           the interpreter's Int64.rem, and every C-family backend. *)
         let r = new_u64 alloc in
-        emit buf "rem.u64 %s, %s, %s;" r r1 r2 ;
+        emit buf "rem.s64 %s, %s, %s;" r r1 r2 ;
         r)
       else
         let r = new_u32 alloc in
-        emit buf "rem.u32 %s, %s, %s;" r r1 r2 ;
+        emit buf "rem.s32 %s, %s, %s;" r r1 r2 ;
         r
-  | Eq ->
+  | Eq | Ne | Lt | Le | Gt | Ge ->
+      (* Comparison family, class-aware (audit finding H2): the old code
+         fell through to setp.*.u32/s32 even on %rd (64-bit) operands,
+         which is invalid PTX and fails at module load. Sarek ints are
+         signed, so the integer forms are s32/s64 (sign matters for
+         Lt/Le/Gt/Ge; for Eq/Ne it is irrelevant but harmless). *)
+      let cmp =
+        match op with
+        | Eq -> "eq"
+        | Ne -> "ne"
+        | Lt -> "lt"
+        | Le -> "le"
+        | Gt -> "gt"
+        | Ge -> "ge"
+        | _ -> assert false
+      in
+      let ty =
+        if is_f64 r1 then "f64"
+        else if is_f32 r1 then "f32"
+        else if is_u64 r1 then "s64"
+        else if cmp = "eq" || cmp = "ne" then "u32"
+        else "s32"
+      in
       let p = new_pred alloc in
-      if is_f64 r1 then emit buf "setp.eq.f64 %s, %s, %s;" p r1 r2
-      else if is_f32 r1 then emit buf "setp.eq.f32 %s, %s, %s;" p r1 r2
-      else emit buf "setp.eq.u32 %s, %s, %s;" p r1 r2 ;
-      let r = new_u32 alloc in
-      emit buf "selp.u32 %s, 1, 0, %s;" r p ;
-      r
-  | Ne ->
-      let p = new_pred alloc in
-      if is_f64 r1 then emit buf "setp.ne.f64 %s, %s, %s;" p r1 r2
-      else if is_f32 r1 then emit buf "setp.ne.f32 %s, %s, %s;" p r1 r2
-      else emit buf "setp.ne.u32 %s, %s, %s;" p r1 r2 ;
-      let r = new_u32 alloc in
-      emit buf "selp.u32 %s, 1, 0, %s;" r p ;
-      r
-  | Lt ->
-      let p = new_pred alloc in
-      if is_f64 r1 then emit buf "setp.lt.f64 %s, %s, %s;" p r1 r2
-      else if is_f32 r1 then emit buf "setp.lt.f32 %s, %s, %s;" p r1 r2
-      else emit buf "setp.lt.s32 %s, %s, %s;" p r1 r2 ;
-      let r = new_u32 alloc in
-      emit buf "selp.u32 %s, 1, 0, %s;" r p ;
-      r
-  | Le ->
-      let p = new_pred alloc in
-      if is_f64 r1 then emit buf "setp.le.f64 %s, %s, %s;" p r1 r2
-      else if is_f32 r1 then emit buf "setp.le.f32 %s, %s, %s;" p r1 r2
-      else emit buf "setp.le.s32 %s, %s, %s;" p r1 r2 ;
-      let r = new_u32 alloc in
-      emit buf "selp.u32 %s, 1, 0, %s;" r p ;
-      r
-  | Gt ->
-      let p = new_pred alloc in
-      if is_f64 r1 then emit buf "setp.gt.f64 %s, %s, %s;" p r1 r2
-      else if is_f32 r1 then emit buf "setp.gt.f32 %s, %s, %s;" p r1 r2
-      else emit buf "setp.gt.s32 %s, %s, %s;" p r1 r2 ;
-      let r = new_u32 alloc in
-      emit buf "selp.u32 %s, 1, 0, %s;" r p ;
-      r
-  | Ge ->
-      let p = new_pred alloc in
-      if is_f64 r1 then emit buf "setp.ge.f64 %s, %s, %s;" p r1 r2
-      else if is_f32 r1 then emit buf "setp.ge.f32 %s, %s, %s;" p r1 r2
-      else emit buf "setp.ge.s32 %s, %s, %s;" p r1 r2 ;
+      emit buf "setp.%s.%s %s, %s, %s;" cmp ty p r1 r2 ;
       let r = new_u32 alloc in
       emit buf "selp.u32 %s, 1, 0, %s;" r p ;
       r
@@ -1189,7 +1302,7 @@ and emit_intrinsic_native buf alloc env path name args : string =
      the element size (2 for 32-bit, 3 for 64-bit elements) — the stride
      must match the atom width or neighbouring elements alias. Returns the
      PTX space name and the address register. *)
-  let atomic_addr ~global_only ~elt_shift arr r_idx =
+  let atomic_addr ~intr ~global_only ~elt_shift arr r_idx =
     let r_base = env_lookup env arr.var_name in
     (* PTX has no atom.local — and per-thread memory needs no atomics. *)
     (match arr_space_of alloc arr.var_name with
@@ -1197,7 +1310,40 @@ and emit_intrinsic_native buf alloc env path name args : string =
         unsupported
           ("atomic operation on per-thread local array '" ^ arr.var_name
          ^ "' (atomics require shared or global memory)")
+    | Some SpaceShared when global_only ->
+        (* A *_global_* atomic on a shared array would use the 32-bit
+           shared-window offset as a 64-bit global address — silent
+           corruption (audit finding M5). *)
+        unsupported
+          (intr ^ ": '" ^ arr.var_name
+         ^ "' is a shared array; use the non-global atomic form")
     | Some SpaceShared | None -> ()) ;
+    (* The intrinsic's hardwired stride must match the array's element
+       width: atomic_add_int32 on an int64/f64 vector would index with a
+       4-byte stride into 8-byte elements — silent corruption of
+       neighbouring elements (audit finding M5). *)
+    (let elt = infer_elt_type alloc arr.var_name in
+     let width_shift =
+       match elt with
+       | TInt32 | TFloat32 | TBool -> Some 2
+       | TInt64 | TFloat64 -> Some 3
+       | _ -> None
+     in
+     match width_shift with
+     | Some w when w <> elt_shift ->
+         unsupported
+           (Printf.sprintf
+              "%s: array '%s' has %d-byte elements but this atomic addresses \
+               %d-byte elements; use the matching-width atomic"
+              intr
+              arr.var_name
+              (1 lsl w)
+              (1 lsl elt_shift))
+     | Some _ -> ()
+     | None ->
+         unsupported
+           (intr ^ ": atomics require a scalar int/float element type, but '"
+          ^ arr.var_name ^ "' has an aggregate element type")) ;
     let is_shared =
       (not global_only) && arr_space_of alloc arr.var_name = Some SpaceShared
     in
@@ -1239,7 +1385,9 @@ and emit_intrinsic_native buf alloc env path name args : string =
           end
           else (op, r_val0)
         in
-        let space, r_addr = atomic_addr ~global_only ~elt_shift arr r_idx in
+        let space, r_addr =
+          atomic_addr ~intr ~global_only ~elt_shift arr r_idx
+        in
         let r_old = new_atom_result result in
         emit buf "atom.%s.%s%s %s, [%s], %s;" space op ty r_old r_addr r_val ;
         r_old
@@ -1257,7 +1405,7 @@ and emit_intrinsic_native buf alloc env path name args : string =
         check_atom_operand intr result r_cmp ;
         check_atom_operand intr result r_val ;
         let space, r_addr =
-          atomic_addr ~global_only:false ~elt_shift arr r_idx
+          atomic_addr ~intr ~global_only:false ~elt_shift arr r_idx
         in
         let r_old = new_atom_result result in
         emit
@@ -1285,7 +1433,9 @@ and emit_intrinsic_native buf alloc env path name args : string =
     match args with
     | [EVar arr; idx_e] ->
         let r_idx = emit_expr buf alloc env idx_e in
-        let space, r_addr = atomic_addr ~global_only ~elt_shift:2 arr r_idx in
+        let space, r_addr =
+          atomic_addr ~intr ~global_only ~elt_shift:2 arr r_idx
+        in
         let r_lim = new_u32 alloc in
         emit buf "mov.u32 %s, 0xffffffff;" r_lim ;
         let r_old = new_u32 alloc in
@@ -1319,9 +1469,18 @@ and emit_intrinsic_native buf alloc env path name args : string =
             r)
         else if is_f32_reg rb || is_f64_reg rb then mismatch ()
         else
-          let r = new_u32 alloc in
-          emit buf "%s.s32 %s, %s, %s;" op r ra rb ;
-          r
+          let is_u64 r = String.length r >= 3 && r.[1] = 'r' && r.[2] = 'd' in
+          if is_u64 ra then (
+            if not (is_u64 rb) then mismatch ()
+            else
+              let r = new_u64 alloc in
+              emit buf "%s.s64 %s, %s, %s;" op r ra rb ;
+              r)
+          else if is_u64 rb then mismatch ()
+          else
+            let r = new_u32 alloc in
+            emit buf "%s.s32 %s, %s, %s;" op r ra rb ;
+            r
     | _ -> unsupported (intr ^ " arity != 2")
   in
   (* Unary same-type float rounding via cvt (rmi = floor, rpi = ceil). *)

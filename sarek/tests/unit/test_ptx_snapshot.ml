@@ -550,8 +550,10 @@ let test_atomic_cas_incdec_wide_markers () =
   (* 8-byte addressing stride for the 64-bit forms *)
   assert_contains ptx ", 3;"
 
-(** Float Mod lowers to C fmod: x − trunc(x/y)·y via rn-rounded div, cvt.rzi
-    trunc, neg and a single fma — for both f32 and f64. *)
+(** Float Mod lowers to exact C fmod via emit_float_fmod's iterative reduction
+    (audit finding M1): rn-rounded div + cvt.rzi + fma per round, inside a
+    branch loop, with an overflow-scaling branch and a final sign fix (selp) +
+    copysign zero-sign normalization — for f32 and f64. *)
 let test_float_mod_fmod_markers () =
   let fa = make_var "fa" (TVec TFloat32) in
   let da = make_var "da" (TVec TFloat64) in
@@ -587,10 +589,137 @@ let test_float_mod_fmod_markers () =
   assert_contains ptx "cvt.rzi.f32.f32" ;
   assert_contains ptx "neg.f32" ;
   assert_contains ptx "fma.rn.f32" ;
+  assert_contains ptx "copysign.f32" ;
   assert_contains ptx "div.rn.f64" ;
   assert_contains ptx "cvt.rzi.f64.f64" ;
   assert_contains ptx "neg.f64" ;
-  assert_contains ptx "fma.rn.f64"
+  assert_contains ptx "fma.rn.f64" ;
+  assert_contains ptx "copysign.f64" ;
+  (* loop + overflow-scale + sign-fix structure *)
+  assert_contains ptx "and.pred" ;
+  assert_contains ptx "selp.f64" ;
+  assert_contains ptx "selp.f32"
+
+(** Integer Div/Mod are SIGNED (audit finding H1): Sarek int32/int64 are signed
+    everywhere (interpreter uses Int32.div/Int64.div, C backends emit / and % on
+    signed types), so PTX must emit div.s32/s64 and rem.s32/s64. The old
+    div.u32/u64, rem.u32/u64 silently returned garbage for negative operands
+    ((-7)/2 = 2147483644). *)
+let test_int_div_rem_signed_markers () =
+  let ia = make_var "ia" (TVec TInt32) in
+  let la = make_var "la" (TVec TInt64) in
+  let tid = make_var "tid" TInt32 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SSeq
+          [
+            SAssign
+              ( LArrayElem ("ia", EVar tid),
+                EBinop (Div, EArrayRead ("ia", EVar tid), EConst (CInt32 (-2l)))
+              );
+            SAssign
+              ( LArrayElem ("ia", EVar tid),
+                EBinop (Mod, EArrayRead ("ia", EVar tid), EConst (CInt32 3l)) );
+            SAssign
+              ( LArrayElem ("la", EVar tid),
+                EBinop (Div, EArrayRead ("la", EVar tid), EConst (CInt64 (-2L)))
+              );
+            SAssign
+              ( LArrayElem ("la", EVar tid),
+                EBinop (Mod, EArrayRead ("la", EVar tid), EConst (CInt64 3L)) );
+          ] )
+  in
+  let k =
+    base_kernel
+      "int_div_rem"
+      [
+        DParam (ia, Some {arr_elttype = TInt32; arr_memspace = Global});
+        DParam (la, Some {arr_elttype = TInt64; arr_memspace = Global});
+      ]
+      body
+      []
+  in
+  let ptx = Sarek_ir_ptx.generate k in
+  assert_contains ptx "div.s32" ;
+  assert_contains ptx "rem.s32" ;
+  assert_contains ptx "div.s64" ;
+  assert_contains ptx "rem.s64" ;
+  if contains ptx "div.u32" || contains ptx "div.u64" then
+    Alcotest.fail "unsigned div emitted for signed Sarek int" ;
+  if contains ptx "rem.u32" || contains ptx "rem.u64" then
+    Alcotest.fail "unsigned rem emitted for signed Sarek int"
+
+(** Plain f32 division is correctly rounded (audit finding M2): the generic Div
+    binop must emit div.rn.f32, not the ~2-ulp div.approx.f32 (which remains
+    reserved for already-approximate intrinsics like tan/tanh). *)
+let test_f32_div_correctly_rounded () =
+  let out = make_var "out" (TVec TFloat32) in
+  let a = make_var "a" (TVec TFloat32) in
+  let tid = make_var "tid" TInt32 in
+  let av = EArrayRead ("a", EVar tid) in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign
+          (LArrayElem ("out", EVar tid), EBinop (Div, av, EConst (CFloat32 3.0)))
+      )
+  in
+  let mk v = DParam (v, Some {arr_elttype = TFloat32; arr_memspace = Global}) in
+  let k = base_kernel "f32_div" [mk out; mk a] body [] in
+  let ptx = Sarek_ir_ptx.generate k in
+  assert_contains ptx "div.rn.f32" ;
+  if contains ptx "div.approx.f32" then
+    Alcotest.fail "plain f32 division must not use div.approx.f32"
+
+(** Int64 comparison family, Not/BitNot and min/max must be class-aware (audit
+    finding H2): the old code emitted setp.*.s32 / not.b32 / min.s32 on %rd
+    (64-bit) registers - invalid PTX, rejected at module load. *)
+let test_int64_compare_minmax_markers () =
+  let la = make_var "la" (TVec TInt64) in
+  let out = make_var "out" (TVec TInt32) in
+  let tid = make_var "tid" TInt32 in
+  let x = make_var "x" TInt64 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SLet
+          ( x,
+            EArrayRead ("la", EVar tid),
+            SSeq
+              [
+                SAssign
+                  ( LArrayElem ("out", EVar tid),
+                    EBinop (Lt, EVar x, EConst (CInt64 0L)) );
+                SAssign
+                  ( LArrayElem ("out", EVar tid),
+                    EBinop (Eq, EVar x, EConst (CInt64 42L)) );
+                SAssign (LArrayElem ("la", EVar tid), EUnop (BitNot, EVar x));
+                SAssign
+                  ( LArrayElem ("la", EVar tid),
+                    EIntrinsic ([], "min", [EVar x; EConst (CInt64 7L)]) );
+              ] ) )
+  in
+  let k =
+    base_kernel
+      "int64_cmp"
+      [
+        DParam (la, Some {arr_elttype = TInt64; arr_memspace = Global});
+        DParam (out, Some {arr_elttype = TInt32; arr_memspace = Global});
+      ]
+      body
+      []
+  in
+  let ptx = Sarek_ir_ptx.generate k in
+  assert_contains ptx "setp.lt.s64" ;
+  assert_contains ptx "setp.eq.s64" ;
+  assert_contains ptx "not.b64" ;
+  assert_contains ptx "min.s64" ;
+  if contains ptx "setp.lt.s32" || contains ptx "not.b32" then
+    Alcotest.fail "32-bit instruction emitted for 64-bit operand"
 
 (** ECast scalar-matrix coverage: bool casts normalize to a u32 0/1 via
     setp+selp (float sources use unordered neu so NaN -> 1, matching C); i32 ->
@@ -674,6 +803,53 @@ let test_atomic_width_mismatch_rejected () =
   in
   match Sarek_ir_ptx.generate k with
   | _ -> Alcotest.fail "int32 value into atom.add.u64 should be rejected"
+  | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()
+
+(** Audit finding M5: the intrinsic's hardwired 4/8-byte stride must match the
+    array's element width — atomic_add_int32 on an int64 vector would corrupt
+    neighbouring elements; and a *_global_* atomic on a shared array would use
+    the 32-bit shared-window offset as a global address. *)
+let test_atomic_stride_and_space_rejected () =
+  let tid = make_var "tid" TInt32 in
+  let gen_with body params =
+    base_kernel "atomic_bad" params body [] |> Sarek_ir_ptx.generate
+  in
+  (* 4-byte atomic on an 8-byte-element array: rejected. *)
+  let lacc = make_var "lacc" (TVec TInt64) in
+  let body32on64 =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SExpr
+          (EIntrinsic
+             ( ["Sarek_stdlib"; "Gpu"],
+               "atomic_add_int32",
+               [EVar lacc; EVar tid; EConst (CInt32 1l)] )) )
+  in
+  (match
+     gen_with
+       body32on64
+       [DParam (lacc, Some {arr_elttype = TInt64; arr_memspace = Global})]
+   with
+  | _ -> Alcotest.fail "4-byte atomic on 8-byte elements should be rejected"
+  | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()) ;
+  (* *_global_* atomic on a shared array: rejected. *)
+  let sacc = make_var "sacc" TInt32 in
+  let body_global_on_shared =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SLet
+          ( sacc,
+            EArrayCreate (TInt32, EConst (CInt32 32l), Shared),
+            SExpr
+              (EIntrinsic
+                 ( ["Sarek_stdlib"; "Gpu"],
+                   "atomic_add_global_int32",
+                   [EVar sacc; EVar tid; EConst (CInt32 1l)] )) ) )
+  in
+  match gen_with body_global_on_shared [] with
+  | _ -> Alcotest.fail "global-form atomic on shared array should be rejected"
   | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()
 
 (** Check that [ptx] does NOT contain [marker]. *)
@@ -1861,6 +2037,470 @@ let test_static_dshared_markers () =
     ~why:"statically-sized shared array must not be extern" ;
   assert_contains ptx "st.shared.s32"
 
+(** ptxas validation gate (audit finding M9): the substring markers above prove
+    which instructions were emitted, but not that the module ASSEMBLES. When the
+    CUDA toolkit's [ptxas] is on PATH, assemble the PTX of the regression
+    kernels (vector_add, signed div/rem, int64 comparisons) and fail if ptxas
+    rejects it — this is exactly the check that catches an invalid-PTX class of
+    bug (e.g. a 32-bit instruction on a 64-bit register) with no GPU required.
+    Skips cleanly when ptxas is absent (CPU-only CI). *)
+let ptxas_available =
+  lazy
+    (match Unix.system "command -v ptxas >/dev/null 2>&1" with
+    | Unix.WEXITED 0 -> true
+    | _ -> false)
+
+let assemble_ok ptx =
+  let base = Filename.temp_file "sarek_ptx_" "" in
+  let src = base ^ ".ptx" in
+  let obj = base ^ ".cubin" in
+  let oc = open_out src in
+  output_string oc ptx ;
+  close_out oc ;
+  (* ptxas assumes a low default SM and rejects any PTX whose [.target] is
+     higher ("SM version specified by .target is higher than default SM
+     version assumed"), so extract the module's own target and pass it
+     explicitly via --gpu-name. *)
+  let gpu_name =
+    let target_re = Str.regexp "\\.target[ \t]+\\(sm_[0-9]+\\)" in
+    try
+      ignore (Str.search_forward target_re ptx 0) ;
+      Str.matched_group 1 ptx
+    with Not_found -> "sm_86"
+  in
+  let cmd =
+    Printf.sprintf
+      "ptxas --compile-only --gpu-name %s -o %s %s 2>%s.err"
+      (Filename.quote gpu_name)
+      (Filename.quote obj)
+      (Filename.quote src)
+      (Filename.quote base)
+  in
+  let rc = Unix.system cmd in
+  let err =
+    try
+      let ic = open_in (base ^ ".err") in
+      let n = in_channel_length ic in
+      let s = really_input_string ic n in
+      close_in ic ;
+      s
+    with _ -> ""
+  in
+  List.iter
+    (fun f -> try Sys.remove f with _ -> ())
+    [src; obj; base; base ^ ".err"] ;
+  match rc with Unix.WEXITED 0 -> Ok () | _ -> Error err
+
+(** {1 SoA (Structure-of-Arrays) shared fixtures}
+
+    A custom (record) vector parameter named in [~soa_params] lowers to one
+    [.param .u64] base pointer per scalar leaf (sharing one length), and every
+    field access becomes a coalesced per-leaf scalar [ld/st.global] at that
+    leaf's own base — never the AoS packed-element [mul.wide] stride. *)
+
+let point3d_ty =
+  TRecord ("point3d", [("x", TFloat32); ("y", TFloat32); ("z", TFloat32)])
+
+(* {i:int32; d:float64} — covers a 4-byte and an 8-byte leaf, and a packed-AoS
+   *misaligned* layout (d at offset 4) that SoA accepts because each leaf has its
+   own contiguous buffer. *)
+let mixed_id_ty = TRecord ("mixed_id", [("i", TInt32); ("d", TFloat64)])
+
+(* {p:int64; q:int32} — the remaining two leaf widths (8-byte i64 + 4-byte
+   i32). *)
+let long_iq_ty = TRecord ("long_iq", [("p", TInt64); ("q", TInt32)])
+
+(* mixed_id field-combine: reads an i32 leaf and an f64 leaf and writes their
+   sum (i widened to f64). Exercises s32 + f64 SoA leaf loads. *)
+let soa_mixed_kernel () =
+  let v = make_var "v" (TVec mixed_id_ty) in
+  let out = make_var "out" (TVec TFloat64) in
+  let n = make_var "n" TInt32 in
+  let tid = make_var "tid" TInt32 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SIf
+          ( EBinop (Lt, EVar tid, EVar n),
+            SAssign
+              ( LArrayElem ("out", EVar tid),
+                EBinop
+                  ( Add,
+                    ECast
+                      (TFloat64, ERecordField (EArrayRead ("v", EVar tid), "i")),
+                    ERecordField (EArrayRead ("v", EVar tid), "d") ) ),
+            None ) )
+  in
+  base_kernel
+    "mixedsum"
+    [
+      DParam (v, Some {arr_elttype = mixed_id_ty; arr_memspace = Global});
+      DParam (out, Some {arr_elttype = TFloat64; arr_memspace = Global});
+      DParam (n, None);
+    ]
+    body
+    []
+
+(* long_iq field-combine: reads an i64 leaf and an i32 leaf (q widened to i64)
+   and writes their sum. Exercises s64 + s32 SoA leaf loads. *)
+let soa_long_kernel () =
+  let v = make_var "v" (TVec long_iq_ty) in
+  let out = make_var "out" (TVec TInt64) in
+  let n = make_var "n" TInt32 in
+  let tid = make_var "tid" TInt32 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SIf
+          ( EBinop (Lt, EVar tid, EVar n),
+            SAssign
+              ( LArrayElem ("out", EVar tid),
+                EBinop
+                  ( Add,
+                    ERecordField (EArrayRead ("v", EVar tid), "p"),
+                    ECast
+                      (TInt64, ERecordField (EArrayRead ("v", EVar tid), "q"))
+                  ) ),
+            None ) )
+  in
+  base_kernel
+    "longsum"
+    [
+      DParam (v, Some {arr_elttype = long_iq_ty; arr_memspace = Global});
+      DParam (out, Some {arr_elttype = TInt64; arr_memspace = Global});
+      DParam (n, None);
+    ]
+    body
+    []
+
+(** point3d field-sum: reads three f32 fields of a custom vector and writes
+    their sum. Shared by the marker test and the ptxas gate. *)
+let soa_field_sum_kernel () =
+  let pts = make_var "pts" (TVec point3d_ty) in
+  let out = make_var "out" (TVec TFloat32) in
+  let n = make_var "n" TInt32 in
+  let tid = make_var "tid" TInt32 in
+  let fld f = ERecordField (EArrayRead ("pts", EVar tid), f) in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SIf
+          ( EBinop (Lt, EVar tid, EVar n),
+            SAssign
+              ( LArrayElem ("out", EVar tid),
+                EBinop (Add, EBinop (Add, fld "x", fld "y"), fld "z") ),
+            None ) )
+  in
+  base_kernel
+    "p3sum"
+    [
+      DParam (pts, Some {arr_elttype = point3d_ty; arr_memspace = Global});
+      DParam (out, Some {arr_elttype = TFloat32; arr_memspace = Global});
+      DParam (n, None);
+    ]
+    body
+    []
+
+let test_ptxas_assembles () =
+  if not (Lazy.force ptxas_available) then
+    Printf.printf "  SKIP: ptxas not on PATH (CPU-only environment)\n%!"
+  else begin
+    let ia = make_var "ia" (TVec TInt32) in
+    let la = make_var "la" (TVec TInt64) in
+    let out = make_var "out" (TVec TInt32) in
+    let tid = make_var "tid" TInt32 in
+    let x = make_var "x" TInt64 in
+    let div_body =
+      SLet
+        ( tid,
+          EIntrinsic ([], "global_thread_id", []),
+          SSeq
+            [
+              SAssign
+                ( LArrayElem ("ia", EVar tid),
+                  EBinop
+                    (Div, EArrayRead ("ia", EVar tid), EConst (CInt32 (-2l))) );
+              SAssign
+                ( LArrayElem ("la", EVar tid),
+                  EBinop
+                    (Div, EArrayRead ("la", EVar tid), EConst (CInt64 (-2L))) );
+            ] )
+    in
+    let cmp_body =
+      SLet
+        ( tid,
+          EIntrinsic ([], "global_thread_id", []),
+          SLet
+            ( x,
+              EArrayRead ("la", EVar tid),
+              SSeq
+                [
+                  SAssign
+                    ( LArrayElem ("out", EVar tid),
+                      EBinop (Lt, EVar x, EConst (CInt64 0L)) );
+                  SAssign
+                    ( LArrayElem ("la", EVar tid),
+                      EIntrinsic ([], "min", [EVar x; EConst (CInt64 7L)]) );
+                ] ) )
+    in
+    let kernels =
+      [
+        ("vector_add", make_vector_add_kernel ());
+        ( "int_div_rem_signed",
+          base_kernel
+            "int_div_rem"
+            [
+              DParam (ia, Some {arr_elttype = TInt32; arr_memspace = Global});
+              DParam (la, Some {arr_elttype = TInt64; arr_memspace = Global});
+            ]
+            div_body
+            [] );
+        ( "int64_compare",
+          base_kernel
+            "int64_cmp"
+            [
+              DParam (la, Some {arr_elttype = TInt64; arr_memspace = Global});
+              DParam (out, Some {arr_elttype = TInt32; arr_memspace = Global});
+            ]
+            cmp_body
+            [] );
+      ]
+    in
+    List.iter
+      (fun (name, k) ->
+        match assemble_ok (Sarek_ir_ptx.generate k) with
+        | Ok () -> Printf.printf "  ptxas OK: %s\n%!" name
+        | Error err ->
+            Alcotest.fail
+              (Printf.sprintf "ptxas rejected kernel %s:\n%s" name err))
+      kernels ;
+    (* SoA-lowered custom-vector kernels: N per-leaf base pointers + coalesced
+       scalar loads must also assemble, across every leaf width (f32/f64/i32/i64
+       and a misaligned-AoS mixed record). *)
+    List.iter
+      (fun (name, vec, k) ->
+        match assemble_ok (Sarek_ir_ptx.generate ~soa_params:[vec] k) with
+        | Ok () -> Printf.printf "  ptxas OK: %s (SoA)\n%!" name
+        | Error err ->
+            Alcotest.fail
+              (Printf.sprintf "ptxas rejected SoA kernel %s:\n%s" name err))
+      [
+        ("soa_field_sum_f32", "pts", soa_field_sum_kernel ());
+        ("soa_mixed_i32_f64", "v", soa_mixed_kernel ());
+        ("soa_long_i64_i32", "v", soa_long_kernel ());
+      ]
+  end
+
+(** SoA field read emits N per-leaf base pointers + one shared length, coalesced
+    per-leaf scalar loads, and NO packed-element [mul.wide] stride nor the
+    single AoS base pointer. The default (AoS) compilation of the same kernel
+    keeps the single pointer + element stride — proving SoA is opt-in and AoS
+    unchanged. *)
+let test_soa_field_read_markers () =
+  let k = soa_field_sum_kernel () in
+  let soa = Sarek_ir_ptx.generate ~soa_params:["pts"] k in
+  assert_contains soa ".param .u64 param_pts_soa_x" ;
+  assert_contains soa ".param .u64 param_pts_soa_y" ;
+  assert_contains soa ".param .u64 param_pts_soa_z" ;
+  assert_contains soa ".param .u32 param_sarek_pts_length" ;
+  if count_substr soa "ld.global.f32" < 3 then
+    Alcotest.fail (Printf.sprintf "expected >=3 coalesced leaf loads:\n%s" soa) ;
+  assert_absent
+    soa
+    "mul.wide.u32"
+    ~why:
+      "SoA field access must be scalar-strided (shl), not the AoS element \
+       multiply" ;
+  assert_absent
+    soa
+    ".param .u64 param_pts,"
+    ~why:"SoA replaces the single AoS base pointer with per-leaf pointers" ;
+  (* AoS (default) compilation is unchanged: single base pointer + element
+     stride. *)
+  let aos = Sarek_ir_ptx.generate k in
+  assert_contains aos ".param .u64 param_pts," ;
+  assert_contains aos "mul.wide.u32" ;
+  assert_absent
+    aos
+    "param_pts_soa_x"
+    ~why:"AoS compilation must not emit SoA per-leaf pointers"
+
+(** Whole-element copy between two SoA vectors: per-leaf coalesced loads from
+    the source leaves and stores to the destination leaves, no element stride.
+*)
+let test_soa_whole_copy_markers () =
+  let src = make_var "src" (TVec point3d_ty) in
+  let dst = make_var "dst" (TVec point3d_ty) in
+  let n = make_var "n" TInt32 in
+  let tid = make_var "tid" TInt32 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SIf
+          ( EBinop (Lt, EVar tid, EVar n),
+            SAssign (LArrayElem ("dst", EVar tid), EArrayRead ("src", EVar tid)),
+            None ) )
+  in
+  let k =
+    base_kernel
+      "p3copy"
+      [
+        DParam (src, Some {arr_elttype = point3d_ty; arr_memspace = Global});
+        DParam (dst, Some {arr_elttype = point3d_ty; arr_memspace = Global});
+        DParam (n, None);
+      ]
+      body
+      []
+  in
+  let soa = Sarek_ir_ptx.generate ~soa_params:["src"; "dst"] k in
+  assert_contains soa ".param .u64 param_src_soa_x" ;
+  assert_contains soa ".param .u64 param_dst_soa_z" ;
+  if count_substr soa "ld.global.f32" < 3 then
+    Alcotest.fail (Printf.sprintf "expected >=3 leaf loads:\n%s" soa) ;
+  if count_substr soa "st.global.f32" < 3 then
+    Alcotest.fail (Printf.sprintf "expected >=3 leaf stores:\n%s" soa) ;
+  assert_absent
+    soa
+    "mul.wide.u32"
+    ~why:"whole SoA copy is per-leaf coalesced scalar ld/st, no element stride"
+
+(** Single-field SoA write [v.(i).x <- v.(i).y +. 1.0]: one coalesced scalar
+    load (y leaf) and one coalesced scalar store (x leaf). *)
+let test_soa_field_write_markers () =
+  let pts = make_var "pts" (TVec point3d_ty) in
+  let n = make_var "n" TInt32 in
+  let tid = make_var "tid" TInt32 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SIf
+          ( EBinop (Lt, EVar tid, EVar n),
+            SAssign
+              ( LRecordField (LArrayElem ("pts", EVar tid), "x"),
+                EBinop
+                  ( Add,
+                    ERecordField (EArrayRead ("pts", EVar tid), "y"),
+                    EConst (CFloat32 1.0) ) ),
+            None ) )
+  in
+  let k =
+    base_kernel
+      "p3fieldwrite"
+      [
+        DParam (pts, Some {arr_elttype = point3d_ty; arr_memspace = Global});
+        DParam (n, None);
+      ]
+      body
+      []
+  in
+  let soa = Sarek_ir_ptx.generate ~soa_params:["pts"] k in
+  assert_contains soa "ld.global.f32" ;
+  assert_contains soa "st.global.f32" ;
+  assert_absent
+    soa
+    "mul.wide.u32"
+    ~why:"single-field SoA write addresses one leaf by scalar stride"
+
+(** Mixed-width record [{i:int32; d:float64}] under SoA: an s32 leaf load and an
+    f64 leaf load, each from its own base — and it is accepted despite the
+    packed AoS layout being misaligned (SoA leaves are independently
+    contiguous). *)
+let test_soa_mixed_width_markers () =
+  let v = make_var "v" (TVec mixed_id_ty) in
+  let out = make_var "out" (TVec TFloat64) in
+  let n = make_var "n" TInt32 in
+  let tid = make_var "tid" TInt32 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SIf
+          ( EBinop (Lt, EVar tid, EVar n),
+            SAssign
+              ( LArrayElem ("out", EVar tid),
+                EBinop
+                  ( Add,
+                    ECast
+                      (TFloat64, ERecordField (EArrayRead ("v", EVar tid), "i")),
+                    ERecordField (EArrayRead ("v", EVar tid), "d") ) ),
+            None ) )
+  in
+  let k =
+    base_kernel
+      "mixedsum"
+      [
+        DParam (v, Some {arr_elttype = mixed_id_ty; arr_memspace = Global});
+        DParam (out, Some {arr_elttype = TFloat64; arr_memspace = Global});
+        DParam (n, None);
+      ]
+      body
+      []
+  in
+  let soa = Sarek_ir_ptx.generate ~soa_params:["v"] k in
+  assert_contains soa ".param .u64 param_v_soa_i" ;
+  assert_contains soa ".param .u64 param_v_soa_d" ;
+  assert_contains soa "ld.global.s32" ;
+  assert_contains soa "ld.global.f64" ;
+  assert_absent
+    soa
+    "mul.wide.u32"
+    ~why:"mixed-width SoA leaves are scalar-strided per leaf"
+
+(** Record [{p:int64; q:int32}] under SoA: an s64 leaf load and an s32 leaf
+    load, each from its own base (the remaining two leaf widths). *)
+let test_soa_int64_markers () =
+  let soa = Sarek_ir_ptx.generate ~soa_params:["v"] (soa_long_kernel ()) in
+  assert_contains soa ".param .u64 param_v_soa_p" ;
+  assert_contains soa ".param .u64 param_v_soa_q" ;
+  assert_contains soa "ld.global.s64" ;
+  assert_contains soa "ld.global.s32" ;
+  assert_absent
+    soa
+    "mul.wide.u32"
+    ~why:"i64/i32 SoA leaves are scalar-strided per leaf (shl 3 / shl 2)"
+
+(** A [~soa_params] naming a scalar-element (non-record) vector is rejected. *)
+let test_soa_nonrecord_rejected () =
+  let k = make_vector_add_kernel () in
+  match Sarek_ir_ptx.generate ~soa_params:["a"] k with
+  | _ -> Alcotest.fail "SoA on a non-record vector should be rejected"
+  | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()
+
+(** A [~soa_params] naming a nested-record vector is rejected (v1 = flat records
+    only). *)
+let test_soa_nested_record_rejected () =
+  let outer_ty = TRecord ("outer", [("inner", point_ty); ("c", TFloat32)]) in
+  let v = make_var "v" (TVec outer_ty) in
+  let out = make_var "out" (TVec TFloat32) in
+  let tid = make_var "tid" TInt32 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign
+          ( LArrayElem ("out", EVar tid),
+            ERecordField
+              (ERecordField (EArrayRead ("v", EVar tid), "inner"), "x") ) )
+  in
+  let k =
+    base_kernel
+      "nested_soa"
+      [
+        DParam (v, Some {arr_elttype = outer_ty; arr_memspace = Global});
+        DParam (out, Some {arr_elttype = TFloat32; arr_memspace = Global});
+      ]
+      body
+      []
+  in
+  match Sarek_ir_ptx.generate ~soa_params:["v"] k with
+  | _ -> Alcotest.fail "SoA on a nested-record vector should be rejected"
+  | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()
+
 let () =
   Alcotest.run
     "ptx_snapshot"
@@ -1871,6 +2511,10 @@ let () =
             "vector_add PTX contains canonical markers"
             `Quick
             test_vector_add_markers;
+          Alcotest.test_case
+            "ptxas assembles regression kernels (skips if ptxas absent)"
+            `Quick
+            test_ptxas_assembles;
           Alcotest.test_case
             "native math emits min/max/cvt.rmi/cvt.rpi/rsqrt"
             `Quick
@@ -1908,9 +2552,25 @@ let () =
             `Quick
             test_atomic_width_mismatch_rejected;
           Alcotest.test_case
+            "stride/space-mismatched atomics are rejected"
+            `Quick
+            test_atomic_stride_and_space_rejected;
+          Alcotest.test_case
             "float Mod lowers to fmod (div.rn + cvt.rzi + fma)"
             `Quick
             test_float_mod_fmod_markers;
+          Alcotest.test_case
+            "integer Div/Mod emit signed div.s32/s64 rem.s32/s64"
+            `Quick
+            test_int_div_rem_signed_markers;
+          Alcotest.test_case
+            "int64 compare/not/min emit 64-bit forms"
+            `Quick
+            test_int64_compare_minmax_markers;
+          Alcotest.test_case
+            "plain f32 division emits div.rn.f32"
+            `Quick
+            test_f32_div_correctly_rounded;
           Alcotest.test_case
             "ECast matrix: bool setp/selp + i32<->i64 cvt pairs"
             `Quick
@@ -2055,5 +2715,34 @@ let () =
             "static DShared keeps non-extern decl"
             `Quick
             test_static_dshared_markers;
+          Alcotest.test_case
+            "SoA field read: N per-leaf pointers + coalesced loads, AoS \
+             unchanged"
+            `Quick
+            test_soa_field_read_markers;
+          Alcotest.test_case
+            "SoA whole-element copy: per-leaf coalesced ld/st"
+            `Quick
+            test_soa_whole_copy_markers;
+          Alcotest.test_case
+            "SoA single-field write: one leaf ld + one leaf st"
+            `Quick
+            test_soa_field_write_markers;
+          Alcotest.test_case
+            "SoA mixed-width {i32;f64}: s32 + f64 leaf loads, misaligned AoS ok"
+            `Quick
+            test_soa_mixed_width_markers;
+          Alcotest.test_case
+            "SoA {i64;i32}: s64 + s32 leaf loads"
+            `Quick
+            test_soa_int64_markers;
+          Alcotest.test_case
+            "SoA on a non-record vector is rejected"
+            `Quick
+            test_soa_nonrecord_rejected;
+          Alcotest.test_case
+            "SoA on a nested-record vector is rejected"
+            `Quick
+            test_soa_nested_record_rejected;
         ] );
     ]

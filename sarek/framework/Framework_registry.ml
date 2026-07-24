@@ -73,17 +73,26 @@ let find_backend name =
 (** List all registered plugin names *)
 let names () = Hashtbl.to_seq_keys plugins |> List.of_seq
 
-(** List all available plugins (those where is_available returns true) *)
+(** List all available plugins (those where is_available returns true).
+
+    A probe failure counts as unavailable, but only for ordinary exceptions:
+    asynchronous/fatal ones (Out_of_memory, Stack_overflow, signals) must
+    propagate - swallowing them turned real failures into silent "no backends
+    found" (audit finding). *)
+let probe_available (is_available : unit -> bool) : bool =
+  try is_available () with
+  | (Out_of_memory | Stack_overflow | Sys.Break) as fatal -> raise fatal
+  | _ -> false
+
 let available () =
   Hashtbl.to_seq_values plugins
-  |> Seq.filter (fun (module P : S) -> try P.is_available () with _ -> false)
+  |> Seq.filter (fun (module P : S) -> probe_available P.is_available)
   |> List.of_seq
 
 (** List all available full backends *)
 let available_backends () =
   Hashtbl.to_seq_values backends
-  |> Seq.filter (fun (module B : BACKEND) ->
-      try B.is_available () with _ -> false)
+  |> Seq.filter (fun (module B : BACKEND) -> probe_available B.is_available)
   |> List.of_seq
 
 (** Get the best available backend (highest priority) *)
@@ -91,7 +100,7 @@ let best_backend () =
   let available =
     Hashtbl.to_seq backends
     |> Seq.filter (fun (_name, (module B : BACKEND)) ->
-        try B.is_available () with _ -> false)
+        probe_available B.is_available)
     |> List.of_seq
   in
   match available with
