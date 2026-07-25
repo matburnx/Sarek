@@ -525,8 +525,14 @@ let test_glsl_recursion_vector_validates () =
     Alcotest.failf
       "vector-parameter helper must be inlined, found a residual call/def:\n%s"
       glsl ;
-  if not (Lazy.force glslang_available) then
-    Printf.printf "  SKIP: glslangValidator not on PATH\n%!"
+  if not (Lazy.force glslang_available) then begin
+    Printf.printf "  SKIP: glslangValidator not on PATH\n%!" ;
+    (* This suite is the "validation-gate": every case is named for a check
+       the external validator performs. Without the validator the case has
+       not made that check, so report SKIP rather than a green [OK]. The
+       static assertions above still ran and still fail loudly. *)
+    Alcotest.skip ()
+  end
   else
     match glslang_ok glsl with
     | Ok () -> Printf.printf "  glslangValidator OK: recursion_vector\n%!"
@@ -546,8 +552,10 @@ let test_wgsl_recursion_vector_validates () =
     Alcotest.failf
       "vector-parameter helper must be inlined, found a residual call/def:\n%s"
       wgsl ;
-  if not (Lazy.force naga_available) then
-    Printf.printf "  SKIP: naga not on PATH (WGSL validation skipped)\n%!"
+  if not (Lazy.force naga_available) then begin
+    Printf.printf "  SKIP: naga not on PATH (WGSL validation skipped)\n%!" ;
+    Alcotest.skip ()
+  end
   else
     match naga_ok wgsl with
     | Ok () -> Printf.printf "  naga OK: recursion_vector\n%!"
@@ -572,8 +580,14 @@ let test_glsl_local_buffer_name_collision () =
       "expected the colliding local to be alpha-renamed (sarek_inl_local_*):\n\
        %s"
       glsl ;
-  if not (Lazy.force glslang_available) then
-    Printf.printf "  SKIP: glslangValidator not on PATH\n%!"
+  if not (Lazy.force glslang_available) then begin
+    Printf.printf "  SKIP: glslangValidator not on PATH\n%!" ;
+    (* This suite is the "validation-gate": every case is named for a check
+       the external validator performs. Without the validator the case has
+       not made that check, so report SKIP rather than a green [OK]. The
+       static assertions above still ran and still fail loudly. *)
+    Alcotest.skip ()
+  end
   else
     match glslang_ok glsl with
     | Ok () -> Printf.printf "  glslangValidator OK: collision_vector\n%!"
@@ -596,8 +610,10 @@ let test_wgsl_local_buffer_name_collision () =
       "expected the colliding local to be alpha-renamed (sarek_inl_local_*):\n\
        %s"
       wgsl ;
-  if not (Lazy.force naga_available) then
-    Printf.printf "  SKIP: naga not on PATH (WGSL validation skipped)\n%!"
+  if not (Lazy.force naga_available) then begin
+    Printf.printf "  SKIP: naga not on PATH (WGSL validation skipped)\n%!" ;
+    Alcotest.skip ()
+  end
   else
     match naga_ok wgsl with
     | Ok () -> Printf.printf "  naga OK: collision_vector\n%!"
@@ -629,8 +645,14 @@ let test_glsl_transpose_naive_pc_shadow_validates () =
     Alcotest.failf
       "a scalar-param-shadowing local declaration survived unrenamed:\n%s"
       glsl ;
-  if not (Lazy.force glslang_available) then
-    Printf.printf "  SKIP: glslangValidator not on PATH\n%!"
+  if not (Lazy.force glslang_available) then begin
+    Printf.printf "  SKIP: glslangValidator not on PATH\n%!" ;
+    (* This suite is the "validation-gate": every case is named for a check
+       the external validator performs. Without the validator the case has
+       not made that check, so report SKIP rather than a green [OK]. The
+       static assertions above still ran and still fail loudly. *)
+    Alcotest.skip ()
+  end
   else
     match glslang_ok glsl with
     | Ok () -> Printf.printf "  glslangValidator OK: transpose_naive\n%!"
@@ -650,8 +672,10 @@ let test_glsl_transpose_naive_pc_shadow_validates () =
 let test_wgsl_transpose_naive_validates () =
   let k = transpose_naive_kernel () in
   let wgsl = Sarek_ir_wgsl.generate k in
-  if not (Lazy.force naga_available) then
-    Printf.printf "  SKIP: naga not on PATH (WGSL validation skipped)\n%!"
+  if not (Lazy.force naga_available) then begin
+    Printf.printf "  SKIP: naga not on PATH (WGSL validation skipped)\n%!" ;
+    Alcotest.skip ()
+  end
   else
     match naga_ok wgsl with
     | Ok () -> Printf.printf "  naga OK: transpose_naive\n%!"
@@ -691,9 +715,13 @@ let test_wgsl_scalar_shadow_mut_local () =
       "expected the mutable local declaration to use the renamed name:\n%s"
       wgsl ;
   if not (Lazy.force naga_available) then
+    (* Deliberately NOT Alcotest.skip (), unlike the "…validates" cases in
+       this suite: this case is named for the emitted-text property and the
+       three assertions above have already established it. Only the extra
+       naga cross-check is missing, so a green [OK] here is honest. *)
     Printf.printf
-      "  codegen-golden OK: wgsl_scalar_shadow_mut (naga absent — WGSL \
-       assertion is on emitted text, not runtime)\n\
+      "  [SKIP] naga not on PATH — wgsl_scalar_shadow_mut checked its \
+       emitted-text assertions only\n\
        %!"
   else
     match naga_ok wgsl with
@@ -725,8 +753,14 @@ let test_glsl_match_pattern_pc_shadow_validates () =
       "a scalar-param-shadowing match binder declaration survived unrenamed:\n\
        %s"
       k ;
-  if not (Lazy.force glslang_available) then
-    Printf.printf "  SKIP: glslangValidator not on PATH\n%!"
+  if not (Lazy.force glslang_available) then begin
+    Printf.printf "  SKIP: glslangValidator not on PATH\n%!" ;
+    (* This suite is the "validation-gate": every case is named for a check
+       the external validator performs. Without the validator the case has
+       not made that check, so report SKIP rather than a green [OK]. The
+       static assertions above still ran and still fail loudly. *)
+    Alcotest.skip ()
+  end
   else
     match glslang_ok k with
     | Ok () -> Printf.printf "  glslangValidator OK: match_pc_shadow\n%!"
@@ -755,8 +789,14 @@ let test_glsl_vec_len_shadow_validates () =
     Alcotest.failf
       "a vector-_len-shadowing local declaration survived unrenamed:\n%s"
       k ;
-  if not (Lazy.force glslang_available) then
-    Printf.printf "  SKIP: glslangValidator not on PATH\n%!"
+  if not (Lazy.force glslang_available) then begin
+    Printf.printf "  SKIP: glslangValidator not on PATH\n%!" ;
+    (* This suite is the "validation-gate": every case is named for a check
+       the external validator performs. Without the validator the case has
+       not made that check, so report SKIP rather than a green [OK]. The
+       static assertions above still ran and still fail loudly. *)
+    Alcotest.skip ()
+  end
   else
     match glslang_ok k with
     | Ok () -> Printf.printf "  glslangValidator OK: vec_len_shadow\n%!"
