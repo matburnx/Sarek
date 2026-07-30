@@ -52,7 +52,16 @@ module Cuda : Framework_sig.PLUGIN_BASE = struct
         shared_mem_per_block = d.shared_mem_per_block;
         total_global_mem = d.total_mem;
         compute_capability = d.compute_capability;
-        supports_fp64 = true;
+        (* fp64 and int64 are core PTX on every CUDA device Sarek targets.
+           Float16 is NOT listed: it needs sm_53, and [compute_capability] is
+           right here to decide it — but wiring that is a separate change from
+           #142, and listing a feature we have not gated would be the
+           permissive default this list exists to remove. *)
+        device_features = [Sarek_ir_analysis.Float64; Sarek_ir_analysis.Int64];
+        (* backlog-62: no cooperative-matrix probe on this backend. [None] is
+           "not probed", which Sarek_coopmat.verdict maps to Unknown and therefore
+           refuses; an empty list would be a positive claim nobody measured. *)
+        coopmat = None;
         supports_atomics = true;
         warp_size = d.warp_size;
         max_registers_per_block = 65536;

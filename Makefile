@@ -108,6 +108,16 @@ test_negative:
 	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_tuple_destructure_nonprim.cma > "$$out" 2>&1; if grep -q "Tuple values support only scalar components" "$$out"; then echo "  PASS: non-primitive tuple destructure rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
 	@echo "Testing escaping function-value rejection (L12 defunctionalization)..."
 	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_fun_escape.cma > "$$out" 2>&1; if grep -q "Function value escapes" "$$out"; then echo "  PASS: escaping function value rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
+	@echo "Testing f16 arithmetic rejection (storage-only type)..."
+	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_f16_arith.cma > "$$out" 2>&1; if grep -q "float16 is a storage-only type and has no arithmetic" "$$out"; then echo "  PASS: f16 arithmetic rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
+	@echo "Testing f16 equality rejection (Eq/Ne skipped every check pre-fix)..."
+	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_f16_equality.cma > "$$out" 2>&1; if grep -q "float16 is a storage-only type and has no arithmetic" "$$out"; then echo "  PASS: f16 equality rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
+	@echo "Testing f16 ordered-comparison rejection..."
+	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_f16_compare.cma > "$$out" 2>&1; if grep -q "float16 is a storage-only type and has no arithmetic" "$$out"; then echo "  PASS: f16 comparison rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
+	@echo "Testing scalar f16 kernel-parameter rejection..."
+	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_f16_scalar_param.cma > "$$out" 2>&1; if grep -q "cannot be a scalar kernel parameter" "$$out"; then echo "  PASS: scalar f16 param rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
+	@echo "Testing f16 through a polymorphic helper (generalization route)..."
+	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_f16_poly_helper.cma > "$$out" 2>&1; if grep -q "a polymorphic helper instantiated at float16" "$$out"; then echo "  PASS: f16 via polymorphic helper rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
 	@echo "Testing reserved-prefix rejection (kernel param sarek_smod)..."
 	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_reserved_prefix_param.cma > "$$out" 2>&1; if grep -q "identifiers beginning with 'sarek_' are reserved" "$$out"; then echo "  PASS: reserved-prefix param rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
 	@echo "Testing reserved-prefix rejection (local let sarek_x)..."
@@ -118,10 +128,18 @@ test_negative:
 	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_reserved_prefix_field.cma > "$$out" 2>&1; if grep -q "identifiers beginning with 'sarek_' are reserved" "$$out"; then echo "  PASS: reserved-prefix field rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
 	@echo "Testing reserved-prefix rejection (for-loop variable sarek_i)..."
 	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_reserved_prefix_for.cma > "$$out" 2>&1; if grep -q "identifiers beginning with 'sarek_' are reserved" "$$out"; then echo "  PASS: reserved-prefix for-loop variable rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
+	@echo "Testing [%%sarek.type] extension rejection (attribute is the supported spelling)..."
+	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_sarek_type_extension.cma > "$$out" 2>&1; if grep -q "Uninterpreted extension 'sarek.type'" "$$out"; then echo "  PASS: [%%sarek.type] extension rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
 	@echo "Testing unregistered record field-type rejection (aligned ABI safety)..."
 	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_unregistered_field.cma > "$$out" 2>&1; if grep -qE "unknown (size|alignment) for field type" "$$out"; then echo "  PASS: unregistered field type rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
+	@echo "Testing tuple-typed shared-memory array rejection..."
+	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_shared_tuple.cma > "$$out" 2>&1; if grep -q "Tuple-typed shared-memory arrays are not supported" "$$out"; then echo "  PASS: tuple shared array rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
 	@echo "Testing recursive-call vector-swap rejection (tail-recursion + vector)..."
 	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_tailrec_vec_swap.cma > "$$out" 2>&1; if grep -q "must pass its own vector parameter" "$$out"; then echo "  PASS: recursive vector-swap rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
+	@echo "Testing char element-type rejection (1-byte host vs 4-byte device stride)..."
+	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_char_vector.cma > "$$out" 2>&1; if grep -q "is not a supported Sarek element type" "$$out"; then echo "  PASS: char element type rejected"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
+	@echo "Testing polymorphic-helper instantiation diagnostic (names the callee)..."
+	@out=$$(mktemp); dune build --profile=negative sarek/tests/negative/neg_test_poly_helper_f64.cma > "$$out" 2>&1; if grep -q "'norm' cannot be used at this call site" "$$out"; then echo "  PASS: polymorphic helper instantiation named the callee"; else cat "$$out"; rm -f "$$out"; exit 1; fi; rm -f "$$out"
 	@echo "All negative tests checked (see KNOWN-ISSUE line above for the one non-blocking gap, if any)"
 
 
@@ -175,6 +193,24 @@ test_sarek_core:
 # Run all tests: unit tests, e2e tests, negative tests, and spoc tests
 test-all: test test_spoc test_sarek_core test_interpreter test_negative check-opam-clean
 	@echo "=== All tests passed ==="
+
+# Review-pipeline gate contracts. Kept OUT of test-all on purpose: test-all runs
+# the GPU suites, and these must stay checkable on a machine with no GPU. Node
+# only, no framework, no network.
+#
+# Each suite constructs inputs that SHOULD be rejected and asserts the refusal —
+# schema/review-json-schema.md and schema/mandated-steps-schema.md are the
+# contracts under test. They need the review-tool bundle installed
+# (scripts/REVIEW-BUNDLE.md) and FAIL rather than skip when it is absent, because
+# a skipped contract check reads exactly like a passing one.
+.PHONY: test-review-tools
+test-review-tools:
+	@echo "=== Review-pipeline gate contracts (no GPU, no network) ==="
+	node scripts/review-verdict-assemble.test.js
+	node scripts/check-review-convergence-hardening.test.js
+	node scripts/check-mandated-steps.test.js
+	node scripts/review-bundle-verify.js
+	@echo "=== Review-tool contracts hold ==="
 
 # E2E tests - quick verification with small datasets comparing GPU vs native CPU
 # removed test for v2 compatibilit: test_histogram

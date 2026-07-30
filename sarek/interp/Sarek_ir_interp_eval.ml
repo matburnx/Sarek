@@ -222,6 +222,14 @@ and eval_special_expr state env = function
       match ty with
       | TInt32 -> VInt32 (to_int32 v)
       | TInt64 -> VInt64 (to_int64 v)
+      | TFloat16 ->
+          (* An f16 value is carried as VFloat32 (there is no VFloat16 -- f16 is
+             a storage width, not a compute type), but it MUST be narrowed here.
+             Without this arm the old catch-all returned [v] unchanged, so
+             `float32_of_float16 (float16_of_float32 3.14159)` would yield
+             3.14159 on the interpreter and 3.14062 on the GPU. Rounding here is
+             what keeps the interpreter a faithful oracle for f16 kernels. *)
+          VFloat32 (Sarek_float16.to_float16 (to_float32 v))
       | TFloat32 -> VFloat32 (to_float32 v)
       | TFloat64 -> VFloat64 (to_float64 v)
       | TBool -> VBool (to_bool v)
@@ -261,12 +269,39 @@ and eval_expr state env expr =
   (* Function application *)
   | EApp (fn_expr, args) -> eval_app state env fn_expr args
 
+(* Vector lookup, innermost scope first.
+
+   A vector reaches a helper as a PARAMETER, bound by [eval_app] through
+   [bind_var] — so it lives in [vars_by_name], not in [arrays], which holds the
+   KERNEL's own parameters. That table is therefore consulted FIRST: a helper's
+   formal shadows a kernel array of the same name, which is what lexical scoping
+   means and what every GPU backend does. Checking [arrays] first made the
+   shadowing case silently read the wrong buffer — measured: a helper folding
+   over its formal [src] while the kernel also had a vector [src] folded the
+   KERNEL's array, returning 400 instead of 4 on the interpreter while Vulkan and
+   Native both returned 4.
+
+   The lookup is read-only and must stay so: [arrays] is aliased rather than
+   copied into a callee scope because kernel buffers are shared across threads by
+   design, so registering a binding there would be a cross-thread write.
+
+   This fallback existed briefly on its own and was reverted, because alone it
+   traded a loud [Unbound_variable] for a silently wrong number: the
+   tail-recursion transform allocated its loop scaffolding from a counter
+   starting at 0, colliding with the typer's parameter ids. That is fixed in
+   Sarek_tailrec_elim.ml, and a helper call now gets its own scope
+   ([callee_env]) rather than a copy of the caller's, so the fallback can be
+   reinstated. *)
 and get_array env name =
-  try Hashtbl.find env.arrays name
-  with Not_found -> (
-    try Hashtbl.find env.shared name
-    with Not_found ->
-      Interp_error.raise_error (Unbound_variable {name; context = "get_array"}))
+  match Hashtbl.find_opt env.vars_by_name name with
+  | Some (VArray data) -> data
+  | _ -> (
+      try Hashtbl.find env.arrays name
+      with Not_found -> (
+        try Hashtbl.find env.shared name
+        with Not_found ->
+          Interp_error.raise_error
+            (Unbound_variable {name; context = "get_array"})))
 
 and eval_app state env fn_expr args =
   match fn_expr with
@@ -278,7 +313,7 @@ and eval_app state env fn_expr args =
       | Some hf ->
           (* Call helper function *)
           let arg_vals = List.map (eval_expr state env) args in
-          let local_env = copy_env env in
+          let local_env = callee_env env in
           List.iter2
             (fun param arg -> bind_var local_env param arg)
             hf.hf_params
@@ -397,6 +432,153 @@ and exec_stmt state env stmt =
   | SNative {ocaml; _} ->
       (* Call the typed OCaml fallback *)
       ocaml.run ~block:state.block_dim ~grid:state.grid_dim [||]
+  | SCoopmat op -> exec_coopmat state env op
+
+(** {1 Cooperative matrix — backlog-62 slice 3}
+
+    The interpreter is the ORACLE every backend is checked against, so this is
+    not a courtesy implementation: [test_vulkan_coopmat_ir_e2e] compares the
+    GLSL backend's output against these numbers bit for bit, and a skip here
+    would let a coopmat kernel "agree" with an interpreter that never computed
+    the product.
+
+    Every invocation holds the whole matrix and performs the whole operation;
+    see {!Sarek_ir_interp_value.env}.[coopmats] for why that is exact rather
+    than approximate.
+
+    {b Only the INTEGER configurations are evaluated.} Float accumulation is
+    refused, and refused HERE rather than left to produce a plausible number,
+    because the interpreter cannot honestly model it: SPV_KHR_cooperative_matrix
+    leaves the ORDER of the k+1 additions to the implementation, so there is no
+    single value a strict oracle could compare against (design document §5.1).
+    Integer accumulation has no such freedom — the specification states it is
+    exact at the precision of the result type — which is the entire reason the
+    integer path lands under Sarek's existing strict contract. *)
+
+and coopmat_zero (c : Sarek_coopmat_types.component_type) =
+  match c with
+  | Sarek_coopmat_types.Uint8 | Sarek_coopmat_types.Sint8
+  | Sarek_coopmat_types.Uint32 | Sarek_coopmat_types.Sint32 ->
+      VInt32 0l
+  | Sarek_coopmat_types.Float16 | Sarek_coopmat_types.Float32 ->
+      coopmat_refuse_float c
+
+and coopmat_refuse_float : 'a. Sarek_coopmat_types.component_type -> 'a =
+ fun c ->
+  Interp_error.raise_error
+    (Unsupported_operation
+       {
+         operation =
+           "cooperative matrix with "
+           ^ Sarek_coopmat_types.component_name c
+           ^ " components";
+         reason =
+           "float cooperative-matrix accumulation has no single correct value \
+            to be an oracle for: SPV_KHR_cooperative_matrix leaves the order \
+            of the additions to the implementation. The INTEGER configurations \
+            are evaluated, and are exact.";
+       })
+
+(** Narrow an accumulated Int32 to the declared component type.
+
+    This is what makes the interpreter a faithful oracle for the 8-bit operand
+    types rather than merely a plausible one: a value loaded into a [u8]
+    fragment from a buffer holding 300 is 44 on the device, and an oracle that
+    kept 300 would disagree with correct hardware. *)
+and coopmat_narrow (c : Sarek_coopmat_types.component_type) (n : int32) =
+  match c with
+  | Sarek_coopmat_types.Uint8 -> Int32.logand n 0xffl
+  | Sarek_coopmat_types.Sint8 ->
+      let b = Int32.logand n 0xffl in
+      if Int32.compare b 0x80l >= 0 then Int32.sub b 0x100l else b
+  | Sarek_coopmat_types.Uint32 | Sarek_coopmat_types.Sint32 -> n
+  | Sarek_coopmat_types.Float16 | Sarek_coopmat_types.Float32 ->
+      coopmat_refuse_float c
+
+and get_coopmat env name =
+  match Hashtbl.find_opt env.coopmats name with
+  | Some m -> m
+  | None ->
+      Interp_error.raise_error
+        (Unbound_variable {name; context = "cooperative-matrix fragment"})
+
+and exec_coopmat state env op =
+  let open Sarek_coopmat_types in
+  match op with
+  | CM_decl {name; frag} ->
+      Hashtbl.replace
+        env.coopmats
+        name
+        (Array.make
+           (fragment_components frag)
+           (coopmat_zero frag.frag_component))
+  | CM_load {dst; frag; src; index; stride} ->
+      let buf = get_array env src in
+      let base = to_int (eval_expr state env index) in
+      let stride = to_int (eval_expr state env stride) in
+      let rows, cols = fragment_dims frag in
+      let m = Array.make (rows * cols) (coopmat_zero frag.frag_component) in
+      for r = 0 to rows - 1 do
+        for c = 0 to cols - 1 do
+          let i = base + (r * stride) + c in
+          if i < 0 || i >= Array.length buf then
+            Interp_error.raise_error
+              (Array_bounds_error
+                 {array_name = src; index = i; length = Array.length buf})
+          else
+            m.((r * cols) + c) <-
+              VInt32 (coopmat_narrow frag.frag_component (to_int32 buf.(i)))
+        done
+      done ;
+      Hashtbl.replace env.coopmats dst m
+  | CM_store {src; frag; dst; index; stride} ->
+      let m = get_coopmat env src in
+      let buf = get_array env dst in
+      let base = to_int (eval_expr state env index) in
+      let stride = to_int (eval_expr state env stride) in
+      let rows, cols = fragment_dims frag in
+      for r = 0 to rows - 1 do
+        for c = 0 to cols - 1 do
+          let i = base + (r * stride) + c in
+          if i < 0 || i >= Array.length buf then
+            Interp_error.raise_error
+              (Array_bounds_error
+                 {array_name = dst; index = i; length = Array.length buf})
+          else buf.(i) <- m.((r * cols) + c)
+        done
+      done
+  | CM_muladd {dst; a; b; c; cfg} ->
+      if cfg.cfg_saturating then
+        Interp_error.raise_error
+          (Unsupported_operation
+             {
+               operation = "saturating cooperative-matrix accumulation";
+               reason =
+                 "the saturating variant computes a different function from \
+                  the plain one and nothing has executed it, so there is \
+                  nothing for an oracle to be faithful to";
+             }) ;
+      let ma = get_coopmat env a
+      and mb = get_coopmat env b
+      and mc = get_coopmat env c in
+      let sh = cfg.cfg_shape in
+      let out = Array.make (sh.m * sh.n) (coopmat_zero cfg.cfg_result) in
+      for i = 0 to sh.m - 1 do
+        for j = 0 to sh.n - 1 do
+          (* Int32 throughout, so that a result exceeding 32 bits WRAPS exactly
+             as the device wraps, rather than being accidentally right on a
+             63-bit host int. This is the claim the whole integer path rests
+             on. *)
+          let acc = ref (to_int32 mc.((i * sh.n) + j)) in
+          for kk = 0 to sh.k - 1 do
+            let av = to_int32 ma.((i * sh.k) + kk) in
+            let bv = to_int32 mb.((kk * sh.n) + j) in
+            acc := Int32.add !acc (Int32.mul av bv)
+          done ;
+          out.((i * sh.n) + j) <- VInt32 (coopmat_narrow cfg.cfg_result !acc)
+        done
+      done ;
+      Hashtbl.replace env.coopmats dst out
 
 and assign_lvalue state env lv value =
   (* Store values directly - VRecord is handled by ERecordField *)
@@ -405,7 +587,23 @@ and assign_lvalue state env lv value =
   | LArrayElem (arr, idx_expr) ->
       let a = get_array env arr in
       let i = to_int (eval_expr state env idx_expr) in
-      a.(i) <- value
+      (* Same check as the LArrayElemExpr arm below, which had it while this one
+         did not — adjacent arms of one function disagreeing about whether an
+         out-of-range store is an interpreter error or an OCaml one.
+
+         NOT a memory-safety fix, and the backlog entry that claimed it was is
+         wrong: OCaml bounds-checks [a.(i) <- v] and raises
+         Invalid_argument "index out of bounds", so nothing was ever corrupted.
+         What was wrong is the DIAGNOSTIC. An interpreter that is the
+         cross-backend oracle should say which array, which index and what
+         length, the way error_to_string does — an opaque Invalid_argument names
+         none of the three, and on a GPU backend the same store is genuine
+         undefined behaviour, so this is the one place able to describe it. *)
+      if i < 0 || i >= Array.length a then
+        Interp_error.raise_error
+          (Array_bounds_error
+             {array_name = arr; index = i; length = Array.length a})
+      else a.(i) <- value
   | LArrayElemExpr (base_expr, idx_expr) ->
       let a =
         match eval_expr state env base_expr with

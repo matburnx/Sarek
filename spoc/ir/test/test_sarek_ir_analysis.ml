@@ -299,30 +299,20 @@ let test_kernel_uses_float64_params () =
 
   let k_f64 : kernel =
     {
+      default_kernel with
       kern_name = "test";
       kern_params =
         [DParam (v_f64, Some {arr_elttype = TFloat64; arr_memspace = Global})];
-      kern_locals = [];
-      kern_body = SEmpty;
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_float64 k_f64 = true) ;
 
   let k_f32 : kernel =
     {
+      default_kernel with
       kern_name = "test";
       kern_params =
         [DParam (v_f32, Some {arr_elttype = TFloat32; arr_memspace = Global})];
-      kern_locals = [];
-      kern_body = SEmpty;
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_float64 k_f32 = false) ;
@@ -332,28 +322,18 @@ let test_kernel_uses_float64_params () =
 let test_kernel_uses_float64_types () =
   let k_with_f64_type : kernel =
     {
+      default_kernel with
       kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
-      kern_body = SEmpty;
       kern_types = [("point", [("x", TFloat64); ("y", TFloat64)])];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_float64 k_with_f64_type = true) ;
 
   let k_with_f32_type : kernel =
     {
+      default_kernel with
       kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
-      kern_body = SEmpty;
       kern_types = [("point", [("x", TFloat32); ("y", TFloat32)])];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_float64 k_with_f32_type = false) ;
@@ -363,14 +343,9 @@ let test_kernel_uses_float64_types () =
 let test_kernel_uses_float64_variants () =
   let k_with_f64_variant : kernel =
     {
+      default_kernel with
       kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
-      kern_body = SEmpty;
-      kern_types = [];
       kern_variants = [("number", [("Float", [TFloat64])])];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_float64 k_with_f64_variant = true) ;
@@ -445,33 +420,17 @@ let test_helper_uses_atomics () =
 let test_kernel_uses_atomics_direct () =
   let k_direct : kernel =
     {
+      default_kernel with
       kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
       kern_body =
         SExpr
           (EIntrinsic
              ([], "atomic_add_int32", [EConst (CInt32 0l); EConst (CInt32 1l)]));
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_atomics k_direct = true) ;
 
-  let k_none : kernel =
-    {
-      kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
-      kern_body = SEmpty;
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
-    }
-  in
+  let k_none : kernel = {default_kernel with kern_name = "test"} in
   assert (kernel_uses_atomics k_none = false) ;
   print_endline "  kernel_uses_atomics direct: OK"
 
@@ -492,16 +451,7 @@ let test_kernel_uses_atomics_in_helper () =
     }
   in
   let k_helper_atomic : kernel =
-    {
-      kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
-      kern_body = SEmpty;
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [hf_atomic];
-      kern_native_fn = None;
-    }
+    {default_kernel with kern_name = "test"; kern_funcs = [hf_atomic]}
   in
   assert (kernel_uses_atomics k_helper_atomic = true) ;
   print_endline "  kernel_uses_atomics via helper: OK"
@@ -537,14 +487,9 @@ let test_kernel_uses_atomics_in_assign_lvalue () =
   in
   let k_lvalue_atomic : kernel =
     {
+      default_kernel with
       kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
       kern_body = SAssign (LArrayElem ("arr", atomic_idx), EConst (CInt32 5l));
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_atomics k_lvalue_atomic = true) ;
@@ -563,14 +508,9 @@ let test_kernel_uses_atomics_snative () =
      here". Pre-fix this returned false unconditionally. *)
   let k_native : kernel =
     {
+      default_kernel with
       kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
       kern_body = SNative {gpu = dummy_native_gpu; ocaml = dummy_native_ocaml};
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_atomics k_native = true) ;
@@ -617,32 +557,16 @@ let test_kernel_uses_int_mod_in_record_field_lvalue () =
   let mod_idx = EBinop (Mod, EConst (CInt32 7l), EConst (CInt32 2l)) in
   let k_lvalue_mod : kernel =
     {
+      default_kernel with
       kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
       kern_body =
         SAssign
           ( LRecordField (LArrayElem ("arr", mod_idx), "field"),
             EConst (CInt32 5l) );
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_int_mod k_lvalue_mod = true) ;
-  let k_none : kernel =
-    {
-      kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
-      kern_body = SEmpty;
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
-    }
-  in
+  let k_none : kernel = {default_kernel with kern_name = "test"} in
   assert (kernel_uses_int_mod k_none = false) ;
   print_endline "  kernel_uses_int_mod via record-field lvalue: OK"
 
@@ -726,32 +650,16 @@ let test_kernel_uses_copysign_in_record_field_lvalue () =
   in
   let k_lvalue_cs : kernel =
     {
+      default_kernel with
       kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
       kern_body =
         SAssign
           ( LRecordField (LArrayElem ("arr", cs_idx), "field"),
             EConst (CInt32 5l) );
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
     }
   in
   assert (kernel_uses_copysign k_lvalue_cs = true) ;
-  let k_none : kernel =
-    {
-      kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
-      kern_body = SEmpty;
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [];
-      kern_native_fn = None;
-    }
-  in
+  let k_none : kernel = {default_kernel with kern_name = "test"} in
   assert (kernel_uses_copysign k_none = false) ;
   print_endline "  kernel_uses_copysign via record-field lvalue: OK"
 
@@ -773,21 +681,562 @@ let test_kernel_uses_copysign_in_helper () =
     }
   in
   let k : kernel =
-    {
-      kern_name = "test";
-      kern_params = [];
-      kern_locals = [];
-      kern_body = SEmpty;
-      kern_types = [];
-      kern_variants = [];
-      kern_funcs = [hf_cs];
-      kern_native_fn = None;
-    }
+    {default_kernel with kern_name = "test"; kern_funcs = [hf_cs]}
   in
   assert (kernel_uses_copysign k = true) ;
   print_endline "  kernel_uses_copysign via helper: OK"
 
+(** {1 kernel_uses_nonfinite_float64 Tests}
+
+    A [CFloat64] whose value is ±inf or NaN cannot be spelled as a GLSL literal,
+    so the detector flags any non-finite f64 constant anywhere in the kernel. A
+    {e finite} f64 constant must NOT trip it, and [SNative] is treated as
+    non-finite-free (native code carries its own literals). *)
+
+let empty_kernel body : kernel =
+  {default_kernel with kern_name = "test"; kern_body = body}
+
+(** {1 Float16 detection Tests}
+
+    Mirrors the float64 detector tests above. Every positive case is paired with
+    a negative one: the whole point of the detector is that a NON-f16 kernel
+    must not trigger the CUDA/HIP [cuda_fp16.h] include, so a detector that
+    over-reports would silently change every existing golden. *)
+
+let test_elttype_float16 () =
+  assert (elttype_uses_float16 TFloat16 = true) ;
+  (* f16 must not be confused with the other float widths, in either
+     direction. *)
+  assert (elttype_uses_float16 TFloat32 = false) ;
+  assert (elttype_uses_float16 TFloat64 = false) ;
+  assert (elttype_uses_float64 TFloat16 = false) ;
+  assert (elttype_uses_float16 TInt32 = false) ;
+  assert (elttype_uses_float16 TInt64 = false) ;
+  assert (elttype_uses_float16 TBool = false) ;
+  assert (elttype_uses_float16 TUnit = false) ;
+  print_endline "  elttype_uses_float16 primitives: OK"
+
+let test_elttype_nested_float16 () =
+  (* Records, variants, arrays and vectors are searched recursively. *)
+  assert (
+    elttype_uses_float16 (TRecord ("r", [("x", TFloat32); ("y", TFloat16)]))
+    = true) ;
+  assert (
+    elttype_uses_float16 (TRecord ("r", [("x", TFloat32); ("y", TFloat64)]))
+    = false) ;
+  assert (
+    elttype_uses_float16 (TVariant ("v", [("A", [TInt32]); ("B", [TFloat16])]))
+    = true) ;
+  assert (
+    elttype_uses_float16 (TVariant ("v", [("A", [TInt32]); ("B", [TFloat32])]))
+    = false) ;
+  assert (elttype_uses_float16 (TArray (TFloat16, Shared)) = true) ;
+  assert (elttype_uses_float16 (TArray (TFloat32, Shared)) = false) ;
+  assert (elttype_uses_float16 (TVec TFloat16) = true) ;
+  assert (elttype_uses_float16 (TVec TFloat32) = false) ;
+  (* Doubly nested: vector of records containing an f16 field. *)
+  assert (elttype_uses_float16 (TVec (TRecord ("r", [("h", TFloat16)]))) = true) ;
+  print_endline "  elttype_uses_float16 nested: OK"
+
+let test_expr_uses_float16 () =
+  (* An f16 value enters an expression through a CAST -- f16 has no literal, so
+     unlike float64 there is no constant case to detect. *)
+  assert (expr_uses_float16 (ECast (TFloat16, EConst (CFloat32 1.5))) = true) ;
+  assert (expr_uses_float16 (ECast (TFloat32, EConst (CFloat32 1.5))) = false) ;
+  (* ... or through an f16-typed variable. *)
+  let v_f16 : var =
+    {var_name = "h"; var_id = 0; var_type = TFloat16; var_mutable = false}
+  in
+  let v_f32 : var =
+    {var_name = "f"; var_id = 1; var_type = TFloat32; var_mutable = false}
+  in
+  assert (expr_uses_float16 (EVar v_f16) = true) ;
+  assert (expr_uses_float16 (EVar v_f32) = false) ;
+  (* ... or through an f16 array construction. *)
+  assert (
+    expr_uses_float16 (EArrayCreate (TFloat16, EConst (CInt32 4l), Shared))
+    = true) ;
+  assert (
+    expr_uses_float16 (EArrayCreate (TFloat32, EConst (CInt32 4l), Shared))
+    = false) ;
+  (* Buried in a sub-expression: the traversal must still find it. *)
+  assert (
+    expr_uses_float16
+      (EBinop
+         ( Add,
+           EConst (CFloat32 1.0),
+           EBinop (Mul, EConst (CFloat32 2.0), ECast (TFloat16, EVar v_f32)) ))
+    = true) ;
+  (* A structurally identical f32-only expression must NOT trigger. *)
+  assert (
+    expr_uses_float16
+      (EBinop
+         ( Add,
+           EConst (CFloat32 1.0),
+           EBinop (Mul, EConst (CFloat32 2.0), ECast (TFloat32, EVar v_f32)) ))
+    = false) ;
+  print_endline "  expr_uses_float16: OK"
+
+let test_stmt_decl_uses_float16 () =
+  let v_f16 : var =
+    {var_name = "h"; var_id = 0; var_type = TFloat16; var_mutable = false}
+  in
+  let v_f32 : var =
+    {var_name = "f"; var_id = 1; var_type = TFloat32; var_mutable = false}
+  in
+  (* Binder types are inspected (the [ft] hook of the shared folder). *)
+  assert (stmt_uses_float16 (SLet (v_f16, EConst (CFloat32 0.0), SEmpty)) = true) ;
+  assert (
+    stmt_uses_float16 (SLet (v_f32, EConst (CFloat32 0.0), SEmpty)) = false) ;
+  assert (stmt_uses_float16 SEmpty = false) ;
+  (* SNative is treated as f16-free, matching the float64 detector: inline
+     device text is opaque and owns its own feature declaration. *)
+  assert (
+    stmt_uses_float16
+      (SNative {gpu = dummy_native_gpu; ocaml = dummy_native_ocaml})
+    = false) ;
+  (* Declarations: the parameter type AND the array element type. *)
+  assert (decl_uses_float16 (DParam (v_f16, None)) = true) ;
+  assert (decl_uses_float16 (DParam (v_f32, None)) = false) ;
+  assert (
+    decl_uses_float16
+      (DParam (v_f32, Some {arr_elttype = TFloat16; arr_memspace = Global}))
+    = true) ;
+  assert (
+    decl_uses_float16
+      (DParam (v_f32, Some {arr_elttype = TFloat32; arr_memspace = Global}))
+    = false) ;
+  assert (decl_uses_float16 (DShared ("s", TFloat16, None)) = true) ;
+  assert (decl_uses_float16 (DShared ("s", TFloat32, None)) = false) ;
+  print_endline "  stmt/decl_uses_float16: OK"
+
+let test_kernel_uses_float16 () =
+  let v_f16 : var =
+    {var_name = "x"; var_id = 0; var_type = TVec TFloat16; var_mutable = false}
+  in
+  let v_f32 : var =
+    {var_name = "x"; var_id = 0; var_type = TVec TFloat32; var_mutable = false}
+  in
+  let kern_with params body : kernel =
+    {
+      default_kernel with
+      kern_name = "test";
+      kern_params = params;
+      kern_body = body;
+    }
+  in
+  (* Positive: an f16 vector parameter. This is the case that must switch the
+     CUDA/HIP fp16 include on. *)
+  assert (
+    kernel_uses_float16
+      (kern_with
+         [DParam (v_f16, Some {arr_elttype = TFloat16; arr_memspace = Global})]
+         SEmpty)
+    = true) ;
+  (* Negative: the same kernel with an f32 vector. *)
+  assert (
+    kernel_uses_float16
+      (kern_with
+         [DParam (v_f32, Some {arr_elttype = TFloat32; arr_memspace = Global})]
+         SEmpty)
+    = false) ;
+  (* Positive: f16 only in the BODY, via a cast -- no f16 in the signature. *)
+  assert (
+    kernel_uses_float16
+      (kern_with [] (SExpr (ECast (TFloat16, EConst (CFloat32 1.0)))))
+    = true) ;
+  (* Positive: f16 only inside a helper function. *)
+  let helper : helper_func =
+    {hf_name = "h"; hf_params = []; hf_ret_type = TFloat16; hf_body = SEmpty}
+  in
+  let k_helper = {(kern_with [] SEmpty) with kern_funcs = [helper]} in
+  assert (kernel_uses_float16 k_helper = true) ;
+  assert (helper_uses_float16 helper = true) ;
+  (* Positive: f16 only in a kernel record type declaration. *)
+  let k_types =
+    {(kern_with [] SEmpty) with kern_types = [("r", [("h", TFloat16)])]}
+  in
+  assert (kernel_uses_float16 k_types = true) ;
+  (* Negative: an entirely f16-free kernel, including an f64 one -- f64 must not
+     be mistaken for f16. *)
+  let v_f64 : var =
+    {var_name = "x"; var_id = 0; var_type = TVec TFloat64; var_mutable = false}
+  in
+  let k_f64 =
+    kern_with
+      [DParam (v_f64, Some {arr_elttype = TFloat64; arr_memspace = Global})]
+      (SExpr (EConst (CFloat64 1.0)))
+  in
+  assert (kernel_uses_float16 k_f64 = false) ;
+  assert (kernel_uses_float64 k_f64 = true) ;
+  assert (kernel_uses_float16 (kern_with [] SEmpty) = false) ;
+  print_endline "  kernel_uses_float16: OK"
+
+(** {1 Parameterised feature API}
+
+    The per-width [*_uses_float64] / [*_uses_float16] names above are thin
+    aliases over ONE parameterised family. These assertions pin the family
+    itself, so a future width (bf16) is covered by construction rather than by
+    another 200 lines of copied assertions. *)
+
+let feature_kern params body : kernel =
+  {
+    default_kernel with
+    kern_name = "test";
+    kern_params = params;
+    kern_body = body;
+  }
+
+let test_feature_api_agrees_with_aliases () =
+  let v_f16 : var =
+    {var_name = "h"; var_id = 0; var_type = TFloat16; var_mutable = false}
+  in
+  let v_f64 : var =
+    {var_name = "d"; var_id = 1; var_type = TFloat64; var_mutable = false}
+  in
+  let k16 = feature_kern [DParam (v_f16, None)] SEmpty in
+  let k64 = feature_kern [DParam (v_f64, None)] SEmpty in
+  let k32 = feature_kern [] SEmpty in
+  (* The alias is exactly the parameterised call, at every level. *)
+  assert (kernel_uses Float16 k16 = kernel_uses_float16 k16) ;
+  assert (kernel_uses Float64 k64 = kernel_uses_float64 k64) ;
+  assert (elttype_uses Float16 TFloat16 = elttype_uses_float16 TFloat16) ;
+  assert (elttype_uses Float64 TFloat64 = elttype_uses_float64 TFloat64) ;
+  assert (const_uses Float64 (CFloat64 1.0) = const_uses_float64 (CFloat64 1.0)) ;
+  assert (
+    expr_uses Float16 (ECast (TFloat16, EConst (CFloat32 1.0)))
+    = expr_uses_float16 (ECast (TFloat16, EConst (CFloat32 1.0)))) ;
+  assert (stmt_uses Float16 SEmpty = stmt_uses_float16 SEmpty) ;
+  assert (
+    decl_uses Float16 (DParam (v_f16, None))
+    = decl_uses_float16 (DParam (v_f16, None))) ;
+  (* Widths are orthogonal: neither detector sees the other's type. *)
+  assert (kernel_uses Float64 k16 = false) ;
+  assert (kernel_uses Float16 k64 = false) ;
+  assert (kernel_uses Float16 k32 = false) ;
+  assert (kernel_uses Float64 k32 = false) ;
+  print_endline "  feature API agrees with the per-width aliases: OK"
+
+let test_const_uses_is_width_specific () =
+  (* The one deliberate per-width asymmetry: float64 has literals, f16 has none,
+     so [const_uses Float16] is false for EVERY constant — by construction, not
+     by a missing match arm. *)
+  List.iter
+    (fun c -> assert (const_uses Float16 c = false))
+    [CFloat64 1.0; CFloat32 1.0; CInt32 1l; CInt64 1L; CBool true; CUnit] ;
+  assert (const_uses Float64 (CFloat64 1.0) = true) ;
+  assert (const_uses Float64 (CFloat32 1.0) = false) ;
+  print_endline "  const_uses is width-specific: OK"
+
+let test_kernel_requirements () =
+  (* The set-valued form a future [Kernel.requirements] reduces to. *)
+  let v_f16 : var =
+    {var_name = "h"; var_id = 0; var_type = TVec TFloat16; var_mutable = false}
+  in
+  let v_f64 : var =
+    {var_name = "d"; var_id = 1; var_type = TVec TFloat64; var_mutable = false}
+  in
+  assert (kernel_requirements (feature_kern [] SEmpty) = []) ;
+  assert (
+    kernel_requirements
+      (feature_kern
+         [DParam (v_f16, Some {arr_elttype = TFloat16; arr_memspace = Global})]
+         SEmpty)
+    = [Float16]) ;
+  assert (
+    kernel_requirements
+      (feature_kern
+         [DParam (v_f64, Some {arr_elttype = TFloat64; arr_memspace = Global})]
+         SEmpty)
+    = [Float64]) ;
+  (* Both widths in one kernel: the result is ordered by [all_features], NOT by
+     the order the parameters were declared in. The two cases below differ ONLY
+     in declaration order and must produce the SAME list — with f64 first the
+     two hypotheses are indistinguishable, so the reversed case is what actually
+     pins the canonical ordering. *)
+  assert (
+    kernel_requirements
+      (feature_kern
+         [
+           DParam (v_f64, Some {arr_elttype = TFloat64; arr_memspace = Global});
+           DParam (v_f16, Some {arr_elttype = TFloat16; arr_memspace = Global});
+         ]
+         SEmpty)
+    = [Float64; Float16]) ;
+  assert (
+    kernel_requirements
+      (feature_kern
+         [
+           DParam (v_f16, Some {arr_elttype = TFloat16; arr_memspace = Global});
+           DParam (v_f64, Some {arr_elttype = TFloat64; arr_memspace = Global});
+         ]
+         SEmpty)
+    = [Float64; Float16]) ;
+  (* Every feature must be reachable from [all_features]; a new constructor that
+     is not added there would silently never be required. *)
+  assert (List.length all_features = 4) ;
+  assert (
+    List.map feature_name all_features
+    = ["float64"; "float16"; "int64"; "cooperative-matrix"]) ;
+  (* [Int64], added in #141 so the GLSL backend can gate
+     `#extension GL_ARB_gpu_shader_int64` on the user's own int64 and not only
+     on the software-f64 helpers that bit-cast a double. *)
+  let v_i64 : var =
+    {var_name = "l"; var_id = 2; var_type = TVec TInt64; var_mutable = false}
+  in
+  assert (
+    kernel_requirements
+      (feature_kern
+         [DParam (v_i64, Some {arr_elttype = TInt64; arr_memspace = Global})]
+         SEmpty)
+    = [Int64]) ;
+  (* An int64 LITERAL alone is enough — the GLSL emitter needs the extension for
+     the `7L` suffix just as much as for the declared type. *)
+  assert (kernel_uses Int64 (feature_kern [] (SExpr (EConst (CInt64 7L))))) ;
+  (* And Int64 must not be triggered by the other widths. *)
+  assert (
+    not
+      (kernel_uses
+         Int64
+         (feature_kern
+            [
+              DParam
+                (v_f64, Some {arr_elttype = TFloat64; arr_memspace = Global});
+            ]
+            SEmpty))) ;
+  print_endline "  kernel_requirements: OK"
+
+let test_kernel_uses_nonfinite_float64 () =
+  (* Positive: +inf constant in the body. *)
+  let k_inf = empty_kernel (SExpr (EConst (CFloat64 Float.infinity))) in
+  assert (kernel_uses_nonfinite_float64 k_inf = true) ;
+  (* Positive: NaN constant in the body. *)
+  let k_nan = empty_kernel (SExpr (EConst (CFloat64 Float.nan))) in
+  assert (kernel_uses_nonfinite_float64 k_nan = true) ;
+  (* Positive: -inf buried inside an otherwise ordinary expression. *)
+  let k_neg_inf =
+    empty_kernel
+      (SExpr
+         (EBinop
+            (Add, EConst (CFloat64 1.0), EConst (CFloat64 Float.neg_infinity))))
+  in
+  assert (kernel_uses_nonfinite_float64 k_neg_inf = true) ;
+  (* Negative: an ordinary FINITE f64 constant must NOT trip the detector — the
+     distinction from [kernel_uses_float64] is exactly finiteness. *)
+  let k_finite = empty_kernel (SExpr (EConst (CFloat64 3.14))) in
+  assert (kernel_uses_nonfinite_float64 k_finite = false) ;
+  (* Negative: an f32 non-finite value is not an f64 constant. *)
+  let k_f32_inf = empty_kernel (SExpr (EConst (CFloat32 Float.infinity))) in
+  assert (kernel_uses_nonfinite_float64 k_f32_inf = false) ;
+  (* Negative: empty kernel. *)
+  assert (kernel_uses_nonfinite_float64 (empty_kernel SEmpty) = false) ;
+  (* Negative: SNative is treated as non-finite-free (asymmetric vs atomics). *)
+  let k_native =
+    empty_kernel (SNative {gpu = dummy_native_gpu; ocaml = dummy_native_ocaml})
+  in
+  assert (kernel_uses_nonfinite_float64 k_native = false) ;
+  print_endline "  kernel_uses_nonfinite_float64: OK"
+
+(** {1 kernel_uses_intrinsic Tests}
+
+    Generic named-intrinsic detector: [kernel_uses_intrinsic name k] matches an
+    [EIntrinsic] by [name] only (module path ignored), so both the [Float32] and
+    [Float64] spellings are found. [SNative] is conservatively assumed to
+    reference the intrinsic. *)
+
+let test_kernel_uses_intrinsic () =
+  (* Positive: fmod invoked directly in the body (Float64 path). *)
+  let k_fmod =
+    empty_kernel
+      (SExpr
+         (EIntrinsic
+            (["Float64"], "fmod", [EConst (CFloat64 7.0); EConst (CFloat64 2.0)])))
+  in
+  assert (kernel_uses_intrinsic "fmod" k_fmod = true) ;
+  (* Path-agnostic: the Float32 spelling of the same name is detected too. *)
+  let k_fmod_f32 =
+    empty_kernel
+      (SExpr
+         (EIntrinsic
+            (["Float32"], "fmod", [EConst (CFloat32 7.0); EConst (CFloat32 2.0)])))
+  in
+  assert (kernel_uses_intrinsic "fmod" k_fmod_f32 = true) ;
+  (* Positive: reachable only through a helper function, not kern_body. *)
+  let param : var =
+    {var_name = "x"; var_id = 0; var_type = TFloat64; var_mutable = false}
+  in
+  let hf_fmod : helper_func =
+    {
+      hf_name = "f";
+      hf_params = [param];
+      hf_ret_type = TFloat64;
+      hf_body =
+        SReturn
+          (EIntrinsic (["Float64"], "fmod", [EVar param; EConst (CFloat64 2.0)]));
+    }
+  in
+  let k_helper = {(empty_kernel SEmpty) with kern_funcs = [hf_fmod]} in
+  assert (kernel_uses_intrinsic "fmod" k_helper = true) ;
+  (* Negative: kernel calls a DIFFERENT intrinsic — must not match "fmod". *)
+  let k_sin =
+    empty_kernel
+      (SExpr (EIntrinsic (["Float64"], "sin", [EConst (CFloat64 1.0)])))
+  in
+  assert (kernel_uses_intrinsic "fmod" k_sin = false) ;
+  (* Negative: no intrinsics at all. *)
+  assert (kernel_uses_intrinsic "fmod" (empty_kernel SEmpty) = false) ;
+  (* Conservative: SNative is assumed to reference the intrinsic. *)
+  let k_native =
+    empty_kernel (SNative {gpu = dummy_native_gpu; ocaml = dummy_native_ocaml})
+  in
+  assert (kernel_uses_intrinsic "fmod" k_native = true) ;
+  print_endline "  kernel_uses_intrinsic: OK"
+
+(** {1 kernel_float64_intrinsics Tests}
+
+    STRING-LIST collector: gathers the names of every [EIntrinsic] whose [path]
+    carries a ["Float64"] component, returning them via [List.sort_uniq compare]
+    — i.e. deduplicated and sorted in ascending (OCaml polymorphic) order. The
+    asserted lists below are pinned to that exact order. Float32-pathed
+    intrinsics are excluded; [SNative] contributes nothing. *)
+
+let test_kernel_float64_intrinsics () =
+  (* Several f64 intrinsics (sin appears twice; cos, exp once), plus one
+     Float32-pathed intrinsic that must be excluded. Expected result is the
+     deduplicated, ascending-sorted name list: ["cos"; "exp"; "sin"]. *)
+  let k_many =
+    empty_kernel
+      (SSeq
+         [
+           SExpr (EIntrinsic (["Float64"], "sin", [EConst (CFloat64 1.0)]));
+           SExpr
+             (EIntrinsic (["Math"; "Float64"], "cos", [EConst (CFloat64 1.0)]));
+           SExpr (EIntrinsic (["Float64"], "exp", [EConst (CFloat64 1.0)]));
+           (* duplicate name -> must be deduplicated *)
+           SExpr (EIntrinsic (["Float64"], "sin", [EConst (CFloat64 2.0)]));
+           (* Float32-pathed -> must be EXCLUDED from the f64 collector *)
+           SExpr (EIntrinsic (["Float32"], "tan", [EConst (CFloat32 1.0)]));
+         ])
+  in
+  assert (kernel_float64_intrinsics k_many = ["cos"; "exp"; "sin"]) ;
+  (* Negative: a kernel using NO Float64-pathed intrinsic collects []. Here the
+     only intrinsic is Float32-pathed. *)
+  let k_f32_only =
+    empty_kernel
+      (SExpr (EIntrinsic (["Float32"], "sin", [EConst (CFloat32 1.0)])))
+  in
+  assert (kernel_float64_intrinsics k_f32_only = []) ;
+  (* Negative: empty kernel collects []. *)
+  assert (kernel_float64_intrinsics (empty_kernel SEmpty) = []) ;
+  print_endline "  kernel_float64_intrinsics: OK"
+
 (** {1 Main} *)
+
+(* ------------------------------------------------------------------ *)
+(* Cooperative matrix — backlog-62 slice 3                             *)
+(* ------------------------------------------------------------------ *)
+
+let cm_shape = {Sarek_coopmat_types.m = 16; n = 16; k = 16}
+
+let cm_cfg =
+  {
+    Sarek_coopmat_types.cfg_shape = cm_shape;
+    cfg_a = Sarek_coopmat_types.Uint8;
+    cfg_b = Sarek_coopmat_types.Uint8;
+    cfg_c = Sarek_coopmat_types.Sint32;
+    cfg_result = Sarek_coopmat_types.Sint32;
+    cfg_saturating = false;
+    cfg_scope = Sarek_coopmat_types.Subgroup;
+  }
+
+let cm_frag_a, cm_frag_b, cm_frag_c, cm_frag_d =
+  Sarek_coopmat_types.fragments_of_config cm_cfg
+
+let test_coopmat_detection () =
+  let u8_param =
+    {var_name = "a"; var_id = 0; var_type = TVec TUint8; var_mutable = false}
+  in
+  let muladd =
+    SCoopmat (CM_muladd {dst = "d"; a = "a"; b = "b"; c = "c"; cfg = cm_cfg})
+  in
+  (* An SCoopmat statement alone is enough. Nothing about it is an expression or
+     an element type, so before the [fs] hook existed no folder could see it. *)
+  assert (kernel_uses Coopmat (empty_kernel muladd)) ;
+  assert (kernel_has_coopmat_op (empty_kernel muladd)) ;
+  (* A TUint8 buffer alone reports the FEATURE but not an OPERATION. That
+     distinction is what lets the GLSL backend emit the int8 extension without
+     the cooperative-matrix one, and it is asserted in BOTH directions because
+     collapsing the two is the easy mistake. *)
+  let k_u8 =
+    feature_kern
+      [DParam (u8_param, Some {arr_elttype = TUint8; arr_memspace = Global})]
+      SEmpty
+  in
+  assert (kernel_uses Coopmat k_u8) ;
+  assert (not (kernel_has_coopmat_op k_u8)) ;
+  (* And an ordinary kernel trips neither. *)
+  assert (not (kernel_uses Coopmat (empty_kernel SEmpty))) ;
+  assert (not (kernel_has_coopmat_op (empty_kernel SEmpty))) ;
+  (* Coopmat must not be triggered by, nor trigger, the numeric widths. *)
+  assert (not (kernel_uses Float16 (empty_kernel muladd))) ;
+  assert (not (kernel_uses Int64 (empty_kernel muladd))) ;
+  assert (not (kernel_uses Float64 k_u8)) ;
+  print_endline "  coopmat detection: OK"
+
+let test_coopmat_configs () =
+  (* Only CM_muladd carries a configuration. A kernel that loads and stores a
+     fragment without multiplying needs no ADVERTISED configuration at all, and
+     reporting one would refuse it on a device that can run it. *)
+  let idx = EConst (CInt32 0l) in
+  let load_store =
+    SSeq
+      [
+        SCoopmat (CM_decl {name = "f"; frag = cm_frag_a});
+        SCoopmat
+          (CM_load
+             {dst = "f"; frag = cm_frag_a; src = "a"; index = idx; stride = idx});
+        SCoopmat
+          (CM_store
+             {src = "f"; frag = cm_frag_a; dst = "b"; index = idx; stride = idx});
+      ]
+  in
+  assert (kernel_coopmat_configs (empty_kernel load_store) = []) ;
+  assert (kernel_has_coopmat_op (empty_kernel load_store)) ;
+  (* One multiply-add, one configuration. *)
+  let one =
+    SCoopmat (CM_muladd {dst = "d"; a = "a"; b = "b"; c = "c"; cfg = cm_cfg})
+  in
+  assert (kernel_coopmat_configs (empty_kernel one) = [cm_cfg]) ;
+  (* Two multiply-adds with the SAME configuration deduplicate; the launch gate
+     asks the device once, not once per statement. *)
+  assert (kernel_coopmat_configs (empty_kernel (SSeq [one; one])) = [cm_cfg]) ;
+  (* Two DIFFERENT configurations are both reported — including two that differ
+     only in [cfg_saturating], which compute different functions and are two
+     distinct advertised configurations on the local device. *)
+  let sat_cfg = {cm_cfg with Sarek_coopmat_types.cfg_saturating = true} in
+  let two =
+    SSeq
+      [
+        one;
+        SCoopmat
+          (CM_muladd {dst = "d"; a = "a"; b = "b"; c = "c"; cfg = sat_cfg});
+      ]
+  in
+  assert (List.length (kernel_coopmat_configs (empty_kernel two)) = 2) ;
+  (* Nested inside control flow, which is where a hand-written walk would have
+     missed it. *)
+  let nested = SIf (EConst (CBool true), SBlock (SSeq [one]), None) in
+  assert (kernel_coopmat_configs (empty_kernel nested) = [cm_cfg]) ;
+  (* And inside a HELPER function, which [kernel_fold] also visits. *)
+  let hf =
+    {hf_name = "h"; hf_params = []; hf_ret_type = TUnit; hf_body = one}
+  in
+  let k = empty_kernel SEmpty in
+  assert (kernel_coopmat_configs {k with kern_funcs = [hf]} = [cm_cfg]) ;
+  ignore cm_frag_b ;
+  ignore cm_frag_c ;
+  ignore cm_frag_d ;
+  print_endline "  coopmat configs: OK"
 
 let () =
   print_endline "Sarek_ir_analysis tests:" ;
@@ -816,6 +1265,14 @@ let () =
   test_kernel_uses_float64_params () ;
   test_kernel_uses_float64_types () ;
   test_kernel_uses_float64_variants () ;
+  test_elttype_float16 () ;
+  test_elttype_nested_float16 () ;
+  test_expr_uses_float16 () ;
+  test_stmt_decl_uses_float16 () ;
+  test_kernel_uses_float16 () ;
+  test_feature_api_agrees_with_aliases () ;
+  test_const_uses_is_width_specific () ;
+  test_kernel_requirements () ;
   test_is_atomic_intrinsic_name () ;
   test_expr_uses_atomics () ;
   test_helper_uses_atomics () ;
@@ -832,4 +1289,9 @@ let () =
   test_lvalue_uses_copysign () ;
   test_kernel_uses_copysign_in_record_field_lvalue () ;
   test_kernel_uses_copysign_in_helper () ;
+  test_kernel_uses_nonfinite_float64 () ;
+  test_kernel_uses_intrinsic () ;
+  test_kernel_float64_intrinsics () ;
+  test_coopmat_detection () ;
+  test_coopmat_configs () ;
   print_endline "All Sarek_ir_analysis tests passed!"

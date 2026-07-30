@@ -187,7 +187,8 @@ module Backend : Framework_sig.BACKEND = struct
       returned None" (PR #259 review); a blanket [try ... with _ -> None]
       previously swallowed it. Codegen never legitimately declines a kernel by
       returning [None]. *)
-  let generate_source ?block:_ (ir : Sarek_ir_types.kernel) : string option =
+  let generate_source ?block:_ ?soa_params:_ (ir : Sarek_ir_types.kernel) :
+      string option =
     let source = Sarek_ir_opencl.generate_with_types ~types:ir.kern_types ir in
     (* Add FP64 pragma if kernel uses double precision *)
     let source =
@@ -298,9 +299,6 @@ let find_intrinsic = Opencl_intrinsics.find
 
 (** Generate OpenCL source with custom types *)
 let generate_with_types = Sarek_ir_opencl.generate_with_types
-
-(** Generate OpenCL source for a kernel *)
-let generate_source = Sarek_ir_opencl.generate
 
 (** Generate OpenCL source with FP64 extension if needed *)
 let generate_with_fp64 = Sarek_ir_opencl.generate_with_fp64

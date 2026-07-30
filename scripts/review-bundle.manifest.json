@@ -1,0 +1,186 @@
+{
+  "schema_version": "1.0",
+  "bundle_version": "1.6.0+spoc.3",
+  "channel": "local-patched",
+  "source_ref": "main",
+  "files": [
+    {
+      "path": "schema/review-finding.schema.json",
+      "sha256": "792b5440ce43b5b295f26c1cae624adbdc8c73199c96def9d666ef965f4f3ffb"
+    },
+    {
+      "path": "schema/review-trace.schema.json",
+      "sha256": "e1c4b004fdb0ea3ab12428c9bbd091870bfeae905e144260ff5e8991c930879a"
+    },
+    {
+      "path": "scripts/check-review-convergence.js",
+      "sha256": "352d226650b96897f5910e6f45b15b9cd18a5b1a39e68848b919f6b83a644639"
+    },
+    {
+      "path": "scripts/check-scope-diff.sh",
+      "sha256": "2de18402aec68d60d95c21ac50ec2796a245d04c4ac43856c8d5f078e034fe91"
+    },
+    {
+      "path": "scripts/lib/review/finding-schema.js",
+      "sha256": "a992e3d1d8030043b647756351f2d4761302f81ee59d17deb769b36bf71e2c03"
+    },
+    {
+      "path": "scripts/lib/review/normalize-rules.js",
+      "sha256": "921c36f14e0c84c763ea146752b05e2f9109d66d6d3ecab56d4e0630d8e469cc"
+    },
+    {
+      "path": "scripts/lib/review/redgreen-scratch.js",
+      "sha256": "c9ca5573c123a9b2cc6ff86aea94ca284040cbe139023fdf6acae1774932c890"
+    },
+    {
+      "path": "scripts/lib/review/review-convergence-rules.js",
+      "sha256": "25a067f06fe20093510ceb617e75d8c22895c10040a312013fe30f9ad210a322"
+    },
+    {
+      "path": "scripts/lib/review/review-lifecycle.js",
+      "sha256": "dc3169f358dc3b75a8532c2622774c8050867975e8bb184f93036384a4f752b6"
+    },
+    {
+      "path": "scripts/lib/review/review-trace-dispatch.js",
+      "sha256": "059e0bb2f7710a046dff7d8d56151d7a0a5ece46743254f2816658311b01a78c"
+    },
+    {
+      "path": "scripts/lib/review/review-trace-rules.js",
+      "sha256": "eaf1c12fb302a658506cdcc934a6e0a0102852370b147ada69611225d8fdb540"
+    },
+    {
+      "path": "scripts/lib/review/review-trace.js",
+      "sha256": "1a2dea224cbf84105ad919b8d3e335f01086a7c505be2a28ed56835355982a2d"
+    },
+    {
+      "path": "scripts/lib/xruntime/xruntime-classify.js",
+      "sha256": "57f959d3c3a05663423fb7cee42c72cfb01e40c78b221b4ab16d1085091cb65b"
+    },
+    {
+      "path": "scripts/lib/xruntime/xruntime-digest.js",
+      "sha256": "eaf8ccc7cbac43967efdaf8378900e61baa54c78eefe83694b3e9357e03383d2"
+    },
+    {
+      "path": "scripts/lib/xruntime/xruntime-journal.js",
+      "sha256": "25f9bcccfb29be830bd138f3fbe6e71906f99d20546feff435159dcbccdb81c9"
+    },
+    {
+      "path": "scripts/review-normalize.js",
+      "sha256": "c2bb7feb98b24df15ee5e41edcfa7c28b9f1023ad3a389027d977ca828b4a402"
+    },
+    {
+      "path": "scripts/xruntime-exec.sh",
+      "sha256": "52339c12eb2585e47a2bc0f0612e5e90be58e37024b2c520d0ab03125d252d3d",
+      "shared": true
+    },
+    {
+      "path": "scripts/xruntime-review.js",
+      "sha256": "ff6fae86b5b935a2c4b31bd383a6069594c90ef806f85e9359fb04f88c33d62b"
+    },
+    {
+      "path": "scripts/REVIEW-BUNDLE.md",
+      "sha256": "bc1090c25819ff6b343ed36a9d7fd7f16a9dad03b695b6473934266822768ce3",
+      "kind": "doc"
+    },
+    {
+      "path": "scripts/review-bundle-verify.js",
+      "sha256": "906bb8934d98765b5ce311744e93c1cd781804d2d3fc33aca87cfcf9bf99273b",
+      "kind": "verifier"
+    },
+    {
+      "path": "tools/data-schema/fixtures/review-finding/valid/basic.jsonl",
+      "sha256": "56da9918e462282aceca4869043c83c67b383707843c056d5a1ae59c434a8654",
+      "kind": "fixture"
+    },
+    {
+      "path": "tools/data-schema/fixtures/review-finding/invalid/missing-specialist.jsonl",
+      "sha256": "ad6aa589d47ff9659a04aba83d1c9cd0216a0b07f8cd24be88e3a7547508b338",
+      "kind": "fixture"
+    },
+    {
+      "path": "scripts/lib/xruntime/xruntime-contract.js",
+      "sha256": "64d594e6e0591cfa30eba24e6f18271e42024667957da33bbcea3ae85a742583",
+      "local_patch": true
+    }
+  ],
+  "local_patches": [
+    {
+      "ref": "#102 + F1 \u2014 cross-runtime fault attribution",
+      "summary": "Outcomes carry fault: \"runtime\"|\"caller\"; only a runtime fault may arm the breaker. A nonzero exit is always a runtime fault (F1: a crashed runtime was being blamed on the caller). Adds --emit-contract and xruntime-contract.js.",
+      "paths": [
+        "scripts/lib/xruntime/xruntime-classify.js",
+        "scripts/lib/xruntime/xruntime-journal.js",
+        "scripts/lib/xruntime/xruntime-contract.js",
+        "scripts/lib/xruntime/xruntime-digest.js",
+        "scripts/xruntime-review.js"
+      ],
+      "markers": {
+        "scripts/lib/xruntime/xruntime-classify.js": [
+          "FAULT_BY_OUTCOME",
+          "runtime-error",
+          "faultFor"
+        ],
+        "scripts/lib/xruntime/xruntime-journal.js": [
+          "isCallerFault",
+          "insideWindow"
+        ],
+        "scripts/lib/xruntime/xruntime-contract.js": [
+          "OUTPUT_CONTRACT"
+        ],
+        "scripts/lib/xruntime/xruntime-digest.js": [
+          "version-probe-spawn-error"
+        ],
+        "scripts/xruntime-review.js": [
+          "--emit-contract",
+          "could not stage the prompt file"
+        ]
+      },
+      "tests": "scripts/xruntime-caller-fault.test.js",
+      "reapply_on_upgrade": true
+    },
+    {
+      "ref": "CodeRabbit review-lifecycle status gate",
+      "summary": "deriveRoundState refuses an unrecognized prior verdict status instead of reading it as a NO-GO continuation, which manufactured attested-looking round state from unverifiable input.",
+      "paths": [
+        "scripts/lib/review/review-lifecycle.js"
+      ],
+      "markers": {
+        "scripts/lib/review/review-lifecycle.js": [
+          "expected \"GO\" or \"NO-GO\""
+        ]
+      },
+      "tests": "scripts/xruntime-caller-fault.test.js",
+      "reapply_on_upgrade": true
+    },
+    {
+      "ref": "#98 \u2014 convergence gate fails closed",
+      "summary": "An under-populated verdict removed the gate\u2019s ability to check anything and exited 0 with violations: [], byte-identical to a real pass. Wires the gate to scripts/lib/review-gate-hardening.js (repo-local, deliberately NOT bundle-owned so an upgrade cannot silently restore the holes), adds --allow-legacy as a RECORDED skip, and reads cross_runtime_findings. Closes D1-D11 plus G3/G5/G13/G14/G15.",
+      "paths": [
+        "scripts/check-review-convergence.js"
+      ],
+      "markers": [
+        "review-gate-hardening",
+        "evaluateHardening",
+        "legacy_skip_authorized",
+        "--allow-legacy"
+      ],
+      "tests": "scripts/check-review-convergence-hardening.test.js",
+      "reapply_on_upgrade": true
+    },
+    {
+      "ref": "backlog-163 \u2014 red_verified provenance",
+      "summary": "checkRedVerifiedProvenance refuses a finding claiming red_verified: true with no `check`. That field is GATE-PRODUCED (emitted in checks[] and merged back by roster-review), so a value without the input that produces it was verified by nothing. Runs over BOTH findings and cross_runtime_findings, and in --static, which is the mode the routing table calls on every resume edge.",
+      "paths": [
+        "scripts/check-review-convergence.js"
+      ],
+      "markers": {
+        "scripts/check-review-convergence.js": [
+          "checkRedVerifiedProvenance",
+          "red-verified-without-check"
+        ]
+      },
+      "tests": "scripts/check-review-convergence-hardening.test.js",
+      "reapply_on_upgrade": true
+    }
+  ]
+}

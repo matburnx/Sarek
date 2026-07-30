@@ -24,6 +24,13 @@ module Codegen_error = Sarek_backend_error.Backend_error.Make (struct
   let name = "CUDA"
 end)
 
+module Dispatch = Sarek_ir_intrinsic_dispatch
+
+(** Raise a located invalid-argument-count error (atomic-arity helper for the
+    shared {!Dispatch.emit_atomic}). *)
+let bad_arity n e g =
+  Codegen_error.raise_error (Codegen_error.invalid_arg_count n e g)
+
 (** Current framework string for SNative code generation. Always [None] in
     normal use; SNative branches check this ref and error if None. *)
 let current_framework : string option ref = ref None
@@ -39,8 +46,23 @@ let mangle_name = Sarek_ir_codegen.mangle_name
 let rec cuda_type_of_elttype = function
   | TInt32 -> "int"
   | TInt64 -> "long long"
+  | TFloat16 -> "__half"
   | TFloat32 -> "float"
   | TFloat64 -> "double"
+  | TUint8 ->
+      (* Not "CUDA has no 8-bit integer" — it has several. The refusal is that
+         [TUint8] carries a promise this backend cannot keep: it exists only as
+         the element type of a cooperative-matrix operand buffer, and mapping it
+         to `unsigned char` here would let a kernel written for the tensor-core
+         path compile into scalar CUDA that silently computes something else.
+         Mapping it becomes correct the day CUDA grows a wmma lowering, not
+         before. *)
+      Codegen_error.raise_error
+        (Codegen_error.unsupported_construct
+           "uint8"
+           "CUDA: uint8 is a cooperative-matrix operand element type, emitted \
+            only by the Vulkan backend, and CUDA has no cooperative-matrix \
+            path")
   | TBool -> "int"
   | TUnit -> "void"
   | TRecord (name, _) -> mangle_name name
@@ -121,7 +143,23 @@ let rec gen_expr buf = function
       gen_expr buf e ;
       Buffer.add_char buf '.' ;
       Buffer.add_string buf field
-  | EIntrinsic (path, name, args) -> gen_intrinsic buf path name args
+  | EIntrinsic (path, name, args) ->
+      Dispatch.gen_intrinsic cuda_backend buf path name args
+  | ECast (TFloat16, e) ->
+      (* f16 is a storage type: narrow through the documented intrinsic rather
+         than a C cast, so the round-to-nearest-even mode is explicit and
+         identical on CUDA and HIP. The widening direction (__half -> float,
+         int, ...) needs no intrinsic: __half carries an implicit conversion
+         operator to float in both toolchains, so a plain C cast is correct and
+         is left to the generic arm below.
+
+         The argument goes through [sarek_f32_barrier] because the narrowing is
+         exactly where the AMDGPU backend fuses away the f32 intermediate the
+         DSL promises. See [sarek_f32_barrier_decl] for the measured ISA and why
+         neither -ffp-contract=off nor `#pragma clang fp contract` reaches it. *)
+      Buffer.add_string buf "__float2half(sarek_f32_barrier(" ;
+      gen_expr buf e ;
+      Buffer.add_string buf "))"
   | ECast (ty, e) ->
       Buffer.add_char buf '(' ;
       Buffer.add_string buf (cuda_type_of_elttype ty) ;
@@ -179,6 +217,25 @@ let rec gen_expr buf = function
       Buffer.add_string buf " : " ;
       gen_expr buf else_ ;
       Buffer.add_char buf ')'
+  | EMatch (scrut, cases) when Sarek_ir_codegen.ematch_binds_payload cases ->
+      (* #75: a match EXPRESSION lowers to a nested ternary, which has nowhere to
+         declare a payload binder — bind it by substituting the same payload
+         read the [SMatch] arm declares (the C-family tagged union), then emit the
+         (now binder-free) match. One shared, capture-avoiding pass for every
+         backend; see {!Sarek_ir_codegen.subst_ematch_payloads}. *)
+      gen_expr
+        buf
+        (EMatch
+           ( scrut,
+             Sarek_ir_codegen.subst_ematch_payloads
+               ~layout:Sarek_ir_codegen.c_family_payload_layout
+               ~raise_:(fun msg ->
+                 Codegen_error.raise_error
+                   (Codegen_error.unsupported_construct
+                      "match-expression payload binding"
+                      msg))
+               scrut
+               cases ))
   | EMatch (_, []) ->
       Codegen_error.raise_error
         (Codegen_error.unsupported_construct "EMatch" "empty match expression")
@@ -232,246 +289,102 @@ and gen_binop = function
 
 and gen_unop = function Neg -> "-" | Not -> "!" | BitNot -> "~"
 
-and gen_intrinsic buf path name args =
-  (* Check for thread intrinsics first *)
-  let full_name =
-    match path with [] -> name | _ -> String.concat "." path ^ "." ^ name
-  in
-  (* For path-qualified intrinsics, query the pure registry first.
-     This handles Float32.sin -> sinf on CUDA, sin on others, etc. *)
-  let pure_registry_hit =
-    match path with
-    | [] -> None
-    | _ -> (
+and cuda_backend =
+  {
+    Dispatch.framework =
+      (fun () -> Option.value ~default:"CUDA" !current_framework);
+    gen_expr;
+    thread_intrinsic = cuda_thread_intrinsic;
+    pre_hook = (fun _ ~full_name:_ _ _ _ -> false);
+    post_hook =
+      (fun buf path name args ->
+        (* Same framework tag the pure-registry lookup uses: without it this
+           fallback emitted the CUDA spelling on every backend. *)
         let framework = Option.value ~default:"CUDA" !current_framework in
-        match
-          Sarek_pure_registry.fun_device_template ~module_path:path name
-        with
-        | Some f -> Some (f ~framework)
-        | None -> None)
-  in
-  match pure_registry_hit with
-  | Some device_name ->
-      Buffer.add_string buf device_name ;
-      Buffer.add_char buf '(' ;
-      List.iteri
-        (fun i e ->
-          if i > 0 then Buffer.add_string buf ", " ;
-          gen_expr buf e)
-        args ;
-      Buffer.add_char buf ')'
-  | None -> (
-      if
-        (* Try thread intrinsics *)
-        List.mem
+        Dispatch.emit_registry_template
+          ~gen_expr
+          ~framework
+          ~invalid_arg_count:bad_arity
+          buf
+          path
           name
-          [
-            "thread_id_x";
-            "thread_idx_x";
-            "thread_id_y";
-            "thread_idx_y";
-            "thread_id_z";
-            "thread_idx_z";
-            "block_id_x";
-            "block_idx_x";
-            "block_id_y";
-            "block_idx_y";
-            "block_id_z";
-            "block_idx_z";
-            "block_dim_x";
-            "block_dim_y";
-            "block_dim_z";
-            "grid_dim_x";
-            "grid_dim_y";
-            "grid_dim_z";
-            "global_thread_id";
-            "global_idx";
-            "global_idx_x";
-            "global_idx_y";
-            "global_idx_z";
-            "global_size";
-          ]
-      then Buffer.add_string buf (cuda_thread_intrinsic name)
-      else
-        (* Standard math intrinsics *)
+          args);
+    invalid_arg_count = bad_arity;
+    on_unknown =
+      (fun full ->
+        Codegen_error.raise_error (Codegen_error.unknown_intrinsic full));
+    arm =
+      (fun name ->
         match name with
         | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh"
         | "tanh" | "exp" | "exp2" | "log" | "log2" | "log10" | "sqrt" | "rsqrt"
-        | "cbrt" | "floor" | "ceil" | "round" | "trunc" | "fabs" ->
-            Buffer.add_string buf name ;
-            Buffer.add_char buf '(' ;
-            List.iteri
-              (fun i e ->
-                if i > 0 then Buffer.add_string buf ", " ;
-                gen_expr buf e)
-              args ;
-            Buffer.add_char buf ')'
-        | "atan2" | "pow" | "fma" | "min" | "max" ->
-            Buffer.add_string buf name ;
-            Buffer.add_char buf '(' ;
-            List.iteri
-              (fun i e ->
-                if i > 0 then Buffer.add_string buf ", " ;
-                gen_expr buf e)
-              args ;
-            Buffer.add_char buf ')'
-        (* Barrier synchronization *)
-        | "block_barrier" -> Buffer.add_string buf "__syncthreads()"
+        | "cbrt" | "floor" | "ceil" | "round" | "trunc" | "fabs" | "atan2"
+        | "pow" | "fma" | "min" | "max" ->
+            Some (fun buf args -> Dispatch.emit_call ~gen_expr buf name args)
+        | "block_barrier" ->
+            Some (fun buf _ -> Buffer.add_string buf "__syncthreads()")
         | "atomic_add" | "atomic_add_int32" | "atomic_add_global_int32" ->
-            Buffer.add_string buf "atomicAdd(" ;
-            (match args with
-            | [addr; value] ->
-                Buffer.add_char buf '&' ;
-                gen_expr buf addr ;
-                Buffer.add_string buf ", " ;
-                gen_expr buf value
-            | [arr; idx; value] ->
-                (* Array element atomic: atomicAdd(&arr[idx], value) *)
-                Buffer.add_char buf '&' ;
-                gen_expr buf arr ;
-                Buffer.add_char buf '[' ;
-                gen_expr buf idx ;
-                Buffer.add_string buf "], " ;
-                gen_expr buf value
-            | _ ->
-                Codegen_error.raise_error
-                  (Codegen_error.invalid_arg_count
-                     "atomic_add"
-                     3
-                     (List.length args))) ;
-            Buffer.add_char buf ')'
+            Some
+              (fun buf args ->
+                Dispatch.emit_atomic
+                  ~gen_expr
+                  ~invalid_arg_count:bad_arity
+                  buf
+                  ~callee:"atomicAdd"
+                  ~prefix:"&"
+                  ~suffix:")"
+                  ~opname:"atomic_add"
+                  ~expected:3
+                  ~allow_array:true
+                  args)
         | "atomic_sub" ->
-            Buffer.add_string buf "atomicSub(" ;
-            (match args with
-            | [addr; value] ->
-                Buffer.add_char buf '&' ;
-                gen_expr buf addr ;
-                Buffer.add_string buf ", " ;
-                gen_expr buf value
-            | _ ->
-                Codegen_error.raise_error
-                  (Codegen_error.invalid_arg_count
-                     "atomic_sub"
-                     2
-                     (List.length args))) ;
-            Buffer.add_char buf ')'
+            Some
+              (fun buf args ->
+                Dispatch.emit_atomic
+                  ~gen_expr
+                  ~invalid_arg_count:bad_arity
+                  buf
+                  ~callee:"atomicSub"
+                  ~prefix:"&"
+                  ~suffix:")"
+                  ~opname:"atomic_sub"
+                  ~expected:2
+                  ~allow_array:false
+                  args)
         | "atomic_min" ->
-            Buffer.add_string buf "atomicMin(" ;
-            (match args with
-            | [addr; value] ->
-                Buffer.add_char buf '&' ;
-                gen_expr buf addr ;
-                Buffer.add_string buf ", " ;
-                gen_expr buf value
-            | _ ->
-                Codegen_error.raise_error
-                  (Codegen_error.invalid_arg_count
-                     "atomic_min"
-                     2
-                     (List.length args))) ;
-            Buffer.add_char buf ')'
+            Some
+              (fun buf args ->
+                Dispatch.emit_atomic
+                  ~gen_expr
+                  ~invalid_arg_count:bad_arity
+                  buf
+                  ~callee:"atomicMin"
+                  ~prefix:"&"
+                  ~suffix:")"
+                  ~opname:"atomic_min"
+                  ~expected:2
+                  ~allow_array:false
+                  args)
         | "atomic_max" ->
-            Buffer.add_string buf "atomicMax(" ;
-            (match args with
-            | [addr; value] ->
-                Buffer.add_char buf '&' ;
-                gen_expr buf addr ;
-                Buffer.add_string buf ", " ;
-                gen_expr buf value
-            | _ ->
-                Codegen_error.raise_error
-                  (Codegen_error.invalid_arg_count
-                     "atomic_max"
-                     2
-                     (List.length args))) ;
-            Buffer.add_char buf ')'
-        | _ -> (
-            (* Try registry lookup for intrinsics like float, int_of_float, etc. *)
-            match Sarek_registry.fun_device_template ~module_path:path name with
-            | Some template ->
-                (* Generate argument strings *)
-                let arg_strs =
-                  List.map
-                    (fun e ->
-                      let b = Buffer.create 64 in
-                      gen_expr b e ;
-                      Buffer.contents b)
-                    args
-                in
-                (* Count %s placeholders in template *)
-                let count_placeholders s =
-                  let rec count i acc =
-                    if i >= String.length s - 1 then acc
-                    else if s.[i] = '%' && s.[i + 1] = 's' then
-                      count (i + 2) (acc + 1)
-                    else count (i + 1) acc
-                  in
-                  count 0 0
-                in
-                let num_placeholders = count_placeholders template in
-                let result =
-                  if num_placeholders = 0 then
-                    (* Plain function/cast like "(float)" -> call as function *)
-                    template ^ "(" ^ String.concat ", " arg_strs ^ ")"
-                  else if num_placeholders = 1 && List.length arg_strs = 1 then
-                    match arg_strs with
-                    | [arg] ->
-                        Printf.sprintf
-                          (Scanf.format_from_string template "%s")
-                          arg
-                    | _ ->
-                        (* This should never happen due to length check above *)
-                        Codegen_error.raise_error
-                          (Codegen_error.type_error
-                             "intrinsic template"
-                             "1 placeholder, 1 argument"
-                             "unexpected list state")
-                  else if num_placeholders = 2 && List.length arg_strs = 2 then
-                    Printf.sprintf
-                      (Scanf.format_from_string template "%s%s")
-                      (List.nth arg_strs 0)
-                      (List.nth arg_strs 1)
-                  else if num_placeholders = 3 && List.length arg_strs = 3 then
-                    Printf.sprintf
-                      (Scanf.format_from_string template "%s%s%s")
-                      (List.nth arg_strs 0)
-                      (List.nth arg_strs 1)
-                      (List.nth arg_strs 2)
-                  else
-                    (* Fallback: treat as function call *)
-                    template ^ "(" ^ String.concat ", " arg_strs ^ ")"
-                in
-                Buffer.add_string buf result
-            | None ->
-                (* Unknown intrinsic - emit as function call *)
-                Buffer.add_string buf full_name ;
-                Buffer.add_char buf '(' ;
-                List.iteri
-                  (fun i e ->
-                    if i > 0 then Buffer.add_string buf ", " ;
-                    gen_expr buf e)
-                  args ;
-                Buffer.add_char buf ')'))
+            Some
+              (fun buf args ->
+                Dispatch.emit_atomic
+                  ~gen_expr
+                  ~invalid_arg_count:bad_arity
+                  buf
+                  ~callee:"atomicMax"
+                  ~prefix:"&"
+                  ~suffix:")"
+                  ~opname:"atomic_max"
+                  ~expected:2
+                  ~allow_array:false
+                  args)
+        | _ -> None);
+  }
 
 (** {1 L-value Generation} *)
 
-let rec gen_lvalue buf = function
-  | LVar v -> Buffer.add_string buf v.var_name
-  | LArrayElem (arr, idx) ->
-      Buffer.add_string buf arr ;
-      Buffer.add_char buf '[' ;
-      gen_expr buf idx ;
-      Buffer.add_char buf ']'
-  | LArrayElemExpr (base, idx) ->
-      Buffer.add_char buf '(' ;
-      gen_expr buf base ;
-      Buffer.add_string buf ")[" ;
-      gen_expr buf idx ;
-      Buffer.add_char buf ']'
-  | LRecordField (lv, field) ->
-      gen_lvalue buf lv ;
-      Buffer.add_char buf '.' ;
-      Buffer.add_string buf field
+let gen_lvalue buf lv = Sarek_ir_codegen.gen_lvalue ~gen_expr buf lv
 
 (** {1 Statement Generation} *)
 
@@ -617,6 +530,18 @@ let rec gen_stmt buf indent = function
       gen_stmt buf (indent ^ "  ") body ;
       Buffer.add_string buf indent ;
       Buffer.add_string buf "}\n"
+  | SCoopmat _ ->
+      (* CUDA does have tensor cores, but reaching them means the wmma
+         fragment API, whose fragment types, ldmatrix layouts and per-shape
+         constraints are a lowering nobody has written or measured here. An
+         approximation emitted from this arm would be a scalar loop wearing a
+         tensor-core name, so the statement is refused outright. *)
+      Codegen_error.raise_error
+        (Codegen_error.unsupported_construct
+           "cooperative matrix"
+           "CUDA: the CUDA backend has no cooperative-matrix path; \
+            cooperative-matrix statements are emitted only by the Vulkan \
+            backend")
 
 (** Helper: Generate record field assignment *)
 and gen_record_assign buf indent lv fields =
@@ -656,9 +581,14 @@ and gen_match_case buf indent scrutinee pattern body =
           Buffer.add_string buf var_name ;
           Buffer.add_string buf " = " ;
           Buffer.add_string buf scrutinee ;
-          Buffer.add_string buf ".data." ;
-          Buffer.add_string buf cname ;
-          Buffer.add_string buf "_v;\n"
+          Buffer.add_string
+            buf
+            (Sarek_ir_codegen.payload_suffix
+               Sarek_ir_codegen.c_family_payload_layout
+               ~cname
+               ~arity:1
+               0) ;
+          Buffer.add_string buf ";\n"
       | vars, Some types when List.length vars = List.length types ->
           (* Multiple payloads: access data.Constructor_v._0, ._1, etc. *)
           List.iteri
@@ -669,9 +599,14 @@ and gen_match_case buf indent scrutinee pattern body =
               Buffer.add_string buf var_name ;
               Buffer.add_string buf " = " ;
               Buffer.add_string buf scrutinee ;
-              Buffer.add_string buf ".data." ;
-              Buffer.add_string buf cname ;
-              Buffer.add_string buf (Printf.sprintf "_v._%d;\n" i))
+              Buffer.add_string
+                buf
+                (Sarek_ir_codegen.payload_suffix
+                   Sarek_ir_codegen.c_family_payload_layout
+                   ~cname
+                   ~arity:(List.length vars)
+                   i) ;
+              Buffer.add_string buf ";\n")
             (List.combine vars types)
       | [], _ | _, None | _, Some [] -> () (* No bindings needed *)
       | _ ->
@@ -697,31 +632,22 @@ and gen_array_decl buf v elem_ty size mem =
 
 (** {1 Declaration Generation} *)
 
-(** Check if a type is a vector (requires length parameter) *)
-let is_vec_type = function TVec _ -> true | _ -> false
-
-let gen_param buf = function
-  | DParam (v, None) ->
+(* CUDA's array parameter uses [cuda_param_type] (which already carries the
+   [__restrict__] spelling and pointer syntax) and, unlike OpenCL/Metal, emits
+   no address-space qualifier, so it supplies its own [gen_array_param] rather
+   than the shared {!Sarek_ir_codegen.gen_global_array_param}. *)
+let gen_param buf decl =
+  Sarek_ir_codegen.gen_param
+    ~param_type:cuda_param_type
+    ~gen_array_param:(fun buf (v : var) _arr ->
       Buffer.add_string buf (cuda_param_type v.var_type) ;
       Buffer.add_char buf ' ' ;
-      Buffer.add_string buf v.var_name ;
-      (* Add length parameter for vectors *)
-      if is_vec_type v.var_type then begin
-        Buffer.add_string buf ", int sarek_" ;
-        Buffer.add_string buf v.var_name ;
-        Buffer.add_string buf "_length"
-      end
-  | DParam (v, Some _arr) ->
-      (* Array with explicit info - always needs length *)
-      Buffer.add_string buf (cuda_param_type v.var_type) ;
-      Buffer.add_string buf " " ;
-      Buffer.add_string buf v.var_name ;
-      Buffer.add_string buf ", int sarek_" ;
-      Buffer.add_string buf v.var_name ;
-      Buffer.add_string buf "_length"
-  | DLocal _ | DShared _ ->
+      Buffer.add_string buf v.var_name)
+    ~invalid:(fun () ->
       Codegen_error.raise_error
-        (Codegen_error.invalid_memory_space "gen_param" "DLocal or DShared")
+        (Codegen_error.invalid_memory_space "gen_param" "DLocal or DShared"))
+    buf
+    decl
 
 let gen_local buf indent = function
   | DLocal (v, None) ->
@@ -788,43 +714,194 @@ let cuda_header = {|
 extern "C" {
 |}
 
-(** Generate complete CUDA source for a kernel *)
-let generate (k : kernel) : string =
-  let buf = Buffer.create 4096 in
+(** f16 feature declaration, emitted only for kernels that actually use f16 —
+    the same conditional-emission discipline the OpenCL/GLSL backends apply to
+    fp64 via {!Sarek_ir_analysis.kernel_uses_float64}. Kernels without f16 are
+    byte-identical to before.
 
-  (* Header *)
-  Buffer.add_string buf cuda_header ;
+    The guard is NOT decoration. This generator is shared verbatim by the HIP
+    backend ([sarek-hip/Hip_shared.ml]), and the two toolchains disagree:
 
-  (* Generate helper functions before kernel *)
-  List.iter (gen_helper_func buf) k.kern_funcs ;
+    - CUDA needs [#include <cuda_fp16.h>] for [__half] and [__float2half].
+      Emitting the include is NECESSARY but not by itself SUFFICIENT under
+      nvrtc: nvrtc is a library, not a driver, so it has no default include path
+      and [__half] is not one of its builtins. Without an explicit
+      [--include-path] the very include below fails with
+      [NVRTC_ERROR_COMPILATION] / "could not open source file \"cuda_fp16.h\"
+      (no directories in search list)". Supplying that path is
+      [Cuda_nvrtc.cuda_include_paths]' job; nvcc, by contrast, adds the toolkit
+      include directory itself.
+    - HIP compiles through hiprtc, which pre-provides [__half], [half] and
+      [__float2half] with no include at all, and which cannot resolve ANY f16
+      header — neither [cuda_fp16.h] nor [hip/hip_fp16.h] exists on its search
+      path. Emitting an unconditional include therefore breaks every HIP f16
+      kernel. Verified empirically against hiprtc on gfx1100: bare [__half] +
+      [__float2half] compile; both include forms fail with "file not found";
+      this negative guard compiles.
 
-  (* Kernel signature *)
-  Buffer.add_string buf "__global__ void " ;
-  Buffer.add_string buf k.kern_name ;
-  Buffer.add_char buf '(' ;
+    [__HIP__] / [__HIP_PLATFORM_AMD__] are both defined under hiprtc (also
+    verified), so the include is skipped there and taken on CUDA. *)
+let cuda_fp16_include =
+  {|#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#include <cuda_fp16.h>
+#endif
+|}
 
-  (* Parameters *)
-  List.iteri
-    (fun i p ->
-      if i > 0 then Buffer.add_string buf ", " ;
-      gen_param buf p)
-    k.kern_params ;
+(** An optimisation barrier that forces an f32 value to be MATERIALISED as a
+    correctly-rounded binary32 register before it is consumed.
 
-  Buffer.add_string buf ") {\n" ;
+    WHY THIS EXISTS. Sarek's f16 surface promises that arithmetic happens in f32
+    and that narrowing to binary16 is a separate, explicit,
+    round-to-nearest-even step — that is what makes the device agree with the
+    interpreter bit-for-bit. The AMDGPU backend breaks that promise: it fuses a
+    narrowing into the operation that feeds it. Measured on gfx1100 for
+    [__float2half((float)__float2half((float)inp[tid] * 1.1f) + 1000.0f)]:
 
-  (* Local declarations *)
-  List.iter (gen_local buf "  ") k.kern_locals ;
+    v_fma_mixlo_f16 v0, v0, s2, 0 <- f32 multiply AND the narrowing, fused
+    v_add_f16_e32 v0.l, 0x63d0, v0.l <- the f32 ADD demoted to binary16
 
-  (* Body *)
-  gen_stmt buf "  " k.kern_body ;
+    Both fusions skip a mandated rounding. The first is what made x = 5.68359375
+    return 1006.5 on HIP where the interpreter, the native path and the host
+    reference all return 1006.0: the fused form rounds the EXACT product once to
+    binary16 instead of rounding to f32 first, and the exact product sits just
+    above a binary16 tie that the correctly-rounded f32 value sits exactly on.
 
-  (* Close kernel *)
-  Buffer.add_string buf "}\n" ;
+    Both halves are individually CORRECT — verified in isolation: the device's
+    f32 product is bit-identical to the host's (0x40c81000), and the device's
+    f32->f16 narrowing is round-to-nearest-even on exact ties in both directions
+    and on negatives. The defect is purely the FUSION.
 
-  (* Close extern "C" *)
-  Buffer.add_string buf "}\n" ;
+    WHY A BARRIER AND NOT A FLAG. Verified at ISA level, the emitted code is
+    byte-identical under [-ffp-contract=off], [=on] and [=fast], and under
+    [#pragma clang fp contract(off)]: this is an AMDGPU ISel combine that the
+    standard FP-contraction controls do not reach. [-ffp-contract=off] is still
+    set on the hiprtc path (see [Hip_rtc.base_options]) because it DOES fix
+    ordinary f32 [a*b+c] contraction, but it is necessary-not-sufficient and
+    does nothing for this pattern.
 
-  Buffer.contents buf
+    COST. The [asm volatile] constraint pins the value in a register and
+    clobbers nothing, so it costs no memory traffic — ScratchSize stays 0. A
+    [volatile] local also works but spills to scratch, which is why it is not
+    used. The price is the un-fused instruction count: 6 VALU ops instead of 2
+    per f16 round-trip. Paid only inside kernels that actually narrow to f16 —
+    the declaration is emitted only under [kernel_uses_float16].
+
+    NVIDIA BRANCH: DELIBERATELY EMPTY, and that is a statement about NVIDIA, not
+    an oversight. The non-HIP branch previously carried a PTX-flavoured
+    [asm volatile("" : "+f"(x))]. AT A NARROWING it bought nothing, and it was
+    removed because a call site reading [sarek_f32_barrier(...)] on the CUDA
+    path advertised a protection that did not exist — the gap between assumed
+    and actual FP semantics is exactly what produced this bug class.
+
+    Measured for this file's current output on CUDA 13.3 (nvcc/ptxas/nvdisasm
+    V13.3.73, host-side, no NVIDIA device) for sm_75, sm_80, sm_86, sm_89,
+    sm_90, sm_100, sm_120 and sm_121: [cmp] on the cubin says byte-identical on
+    all eight, and the arithmetic stream stays
+    [HADD2.F32 / FMUL / F2FP.F16.F32 / HADD2.F32 / FADD / F2FP.F16.F32] — the
+    f32 multiply and the f32 add both intact and the narrowings separate — with
+    the asm and without it.
+
+    WHY, precisely. The first version of this note got it wrong twice, and both
+    corrections matter to anyone reusing this function:
+
+    - NVVM does NOT erase the block. The barriered PTX keeps the
+      [// begin/end inline asm] marker pair and allocates more virtual registers
+      ([%f<9>] against [%f<5>]). What it contributes is ZERO PTX INSTRUCTIONS,
+      so ptxas receives an identical instruction stream either way — which makes
+      the identical cubins structural, not a 13.3 accident.
+    - The barrier is NOT inert in general. On
+      [out[i] = sarek_f32_barrier(a[i]*b[i]) + c[i]] it IS a real NVVM-level
+      contraction barrier: [mul.f32]+[add.f32] with it, [fma.rn.f32] without.
+      Measured at sm_90. But ptxas -O1 and above RE-CONTRACT that back to [FFMA]
+      under the default [-fmad=true] ([-O0] and [--fmad=false] do not), so the
+      cubins are byte-identical there too.
+
+    CONSEQUENCE, and it is a trap: do NOT reach for [sarek_f32_barrier] to fix
+    the caller-side df64 contraction hazard on NVIDIA. It protects the PTX and
+    ptxas undoes it. [Sarek_df64]'s [mul_rn] works because an fma cannot be
+    fused a second time — a property of the instruction, not of a barrier.
+
+    At the f16 narrowing there is nothing for either level to fuse in the first
+    place: NVIDIA has no fused multiply-and-convert-to-f16 instruction, which is
+    why the emitted code is unchanged there under every flag tried.
+
+    WHAT ACTUALLY HOLDS THE GUARANTEE ON NVIDIA: [ptxas] declines to absorb
+    [cvt.rn.f16.f32] into the operation feeding it — hand-written PTX with no
+    inline asm at all gives the same unfused SASS. That is a property of the
+    assembler, not of anything Sarek emits, so it is machine-checked rather than
+    assumed: [sarek-cuda/test/test_cuda_f16_sass.ml] walks generated CUDA ->
+    nvrtc -> PTX -> ptxas -> cubin -> nvdisasm -> SASS on every architecture the
+    local ptxas knows and fails if the discipline breaks. See
+    [docs/fp-contraction-policy.md] and
+    [docs/optimization/cuda-f16-fusion-sass-audit.md]. NO f16 kernel has been
+    EXECUTED on NVIDIA hardware; the claim is a machine-code claim.
+
+    WHY THE GUARD NAMES THE PLATFORM AND NOT THE LANGUAGE (backlog #146). The
+    guard is [defined(__HIP_PLATFORM_AMD__)] alone. It used to be
+    [defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)], and the second form
+    reads as though it admits HIP compiled for an NVIDIA target, where ["+v"] is
+    not a valid constraint. Measured on this host, ROCm 7.2.53211:
+
+    - hiprtc predefines BOTH [__HIP__] and [__HIP_PLATFORM_AMD__], and neither
+      [__HIP_PLATFORM_NVIDIA__] nor the legacy [__HIP_PLATFORM_HCC__]. All three
+      candidate guards select the AMD arm and compile the ["+v"] asm — checked
+      with [#error] in the other arm, so "it compiled" proves which arm was
+      taken. Evidence: EXECUTED (hiprtc).
+    - [hip/hip_common.h] auto-enables [__HIP_PLATFORM_AMD__] whenever
+      [__clang__ && __HIP__], and auto-enables [__HIP_PLATFORM_NVIDIA__] only
+      for [__NVCC__] or clang-CUDA WITHOUT [__HIP__]. [hip/linker_types.h] then
+      hard-[#error]s unless exactly one platform macro is set. So under HIP's
+      own headers [__HIP__] IMPLIES the AMD platform: the removed disjunct was
+      redundant, not load-bearing, and the NVIDIA-target-with-[__HIP__]
+      configuration those headers describe cannot arise. Evidence:
+      BY-CONSTRUCTION (the shipped headers).
+    - Both ROCm clang 22.0.0git and upstream clang 22.1.6 refuse
+      [-x hip --offload-arch=sm_61] outright ("unsupported HIP gpu
+      architecture"), so that configuration is not reachable with either
+      compiler on this host either. Evidence: EXECUTED.
+    - ["+v"] IS invalid on NVPTX, independently of HIP: clang rejects
+      [asm volatile("" : "+v"(x))] for [--target=nvptx64-nvidia-cuda] with
+      "invalid output constraint '+v' in asm", and accepts ["+f"]. Evidence:
+      EXECUTED. This is the part that was previously inferred from the
+      constraint vocabulary alone.
+
+    So this is a CLARITY change, not a bug fix: no reachable configuration was
+    mis-served by the old guard. It is made because the asm is AMD-ISA-specific
+    and the guard should say so — [__HIP__] is a LANGUAGE predicate that
+    constrains no target — and because the redundant disjunct has now twice led
+    a reader to conclude the barrier ships to NVPTX. STILL UNVERIFIED: ROCm
+    older than the 4.x rename, where [__HIP_PLATFORM_HCC__] was the platform
+    macro; no such toolchain exists here. If one is ever in play the AMD arm
+    would be skipped and the f16 discipline would fail silently, which is the
+    one direction this file cares about — [test_f16_barrier_is_amd_scoped] pins
+    the guard so the change cannot happen unnoticed. *)
+let sarek_f32_barrier_decl =
+  {|#if defined(__HIP_PLATFORM_AMD__)
+__device__ __forceinline__ float sarek_f32_barrier(float x) {
+  asm volatile("" : "+v"(x));
+  return x;
+}
+#else
+/* NVIDIA: intentionally an identity. A PTX opacity barrier here contributes
+   zero PTX instructions at a narrowing, so ptxas sees the same instruction
+   stream and the cubins are byte-identical (measured on CUDA 13.3, sm_75..
+   sm_121). What keeps the f32 multiply out of the narrowing on NVIDIA is ptxas
+   itself, checked by test_cuda_f16_sass.ml — not this function. NOTE the same
+   barrier IS load-bearing at PTX level for mul->add, but ptxas re-contracts
+   that under the default -fmad=true; do not reuse it as a general contraction
+   barrier here. See docs/fp-contraction-policy.md. */
+__device__ __forceinline__ float sarek_f32_barrier(float x) {
+  return x;
+}
+#endif
+|}
+
+(** Prefix for a kernel's generated source: the f16 include (only when the
+    kernel uses f16) followed by the standard header. *)
+let cuda_header_for (k : kernel) =
+  if Sarek_ir_analysis.kernel_uses_float16 k then
+    cuda_fp16_include ^ sarek_f32_barrier_decl ^ cuda_header
+  else cuda_header
 
 (** Generate CUDA variant type definition *)
 let gen_variant_def buf v =
@@ -842,26 +919,15 @@ let generate_with_types ~(types : (string * (string * elttype) list) list)
   let buf = Buffer.create 4096 in
 
   (* Header *)
-  Buffer.add_string buf cuda_header ;
+  Buffer.add_string buf (cuda_header_for k) ;
 
   (* Variant type definitions first (may be needed by records) *)
   List.iter (gen_variant_def buf) k.kern_variants ;
 
   (* Record type definitions *)
-  List.iter
-    (fun (name, fields) ->
-      Buffer.add_string buf "typedef struct {\n" ;
-      List.iter
-        (fun (fname, ftype) ->
-          Buffer.add_string buf "  " ;
-          Buffer.add_string buf (cuda_type_of_elttype ftype) ;
-          Buffer.add_char buf ' ' ;
-          Buffer.add_string buf fname ;
-          Buffer.add_string buf ";\n")
-        fields ;
-      Buffer.add_string buf "} " ;
-      Buffer.add_string buf (mangle_name name) ;
-      Buffer.add_string buf ";\n\n")
+  Sarek_ir_codegen.gen_record_typedefs
+    ~type_of_elttype:cuda_type_of_elttype
+    buf
     types ;
 
   (* Generate helper functions before kernel *)
@@ -894,3 +960,15 @@ let generate_with_types ~(types : (string * (string * elttype) list) list)
   Buffer.add_string buf "}\n" ;
 
   Buffer.contents buf
+
+(** Generate complete CUDA source for a kernel.
+
+    A special case of {!generate_with_types} with the kernel's OWN type
+    declarations, which is the only thing every production caller ever passed:
+    [~types] has exactly the type of the [kern_types] field
+    ([Sarek_ir_types.kernel]), so the parameter was redundant with the record it
+    travels in. This used to be a separate 30-80 line copy of the emit sequence
+    that silently omitted record typedefs, variant typedefs and
+    [current_variants] — source referencing an undeclared struct, with no error.
+    Delegating keeps one emit path per backend. *)
+let generate (k : kernel) : string = generate_with_types ~types:k.kern_types k

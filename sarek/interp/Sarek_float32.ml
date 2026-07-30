@@ -157,10 +157,11 @@ let ceil x = to_float32 (Stdlib.ceil x)
 
 let abs x = to_float32 (Stdlib.abs_float x)
 
-(** FMA (fused multiply-add) - important for GPU accuracy *)
 (* A single fused rounding (Float.fma), then one float32 rounding — not
    [(x *. y) +. z], whose intermediate product rounds independently and breaks
    exact TwoProd error extraction for the df64 (float-float) library. *)
+
+(** FMA (fused multiply-add) - important for GPU accuracy *)
 let fma x y z = to_float32 (Float.fma x y z) |> check_overflow "fma"
 
 (** Min/max that handle NaN correctly (GPU semantics) *)
@@ -196,3 +197,70 @@ let to_int x = int_of_float x
 
 (** Pretty print with float32-appropriate precision *)
 let to_string x = Printf.sprintf "%.7g" x
+
+(******************************************************************************
+ * Sarek stdlib surface mirror
+ *
+ * The native (cpu_kern) backend lowers an [IntrinsicRef (["Float32"], name)] to
+ * the OCaml identifier [Sarek.Sarek_cpu_runtime.Float32.<name>] with the name
+ * copied VERBATIM (sarek/ppx/Sarek_native_intrinsics.ml: map_stdlib_path, then
+ * Sarek_native_helpers.evar_qualified). So every name declared by
+ * sarek/Sarek_stdlib/Float32.ml must exist here under exactly that spelling,
+ * or the kernel does not compile — the user sees "Unbound value
+ * Sarek.Sarek_cpu_runtime.Float32.<name>" pointing into PPX-generated code.
+ *
+ * The seven names below were declared in the stdlib but missing here, so
+ * Float32.abs_float / expm1 / log1p / hypot / copysign / fmod / minus were
+ * unusable from any native kernel. sarek/tests/unit/test_intrinsic_surface.ml
+ * reconciles the two surfaces so this cannot silently recur.
+ *
+ * The four *_float32 aliases mirror the stdlib's explicit arithmetic
+ * intrinsics. They are reachable only when written as qualified calls
+ * (Float32.add_float32 a b); infix `+.` is lowered structurally by the PPX and
+ * never reaches this module.
+ ******************************************************************************)
+
+let abs_float x = abs x
+
+let minus x y = sub x y
+
+(* check_overflow is value-neutral in the default [Silent] mode -- it returns
+   its argument untouched -- so these three report an infinite result in [Warn]
+   and [Exception] mode without changing a single number the interpreter
+   produces as the cross-backend oracle.
+
+   Reachability was settled by an exhaustive sweep of all 2^32 binary32 inputs
+   against C's expm1f/log1pf (clang 21, glibc, x86-64), replicating
+   float32_of_float_impl exactly; see the PR for the full table.
+     - expm1 overflows to +inf from x > 88.7228394, and that threshold is
+       BIT-IDENTICAL to expm1f's: 0 spurious and 0 missed overflows over the
+       whole domain, and only 2 inputs in 4.28e9 differ by 1 ulp. So the value
+       was already right; only the reporting was missing (the Major finding).
+     - log1p cannot overflow from any finite input -- its only infinity is the
+       pole at x = -1. It is wired anyway because [log] and [log10] above route
+       their pole through check_overflow too, so this is the house convention
+       rather than a dead gate. NaN is unaffected: check_overflow tests only
+       = infinity / = neg_infinity, and NaN compares false to both, so
+       log1p x < -1. still returns NaN exactly as C's log1pf does.
+     - hypot DOES overflow from finite inputs (first at hypot(6.11e37, 3.35e38)),
+       with 0 spurious and 0 missed over a 1.33e8-pair boundary sweep. *)
+
+let expm1 x = to_float32 (Stdlib.expm1 x) |> check_overflow "expm1"
+
+let log1p x = to_float32 (Stdlib.log1p x) |> check_overflow "log1p"
+
+let hypot x y = to_float32 (Stdlib.hypot x y) |> check_overflow "hypot"
+
+let copysign x y = to_float32 (Stdlib.copysign x y)
+
+(* C [fmod] semantics: sign of the dividend, magnitude < |divisor|.
+   [Float.rem] is OCaml's [fmod]; the stdlib intrinsic uses the same. *)
+let fmod x y = to_float32 (Float.rem x y)
+
+let add_float32 x y = add x y
+
+let sub_float32 x y = sub x y
+
+let mul_float32 x y = mul x y
+
+let div_float32 x y = div x y

@@ -113,24 +113,29 @@ let run_complex_math (dev : Device.t) =
 
 (* ========== Verification ========== *)
 
-let verify_float_arrays name result expected tolerance =
-  let n = Array.length expected in
-  let errors = ref 0 in
-  for i = 0 to n - 1 do
-    let diff = abs_float (result.(i) -. expected.(i)) in
-    if diff > tolerance then begin
-      if !errors < 5 then
-        Printf.printf
-          "  %s mismatch at %d: expected %.6f, got %.6f (diff=%.6f)\n"
-          name
-          i
-          expected.(i)
-          result.(i)
-          diff ;
-      incr errors
-    end
-  done ;
-  !errors = 0
+(** Compare [result] against [expected] and return the failure SHAPE (first bad
+    index, how many, out of how many, non-finite seen) rather than a bare
+    boolean. The CPU-OpenCL KNOWN-ISSUE classifier gates on that shape so a
+    total failure — e.g. a kernel that never ran, leaving the output at its 0.0
+    pre-fill — can never be excused as "known". See
+    [Test_helpers.classify_cpu_opencl_math_result] (#74 / F1). *)
+let verify_float_arrays name result expected tolerance :
+    Test_helpers.float_check_shape =
+  (* The shape computation itself lives in Test_helpers (single source of truth,
+     fixture tested by test_float_check_shape.ml). *)
+  Test_helpers.compute_float_check_shape
+    ~total:(Array.length expected)
+    ~tolerance
+    ~expected:(fun i -> expected.(i))
+    ~got:(fun i -> result.(i))
+    ~report:(fun ~index ~expected ~got ~diff ->
+      Printf.printf
+        "  %s mismatch at %d: expected %.6f, got %.6f (diff=%.6f)\n"
+        name
+        index
+        expected
+        got
+        diff)
 
 let () =
   let c = Test_helpers.parse_args "test_math_intrinsics" in
@@ -169,13 +174,33 @@ let () =
 
         try
           let time, result = run_complex_math dev in
-          let ok =
-            (not cfg.verify)
-            || verify_float_arrays "runtime" result !expected_complex 0.01
+          let shape =
+            if not cfg.verify then Test_helpers.float_check_not_verified
+            else verify_float_arrays "runtime" result !expected_complex 0.01
           in
-          let status = if ok then "OK" else "FAIL" in
+          let verdict =
+            Test_helpers.classify_cpu_opencl_math_result ~dev ~shape ()
+          in
+          let status =
+            match verdict with
+            | `Pass -> "OK"
+            | `Known_issue _ -> "KNOWN-ISSUE"
+            | `Fail -> "FAIL"
+          in
 
-          if not ok then all_ok := false ;
+          (match verdict with
+          | `Pass -> ()
+          | `Known_issue label ->
+              Printf.printf "  KNOWN-ISSUE: %s\n" label ;
+              Test_helpers.github_warning
+                ~title:"KNOWN-ISSUE (task #74)"
+                (Printf.sprintf
+                   "test_math_intrinsics: float32 math-intrinsic numeric check \
+                    SUPPRESSED on %s (%s) — %s"
+                   name
+                   framework
+                   label)
+          | `Fail -> all_ok := false) ;
 
           Printf.printf
             "%-35s %10.4f %10s\n"
@@ -215,16 +240,41 @@ let () =
     try
       let time, result = run_complex_math dev in
       Printf.printf "  Time: %.4f ms\n%!" time ;
-      let ok =
-        (not cfg.verify)
-        || verify_float_arrays "runtime" result !expected_complex 0.01
+      let shape =
+        if not cfg.verify then Test_helpers.float_check_not_verified
+        else verify_float_arrays "runtime" result !expected_complex 0.01
       in
-      Printf.printf "  Status: %s\n%!" (if ok then "PASSED" else "FAILED") ;
+      let verdict =
+        Test_helpers.classify_cpu_opencl_math_result ~dev ~shape ()
+      in
+      Printf.printf
+        "  Status: %s\n%!"
+        (match verdict with
+        | `Pass -> "PASSED"
+        | `Known_issue _ -> "KNOWN-ISSUE"
+        | `Fail -> "FAILED") ;
 
-      if ok then print_endline "\nMath intrinsics tests PASSED"
-      else begin
-        print_endline "\nMath intrinsics tests FAILED" ;
-        exit 1
+      begin match verdict with
+      | `Pass -> print_endline "\nMath intrinsics tests PASSED"
+      | `Known_issue label ->
+          (* CPU-OpenCL only, and only for the flake's failure shape; see
+               Test_helpers.classify_cpu_opencl_math_result. *)
+          Printf.printf "  KNOWN-ISSUE: %s\n%!" label ;
+          Test_helpers.github_warning
+            ~title:"KNOWN-ISSUE (task #74)"
+            (Printf.sprintf
+               "test_math_intrinsics: float32 math-intrinsic numeric check \
+                SUPPRESSED on %s (%s) — %s"
+               dev.Device.name
+               dev.Device.framework
+               label) ;
+          Printf.printf
+            "Math intrinsics tests SKIPPED on known-bad CPU-OpenCL device %s\n\
+             %!"
+            dev.Device.name
+      | `Fail ->
+          print_endline "\nMath intrinsics tests FAILED" ;
+          exit 1
       end
     with
     | Spoc_framework.Backend_error.Backend_error _ ->

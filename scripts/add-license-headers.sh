@@ -35,6 +35,7 @@ MAINTAINER="Mathias Bourgoin <mathias.bourgoin@gmail.com>"
 
 # Colors
 GREEN='\033[0;32m'
+RED='\033[0;31m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
@@ -42,6 +43,10 @@ NC='\033[0m'
 # Counters
 UPDATED_COUNT=0
 SKIPPED_COUNT=0
+# Files carrying two copyright lines for the same contributor. Not fixable
+# here (this script cannot choose which to keep), so it reports and exits
+# non-zero rather than feeding a multi-line value to sed and dying namelessly.
+DUPLICATE_COUNT=0
 
 # Get copyright info from git
 get_copyright_years() {
@@ -93,7 +98,15 @@ apply_change() {
         fi
         rm -f "$tmpfile"
     else
-        mv "$tmpfile" "$file"
+        # Write THROUGH the existing file rather than `mv`-ing the temp file
+        # onto it. mktemp creates 0600, and `mv` carries that mode across, so
+        # the previous `mv` silently stripped the executable bit from every
+        # script it stamped -- i.e. running the fixer on scripts/ left the
+        # whole tooling directory non-executable and CI failing with
+        # "Permission denied". Redirecting into $file preserves its mode,
+        # owner and inode.
+        cat "$tmpfile" > "$file"
+        rm -f "$tmpfile"
         echo -e "${GREEN}${label}${NC}: $file"
         UPDATED_COUNT=$((UPDATED_COUNT + 1))
     fi
@@ -126,34 +139,70 @@ add_ocaml_header() {
         # kept appending a duplicate SPDX-FileCopyrightText line for the same
         # person (root cause of the sarek/codegen/Sarek_ir_ptx_stmt.mli
         # header mangling).
-        if head -"$header_end_line" "$file" 2>/dev/null | grep "SPDX-FileCopyrightText:" | grep -qi "$contributor_email"; then
-            # Contributor exists - check if year needs updating
-            local contributor_line=$(head -"$header_end_line" "$file" | grep "SPDX-FileCopyrightText:" | grep -i "$contributor_email")
-            local existing_years=$(echo "$contributor_line" | grep -oP '\d{4}(-\d{4})?')
+        # -F, and matched on the BRACKETED address. Without -F the email is a
+        # REGEX, so every "." matches any character: two distinct contributors
+        # whose addresses differ only where a dot sits would match each other,
+        # which now means a false DUPLICATE below and a spurious exit 2 on a
+        # correct header. Any of [ ] * ^ $ \ in an address would be worse than
+        # loose -- it would be a grep error. Bracketing pins the match to a whole
+        # address rather than a substring of a longer one. -i stays: providers
+        # are case-insensitive by spec (see the note below).
+        local email_pat="<$contributor_email>"
+        if head -"$header_end_line" "$file" 2>/dev/null | grep "SPDX-FileCopyrightText:" | grep -qiF "$email_pat"; then
+            # Contributor exists - check if the year needs updating.
+            #
+            # This grep can match MORE THAN ONE line: a header carrying two
+            # copyright lines for the same email is exactly what the duplicate
+            # bug noted above produces. A multi-line value then reached a
+            # `sed "s/$existing_years..."`, which is not a well-formed s command
+            # -- sed died with "unterminated `s' command", the fixer exited 1
+            # mid-walk having silently skipped every remaining file, and it never
+            # said WHICH file. Refuse explicitly and name it, because a duplicate
+            # line is itself the defect to fix (four files in this repo had one),
+            # not a state to paper over by taking the first match.
+            local matches
+            matches=$(head -"$header_end_line" "$file" | grep "SPDX-FileCopyrightText:" | grep -ciF "$email_pat")
+            if [ "$matches" -gt 1 ]; then
+                echo -e "${RED}DUPLICATE${NC}: $file has $matches SPDX-FileCopyrightText lines for $email_pat; remove the extra one (this script cannot choose between them)" >&2
+                DUPLICATE_COUNT=$((DUPLICATE_COUNT + 1))
+                return
+            fi
+            local contributor_line lineno
+            contributor_line=$(head -"$header_end_line" "$file" | grep "SPDX-FileCopyrightText:" | grep -iF "$email_pat")
+            lineno=$(head -"$header_end_line" "$file" | grep -n "SPDX-FileCopyrightText:" | grep -iF "$email_pat" | cut -d: -f1)
+            local existing_years=$(echo "$contributor_line" | grep -oP '\d{4}(-\d{4})?' | head -1)
             local first_year=$(echo "$existing_years" | cut -d- -f1)
 
+            # Decide the new year span first, then rewrite the line by NUMBER.
+            #
+            # The year is substituted with bash ${var/pat/repl}, which is glob and
+            # not regex, and the year is digits plus a dash -- no metacharacters.
+            # The old code interpolated the email into a sed PATTERN, which had
+            # the same regex defect as the greps above; targeting the line we
+            # already located removes regex from this path entirely. Carrying the
+            # rest of the line verbatim also preserves the address's existing
+            # casing, which the old code needed a \1 backreference to do.
+            local new_years="" label=""
             if [[ "$existing_years" =~ - ]]; then
-                # Has year range - check if last year matches
                 local end_year=$(echo "$existing_years" | cut -d- -f2)
                 if [ "$last_commit_year" != "$end_year" ]; then
-                    # Update year range (operate on a copy so --check never
-                    # touches the real file; \1 preserves the email's
-                    # existing casing, the match itself is case-insensitive).
-                    local tmpfile=$(mktemp)
-                    cp "$file" "$tmpfile"
-                    sed -i "s/$existing_years\(.*$contributor_email\)/$first_year-$last_commit_year\1/I" "$tmpfile"
-                    apply_change "$file" "$tmpfile" "UPDATED YEAR ($first_year-$end_year -> $first_year-$last_commit_year)"
-                    return
+                    new_years="$first_year-$last_commit_year"
+                    label="UPDATED YEAR ($first_year-$end_year -> $new_years)"
                 fi
             else
-                # Single year - check if we need range
                 if [ "$last_commit_year" != "$first_year" ]; then
-                    local tmpfile=$(mktemp)
-                    cp "$file" "$tmpfile"
-                    sed -i "s/$first_year\(.*$contributor_email\)/$first_year-$last_commit_year\1/I" "$tmpfile"
-                    apply_change "$file" "$tmpfile" "UPDATED YEAR ($first_year -> $first_year-$last_commit_year)"
-                    return
+                    new_years="$first_year-$last_commit_year"
+                    label="UPDATED YEAR ($first_year -> $new_years)"
                 fi
+            fi
+
+            if [ -n "$new_years" ]; then
+                local new_line="${contributor_line/$existing_years/$new_years}"
+                local tmpfile=$(mktemp)
+                awk -v ln="$lineno" -v repl="$new_line" \
+                    'NR==ln {print repl; next} {print}' "$file" > "$tmpfile"
+                apply_change "$file" "$tmpfile" "$label"
+                return
             fi
 
             echo -e "${YELLOW}SKIP${NC}: $file (already up-to-date)"
@@ -251,10 +300,12 @@ EOF
     
     # Append original content
     cat "$file" >> "$tmpfile"
-    
-    # Replace original file
-    mv "$tmpfile" "$file"
-    
+
+    # Write through, not `mv` -- see apply_change for why mode preservation
+    # matters here.
+    cat "$tmpfile" > "$file"
+    rm -f "$tmpfile"
+
     echo -e "${GREEN}UPDATED${NC}: $file"
     UPDATED_COUNT=$((UPDATED_COUNT + 1))
 }
@@ -263,27 +314,133 @@ echo "Adding SPDX license headers..."
 echo "License: $LICENSE"
 echo ""
 
+# ---------------------------------------------------------------------------
+# Coverage scope (#137)
+# ---------------------------------------------------------------------------
+# What is covered is declared here, once, in named lists — not buried in a
+# find expression. Two properties this buys us:
+#
+#   1. A missing root is LOUD. The find calls used to end in `2>/dev/null`,
+#      so renaming or deleting a root directory made find print nothing,
+#      the read loop body never ran, and the gate passed having inspected
+#      no files at all. Every root is now asserted to exist, and the
+#      candidate set is asserted non-empty, before any file is examined.
+#
+#   2. Exemptions are an explicit, reviewable list (EXEMPT_GLOBS) with a
+#      stated reason each, rather than an anonymous `! -path` accumulating
+#      in a find invocation nobody reads.
+#
+# NOT covered, deliberately: scripts/**/*.js and scripts/lib/**/*.js (14
+# files at the time of writing). JavaScript needs a `//` header and no
+# emitter in this script produces one; adding that is a separate change.
+# The omission is recorded here so it is a decision rather than an accident
+# of the find expression.
+
+# Roots holding first-party OCaml sources (*.ml, *.mli).
+OCAML_ROOTS=(sarek sarek-cuda sarek-opencl sarek-vulkan sarek-metal spoc)
+
+# Roots holding first-party tooling. `*.sh` and `*.py` share the `#` comment
+# syntax, so add_shell_header serves both.
+SCRIPT_ROOTS=(scripts ci)
+
+# The only sanctioned way to leave a matching file out. Each entry is a
+# find -path glob plus the reason it is not ours to stamp.
+EXEMPT_GLOBS=(
+    '*/dependencies/*'  # vendored third-party sources — not ours to relicense
+    '*/_build/*'        # dune build output — generated, never committed
+    '*/_opam/*'         # local opam switch — not project source
+    '*/.*'              # dotfile dirs (.git, .github metadata, editor state)
+
+    # Review-tool bundle members. scripts/REVIEW-BUNDLE.md: "These files are
+    # upstream-owned and generated [...] Do not hand-edit any bundle file or
+    # the manifest." Each is pinned by sha256 in review-bundle.manifest.json,
+    # so a header here fails review-bundle-verify immediately and is silently
+    # reverted by the next roster upgrade anyway. Stamping them once already
+    # turned check-review-bundle-tracked.sh red with two SHA MISMATCHes.
+    #
+    # This list is kept by hand rather than derived from the manifest: the
+    # manifest is itself a bundle file, and reading it to decide what to skip
+    # would let an upstream change quietly widen our exemptions.
+    'scripts/check-scope-diff.sh'
+    'scripts/xruntime-exec.sh'
+)
+
+# An exemption for a file that no longer exists is an exemption nobody is
+# reading. Any entry without a wildcard is an exact path and must resolve.
+for glob in "${EXEMPT_GLOBS[@]}"; do
+    case "$glob" in
+        *'*'*) ;;
+        *)
+            if [ ! -e "$glob" ]; then
+                echo "ERROR: stale exemption in EXEMPT_GLOBS: $glob does not exist." >&2
+                echo "       Remove it, or point it at the file's new path." >&2
+                exit 2
+            fi
+            ;;
+    esac
+done
+
+# Build the shared `! -path GLOB ...` argument vector once.
+EXEMPT_ARGS=()
+for glob in "${EXEMPT_GLOBS[@]}"; do
+    EXEMPT_ARGS+=(! -path "$glob")
+done
+
+# Fail loudly if a declared root has moved. Without this the loops below
+# silently inspect nothing and the gate reports success.
+require_roots() {
+    local label="$1"; shift
+    local missing=()
+    local root
+    for root in "$@"; do
+        [ -d "$root" ] || missing+=("$root")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: $label root(s) not found: ${missing[*]}" >&2
+        echo "       Update the *_ROOTS list in scripts/add-license-headers.sh." >&2
+        echo "       Refusing to report success on an un-inspected tree." >&2
+        exit 2
+    fi
+}
+
+# A gate that examined zero files is not a passing gate.
+require_nonempty() {
+    local label="$1"
+    local count="$2"
+    if [ "$count" -eq 0 ]; then
+        echo "ERROR: $label matched 0 files." >&2
+        echo "       Either the roots or EXEMPT_GLOBS in" >&2
+        echo "       scripts/add-license-headers.sh no longer describe this tree." >&2
+        exit 2
+    fi
+}
+
 # Process OCaml files
 echo -e "${BLUE}Processing OCaml files...${NC}"
+require_roots "OCaml" "${OCAML_ROOTS[@]}"
+OCAML_SEEN=0
 while IFS= read -r -d '' file; do
+    OCAML_SEEN=$((OCAML_SEEN + 1))
     add_ocaml_header "$file"
-done < <(find sarek sarek-cuda sarek-opencl sarek-vulkan sarek-metal spoc \
+done < <(find "${OCAML_ROOTS[@]}" \
     -type f \( -name "*.ml" -o -name "*.mli" \) \
-    ! -path "*/.*" \
-    ! -path "*/_build/*" \
-    ! -path "*/_opam/*" \
-    ! -path "*/dependencies/*" \
-    -print0 2>/dev/null)
+    "${EXEMPT_ARGS[@]}" \
+    -print0)
+require_nonempty "OCaml sources" "$OCAML_SEEN"
 
-# Process shell scripts
+# Process shell and Python tooling
 echo ""
-echo -e "${BLUE}Processing shell scripts...${NC}"
+echo -e "${BLUE}Processing shell and Python scripts...${NC}"
+require_roots "Script" "${SCRIPT_ROOTS[@]}"
+SCRIPT_SEEN=0
 while IFS= read -r -d '' file; do
+    SCRIPT_SEEN=$((SCRIPT_SEEN + 1))
     add_shell_header "$file"
-done < <(find scripts ci \
-    -type f -name "*.sh" \
-    ! -path "*/.*" \
-    -print0 2>/dev/null)
+done < <(find "${SCRIPT_ROOTS[@]}" \
+    -type f \( -name "*.sh" -o -name "*.py" \) \
+    "${EXEMPT_ARGS[@]}" \
+    -print0)
+require_nonempty "Shell/Python tooling" "$SCRIPT_SEEN"
 
 # Process dune files (optional - uncomment if needed)
 # echo ""
@@ -308,7 +465,15 @@ else
     echo "Files updated: $UPDATED_COUNT"
 fi
 echo "Files skipped: $SKIPPED_COUNT"
+if [ $DUPLICATE_COUNT -gt 0 ]; then
+    echo -e "${RED}Files with duplicate copyright lines: $DUPLICATE_COUNT${NC} (listed above; fix by hand)"
+fi
 echo ""
+
+# A duplicate is a real defect and must not read as success in either mode.
+if [ $DUPLICATE_COUNT -gt 0 ]; then
+    exit 2
+fi
 
 if $DRY_RUN; then
     if [ $UPDATED_COUNT -gt 0 ]; then

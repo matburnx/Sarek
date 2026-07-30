@@ -29,14 +29,11 @@ let make_var name ty =
 
 let empty_kernel name params locals body =
   {
+    default_kernel with
     kern_name = name;
     kern_params = params;
     kern_locals = locals;
     kern_body = body;
-    kern_types = [];
-    kern_variants = [];
-    kern_funcs = [];
-    kern_native_fn = None;
   }
 
 (** Kernel 1: scalar vector-add. Equivalent to: fun (a : float32 vec) (b :
@@ -306,6 +303,48 @@ let float64_cbrt_path_kernel () =
     []
     body
 
+let float64_exp2_path_kernel () =
+  let a = make_var "a" (TVec TFloat64) in
+  let b = make_var "b" (TVec TFloat64) in
+  let idx = make_var "idx" TInt32 in
+  let body =
+    SLet
+      ( idx,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign
+          ( LArrayElem ("b", EVar idx),
+            EIntrinsic (["Float64"], "exp2", [EArrayRead ("a", EVar idx)]) ) )
+  in
+  empty_kernel
+    "float64_exp2_path"
+    [
+      DParam (a, Some {arr_elttype = TFloat64; arr_memspace = Global});
+      DParam (b, Some {arr_elttype = TFloat64; arr_memspace = Global});
+    ]
+    []
+    body
+
+let float64_log2_path_kernel () =
+  let a = make_var "a" (TVec TFloat64) in
+  let b = make_var "b" (TVec TFloat64) in
+  let idx = make_var "idx" TInt32 in
+  let body =
+    SLet
+      ( idx,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign
+          ( LArrayElem ("b", EVar idx),
+            EIntrinsic (["Float64"], "log2", [EArrayRead ("a", EVar idx)]) ) )
+  in
+  empty_kernel
+    "float64_log2_path"
+    [
+      DParam (a, Some {arr_elttype = TFloat64; arr_memspace = Global});
+      DParam (b, Some {arr_elttype = TFloat64; arr_memspace = Global});
+    ]
+    []
+    body
+
 (* Float64.copysign has no GLSL builtin (and is absent from
    Sarek_pure_registry.float64_list), so pre-fix it fell through to the raw-name
    fallback and emitted [Float64.copysign(...)], which glslang parses as a
@@ -360,6 +399,66 @@ let float32_copysign_path_kernel () =
   in
   empty_kernel
     "float32_copysign_path"
+    [
+      DParam (a, Some {arr_elttype = TFloat32; arr_memspace = Global});
+      DParam (b, Some {arr_elttype = TFloat32; arr_memspace = Global});
+      DParam (c, Some {arr_elttype = TFloat32; arr_memspace = Global});
+    ]
+    []
+    body
+
+(* Float64.fmod has no GLSL builtin, and GLSL [mod()] is floor-based (wrong sign
+   for a truncated C fmod). Pre-fix it fell through to the raw-name fallback and
+   emitted [Float64.fmod(...)], which glslang parses as a swizzle on a [Float64]
+   variable and rejects. It must lower to a call to the [sarek_fmod] helper
+   ([x - y*trunc(x/y)]) emitted in the preamble. See Sarek_ir_glsl.ml. *)
+let float64_fmod_path_kernel () =
+  let a = make_var "a" (TVec TFloat64) in
+  let b = make_var "b" (TVec TFloat64) in
+  let c = make_var "c" (TVec TFloat64) in
+  let idx = make_var "idx" TInt32 in
+  let body =
+    SLet
+      ( idx,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign
+          ( LArrayElem ("c", EVar idx),
+            EIntrinsic
+              ( ["Float64"],
+                "fmod",
+                [EArrayRead ("a", EVar idx); EArrayRead ("b", EVar idx)] ) ) )
+  in
+  empty_kernel
+    "float64_fmod_path"
+    [
+      DParam (a, Some {arr_elttype = TFloat64; arr_memspace = Global});
+      DParam (b, Some {arr_elttype = TFloat64; arr_memspace = Global});
+      DParam (c, Some {arr_elttype = TFloat64; arr_memspace = Global});
+    ]
+    []
+    body
+
+(* Float32.fmod resolves through the pure registry to the raw un-suffixed
+   [fmod(...)] (no GLSL builtin), so it too must lower to the [sarek_fmod]
+   helper — here the float overload only, as the kernel is not float64. *)
+let float32_fmod_path_kernel () =
+  let a = make_var "a" (TVec TFloat32) in
+  let b = make_var "b" (TVec TFloat32) in
+  let c = make_var "c" (TVec TFloat32) in
+  let idx = make_var "idx" TInt32 in
+  let body =
+    SLet
+      ( idx,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign
+          ( LArrayElem ("c", EVar idx),
+            EIntrinsic
+              ( ["Float32"],
+                "fmod",
+                [EArrayRead ("a", EVar idx); EArrayRead ("b", EVar idx)] ) ) )
+  in
+  empty_kernel
+    "float32_fmod_path"
     [
       DParam (a, Some {arr_elttype = TFloat32; arr_memspace = Global});
       DParam (b, Some {arr_elttype = TFloat32; arr_memspace = Global});
@@ -758,7 +857,8 @@ let () =
     "metal"
     "scalar_vec_add"
     "#include <metal_stdlib>\n\
-     using namespace metal;\n\n\
+     using namespace metal;\n\
+     #pragma METAL fp contract(off)\n\n\
      kernel void scalar_vec_add(device float* a [[buffer(0)]], constant int \
      &sarek_a_length [[buffer(1)]], device float* b [[buffer(2)]], constant \
      int &sarek_b_length [[buffer(3)]], device float* c [[buffer(4)]], \
@@ -776,13 +876,14 @@ let () =
     "metal"
     "record_kernel"
     "#include <metal_stdlib>\n\
-     using namespace metal;\n\n\
+     using namespace metal;\n\
+     #pragma METAL fp contract(off)\n\n\
      typedef struct {\n\
     \  float x;\n\
     \  float y;\n\
      } Point2;\n\n\
-     kernel void record_kernel(constant Point2* &pts [[buffer(0)]], constant \
-     int &sarek_pts_length [[buffer(1)]],\n\
+     kernel void record_kernel(device Point2* pts [[buffer(0)]], constant int \
+     &sarek_pts_length [[buffer(1)]],\n\
      uint3 __metal_gid [[thread_position_in_grid]],\n\
      uint3 __metal_tid [[thread_position_in_threadgroup]],\n\
      uint3 __metal_bid [[threadgroup_position_in_grid]],\n\
@@ -797,7 +898,8 @@ let () =
     "metal"
     "variant_kernel"
     "#include <metal_stdlib>\n\
-     using namespace metal;\n\n\
+     using namespace metal;\n\
+     #pragma METAL fp contract(off)\n\n\
      enum { OptNone = 0, OptSome = 1 };\n\
      typedef struct {\n\
     \  int tag;\n\
@@ -817,7 +919,7 @@ let () =
     \  return r;\n\
      }\n\n\
      kernel void variant_kernel(device int* flags [[buffer(0)]], constant int \
-     &sarek_flags_length [[buffer(1)]], constant Opt* &out [[buffer(2)]], \
+     &sarek_flags_length [[buffer(1)]], device Opt* out [[buffer(2)]], \
      constant int &sarek_out_length [[buffer(3)]],\n\
      uint3 __metal_gid [[thread_position_in_grid]],\n\
      uint3 __metal_tid [[thread_position_in_threadgroup]],\n\
@@ -837,7 +939,8 @@ let () =
     "metal"
     "sin_kernel"
     "#include <metal_stdlib>\n\
-     using namespace metal;\n\n\
+     using namespace metal;\n\
+     #pragma METAL fp contract(off)\n\n\
      kernel void sin_kernel(device float* a [[buffer(0)]], constant int \
      &sarek_a_length [[buffer(1)]], device float* b [[buffer(2)]], constant \
      int &sarek_b_length [[buffer(3)]],\n\
@@ -867,13 +970,13 @@ let () =
     \  float c[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
-    \  int c_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
+    \  int sarek_c_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\
-     #define c_len pc.c_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\
+     #define sarek_c_length pc.sarek_c_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  c[idx] = (a[idx] + b[idx]);\n\
@@ -893,9 +996,9 @@ let () =
     \  Point2 pts[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int pts_len;\n\
+    \  int sarek_pts_length;\n\
      } pc;\n\n\
-     #define pts_len pc.pts_len\n\n\
+     #define sarek_pts_length pc.sarek_pts_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  Point2 p = pts[idx];\n\
@@ -932,11 +1035,11 @@ let () =
     \  Opt outv[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int flags_len;\n\
-    \  int outv_len;\n\
+    \  int sarek_flags_length;\n\
+    \  int sarek_outv_length;\n\
      } pc;\n\n\
-     #define flags_len pc.flags_len\n\
-     #define outv_len pc.outv_len\n\n\
+     #define sarek_flags_length pc.sarek_flags_length\n\
+     #define sarek_outv_length pc.sarek_outv_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  int flag = flags[idx];\n\
@@ -960,11 +1063,11 @@ let () =
     \  float b[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  b[idx] = sin(a[idx]);\n\
@@ -999,7 +1102,8 @@ let () =
     "metal"
     "float32_sin_path"
     "#include <metal_stdlib>\n\
-     using namespace metal;\n\n\
+     using namespace metal;\n\
+     #pragma METAL fp contract(off)\n\n\
      kernel void float32_sin_path(device float* a [[buffer(0)]], constant int \
      &sarek_a_length [[buffer(1)]], device float* b [[buffer(2)]], constant \
      int &sarek_b_length [[buffer(3)]],\n\
@@ -1026,11 +1130,11 @@ let () =
     \  float b[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  b[idx] = sin(a[idx]);\n\
@@ -1316,11 +1420,11 @@ let () =
     \  float b[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  b[idx] = inversesqrt(a[idx]);\n\
@@ -1339,11 +1443,11 @@ let () =
     \  float b[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  b[idx] = abs(a[idx]);\n\
@@ -1363,11 +1467,11 @@ let () =
     \  double b[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  b[idx] = abs(a[idx]);\n\
@@ -1390,13 +1494,13 @@ let () =
     \  double c[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
-    \  int c_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
+    \  int sarek_c_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\
-     #define c_len pc.c_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\
+     #define sarek_c_length pc.sarek_c_length\n\n\
      float sarek_copysign(float x, float y) { return \
      uintBitsToFloat((floatBitsToUint(x) & 0x7FFFFFFFu) | (floatBitsToUint(y) \
      & 0x80000000u)); }\n\n\
@@ -1424,19 +1528,116 @@ let () =
     \  float c[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
-    \  int c_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
+    \  int sarek_c_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\
-     #define c_len pc.c_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\
+     #define sarek_c_length pc.sarek_c_length\n\n\
      float sarek_copysign(float x, float y) { return \
      uintBitsToFloat((floatBitsToUint(x) & 0x7FFFFFFFu) | (floatBitsToUint(y) \
      & 0x80000000u)); }\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  c[idx] = sarek_copysign(a[idx], b[idx]);\n\
+     }\n" ;
+
+  register_golden
+    "glsl"
+    "float64_fmod_path"
+    "#version 450\n\
+     #extension GL_ARB_gpu_shader_fp64 : require\n\n\
+     // Sarek-generated compute shader: float64_fmod_path\n\
+     layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n\
+     layout(std430, set=0, binding = 0) buffer Buffer_a {\n\
+    \  double a[];\n\
+     };\n\
+     layout(std430, set=0, binding = 1) buffer Buffer_b {\n\
+    \  double b[];\n\
+     };\n\
+     layout(std430, set=0, binding = 2) buffer Buffer_c {\n\
+    \  double c[];\n\
+     };\n\
+     layout(push_constant) uniform PushConstants {\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
+    \  int sarek_c_length;\n\
+     } pc;\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\
+     #define sarek_c_length pc.sarek_c_length\n\n\
+     float sarek_fmod(float x, float y) {\n\
+    \  float ay = abs(y);\n\
+    \  if (isnan(x) || isnan(y) || isinf(x) || ay == 0.0) return \
+     uintBitsToFloat(0x7fc00000u);\n\
+    \  if (isinf(y)) return x;\n\
+    \  float ax = abs(x);\n\
+    \  if (ax < ay) return x;\n\
+    \  float r = ax; float d = ay;\n\
+    \  while (d <= 0.5 * r) d *= 2.0;\n\
+    \  while (true) { if (r >= d) r -= d; if (d == ay) break; d *= 0.5; }\n\
+    \  return uintBitsToFloat((floatBitsToUint(r) & 0x7fffffffu) | \
+     (floatBitsToUint(x) & 0x80000000u));\n\
+     }\n\n\
+     double sarek_fmod(double x, double y) {\n\
+    \  double ay = abs(y);\n\
+    \  if (isnan(x) || isnan(y) || isinf(x) || ay == 0.0lf) return \
+     packDouble2x32(uvec2(0u, 0x7ff80000u));\n\
+    \  if (isinf(y)) return x;\n\
+    \  double ax = abs(x);\n\
+    \  if (ax < ay) return x;\n\
+    \  double r = ax; double d = ay;\n\
+    \  while (d <= 0.5lf * r) d *= 2.0lf;\n\
+    \  while (true) { if (r >= d) r -= d; if (d == ay) break; d *= 0.5lf; }\n\
+    \  uvec2 ur = unpackDouble2x32(r); uvec2 ux = unpackDouble2x32(x);\n\
+    \  ur.y = (ur.y & 0x7fffffffu) | (ux.y & 0x80000000u);\n\
+    \  return packDouble2x32(ur);\n\
+     }\n\n\
+     void main() {\n\
+    \  int idx = int(gl_GlobalInvocationID.x);\n\
+    \  c[idx] = sarek_fmod(a[idx], b[idx]);\n\
+     }\n" ;
+
+  register_golden
+    "glsl"
+    "float32_fmod_path"
+    "#version 450\n\n\
+     // Sarek-generated compute shader: float32_fmod_path\n\
+     layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n\
+     layout(std430, set=0, binding = 0) buffer Buffer_a {\n\
+    \  float a[];\n\
+     };\n\
+     layout(std430, set=0, binding = 1) buffer Buffer_b {\n\
+    \  float b[];\n\
+     };\n\
+     layout(std430, set=0, binding = 2) buffer Buffer_c {\n\
+    \  float c[];\n\
+     };\n\
+     layout(push_constant) uniform PushConstants {\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
+    \  int sarek_c_length;\n\
+     } pc;\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\
+     #define sarek_c_length pc.sarek_c_length\n\n\
+     float sarek_fmod(float x, float y) {\n\
+    \  float ay = abs(y);\n\
+    \  if (isnan(x) || isnan(y) || isinf(x) || ay == 0.0) return \
+     uintBitsToFloat(0x7fc00000u);\n\
+    \  if (isinf(y)) return x;\n\
+    \  float ax = abs(x);\n\
+    \  if (ax < ay) return x;\n\
+    \  float r = ax; float d = ay;\n\
+    \  while (d <= 0.5 * r) d *= 2.0;\n\
+    \  while (true) { if (r >= d) r -= d; if (d == ay) break; d *= 0.5; }\n\
+    \  return uintBitsToFloat((floatBitsToUint(r) & 0x7fffffffu) | \
+     (floatBitsToUint(x) & 0x80000000u));\n\
+     }\n\n\
+     void main() {\n\
+    \  int idx = int(gl_GlobalInvocationID.x);\n\
+    \  c[idx] = sarek_fmod(a[idx], b[idx]);\n\
      }\n" ;
 
   register_golden
@@ -1455,13 +1656,13 @@ let () =
     \  float c[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
-    \  int c_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
+    \  int sarek_c_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\
-     #define c_len pc.c_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\
+     #define sarek_c_length pc.sarek_c_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  c[idx] = atan(a[idx], b[idx]);\n\
@@ -1480,11 +1681,11 @@ let () =
     \  float b[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  b[idx] = (sign(a[idx]) * pow(abs(a[idx]), 1.0 / 3.0));\n\
@@ -1506,13 +1707,13 @@ let () =
     \  float c[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
-    \  int c_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
+    \  int sarek_c_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\
-     #define c_len pc.c_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\
+     #define sarek_c_length pc.sarek_c_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  c[idx] = sqrt((a[idx]) * (a[idx]) + (b[idx]) * (b[idx]));\n\
@@ -1531,11 +1732,11 @@ let () =
     \  float b[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  b[idx] = (exp(a[idx]) - 1.0);\n\
@@ -1554,11 +1755,11 @@ let () =
     \  float b[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  b[idx] = log(1.0 + (a[idx]));\n\
@@ -1577,11 +1778,11 @@ let () =
     \  float b[];\n\
      };\n\
      layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
+    \  int sarek_a_length;\n\
+    \  int sarek_b_length;\n\
      } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
+     #define sarek_a_length pc.sarek_a_length\n\
+     #define sarek_b_length pc.sarek_b_length\n\n\
      void main() {\n\
     \  int idx = int(gl_GlobalInvocationID.x);\n\
     \  b[idx] = (log(a[idx]) / log(10.0));\n\
@@ -1590,50 +1791,217 @@ let () =
   register_golden
     "glsl"
     "float64_log10_path"
-    "#version 450\n\
-     #extension GL_ARB_gpu_shader_fp64 : require\n\n\
-     // Sarek-generated compute shader: float64_log10_path\n\
-     layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n\
-     layout(std430, set=0, binding = 0) buffer Buffer_a {\n\
-    \  double a[];\n\
-     };\n\
-     layout(std430, set=0, binding = 1) buffer Buffer_b {\n\
-    \  double b[];\n\
-     };\n\
-     layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
-     } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
-     void main() {\n\
-    \  int idx = int(gl_GlobalInvocationID.x);\n\
-    \  b[idx] = (log(a[idx]) / log(10.0lf));\n\
-     }\n" ;
+    {|#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+// Sarek-generated compute shader: float64_log10_path
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set=0, binding = 0) buffer Buffer_a {
+  double a[];
+};
+layout(std430, set=0, binding = 1) buffer Buffer_b {
+  double b[];
+};
+layout(push_constant) uniform PushConstants {
+  int sarek_a_length;
+  int sarek_b_length;
+} pc;
+
+#define sarek_a_length pc.sarek_a_length
+#define sarek_b_length pc.sarek_b_length
+
+double sarek_f64_log(double);
+double sarek_f64_log10(double);
+
+double sarek_f64_log(double x) {
+  int64_t b = doubleBitsToInt64(x);
+  int k_raw = int(((b >> 52) & 2047L));
+  precise double m0 = int64BitsToDouble(((b & 4503599627370495L) | 4607182418800017408L));
+  bool big = (m0 > 1.4142135623730951lf);
+  precise double m = (big ? (m0 * 0.5lf) : m0);
+  int k = (big ? (k_raw - 1022) : (k_raw - 1023));
+  precise double s = ((m - 1.0lf) / (m + 1.0lf));
+  precise double z = (s * s);
+  precise double lm = fma(((s + s) * z), fma(fma(fma(fma(fma(fma(0.066666666666666666lf, z, 0.076923076923076927lf), z, 0.090909090909090912lf), z, 0.1111111111111111lf), z, 0.14285714285714285lf), z, 0.20000000000000001lf), z, 0.33333333333333331lf), (s + s));
+  precise double kf = double(k);
+  return fma(kf, 0.69314718036912382lf, fma(kf, 1.9082149292705877e-10lf, lm));
+}
+
+double sarek_f64_log10(double x) {
+  return (sarek_f64_log(x) * 0.43429448190325182lf);
+}
+
+void main() {
+  int idx = int(gl_GlobalInvocationID.x);
+  b[idx] = sarek_f64_log10(a[idx]);
+}
+|} ;
 
   register_golden
     "glsl"
     "float64_cbrt_path"
-    "#version 450\n\
-     #extension GL_ARB_gpu_shader_fp64 : require\n\n\
-     // Sarek-generated compute shader: float64_cbrt_path\n\
-     layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n\
-     layout(std430, set=0, binding = 0) buffer Buffer_a {\n\
-    \  double a[];\n\
-     };\n\
-     layout(std430, set=0, binding = 1) buffer Buffer_b {\n\
-    \  double b[];\n\
-     };\n\
-     layout(push_constant) uniform PushConstants {\n\
-    \  int a_len;\n\
-    \  int b_len;\n\
-     } pc;\n\n\
-     #define a_len pc.a_len\n\
-     #define b_len pc.b_len\n\n\
-     void main() {\n\
-    \  int idx = int(gl_GlobalInvocationID.x);\n\
-    \  b[idx] = (sign(a[idx]) * pow(abs(a[idx]), 1.0lf / 3.0lf));\n\
-     }\n"
+    {|#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+// Sarek-generated compute shader: float64_cbrt_path
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set=0, binding = 0) buffer Buffer_a {
+  double a[];
+};
+layout(std430, set=0, binding = 1) buffer Buffer_b {
+  double b[];
+};
+layout(push_constant) uniform PushConstants {
+  int sarek_a_length;
+  int sarek_b_length;
+} pc;
+
+#define sarek_a_length pc.sarek_a_length
+#define sarek_b_length pc.sarek_b_length
+
+double sarek_f64_exp(double);
+double sarek_f64_log(double);
+double sarek_f64_pow(double, double);
+
+double sarek_f64_exp(double x) {
+  if ((x < -708.0lf)) {
+    return 0.0lf;
+  } else {
+    if ((x > 709.78271289338397lf)) {
+      return int64BitsToDouble(9218868437227405312L);
+    } else {
+      precise double nf = floor(fma(x, 1.4426950408889634lf, 0.5lf));
+      precise double r_hi = fma(nf, -0.69314718036912382lf, x);
+      precise double r = fma(nf, -1.9082149292705877e-10lf, r_hi);
+      precise double p = fma(fma(fma(fma(fma(fma(fma(fma(fma(fma(fma(2.08767569878681e-09lf, r, 2.505210838544172e-08lf), r, 2.7557319223985888e-07lf), r, 2.7557319223985893e-06lf), r, 2.4801587301587302e-05lf), r, 0.00019841269841269841lf), r, 0.0013888888888888889lf), r, 0.0083333333333333332lf), r, 0.041666666666666664lf), r, 0.16666666666666666lf), r, 0.5lf), r, 1.0lf);
+      int n = int(nf);
+      return (fma(p, r, 1.0lf) * int64BitsToDouble((int64_t((n + 1023)) << 52)));
+    }
+  }
+}
+
+double sarek_f64_log(double x) {
+  int64_t b = doubleBitsToInt64(x);
+  int k_raw = int(((b >> 52) & 2047L));
+  precise double m0 = int64BitsToDouble(((b & 4503599627370495L) | 4607182418800017408L));
+  bool big = (m0 > 1.4142135623730951lf);
+  precise double m = (big ? (m0 * 0.5lf) : m0);
+  int k = (big ? (k_raw - 1022) : (k_raw - 1023));
+  precise double s = ((m - 1.0lf) / (m + 1.0lf));
+  precise double z = (s * s);
+  precise double lm = fma(((s + s) * z), fma(fma(fma(fma(fma(fma(0.066666666666666666lf, z, 0.076923076923076927lf), z, 0.090909090909090912lf), z, 0.1111111111111111lf), z, 0.14285714285714285lf), z, 0.20000000000000001lf), z, 0.33333333333333331lf), (s + s));
+  precise double kf = double(k);
+  return fma(kf, 0.69314718036912382lf, fma(kf, 1.9082149292705877e-10lf, lm));
+}
+
+double sarek_f64_pow(double x, double y) {
+  return sarek_f64_exp((y * sarek_f64_log(x)));
+}
+
+void main() {
+  int idx = int(gl_GlobalInvocationID.x);
+  b[idx] = (sign(a[idx]) * sarek_f64_pow(abs(a[idx]), 1.0lf / 3.0lf));
+}
+|} ;
+
+  register_golden
+    "glsl"
+    "float64_exp2_path"
+    {|#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+// Sarek-generated compute shader: float64_exp2_path
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set=0, binding = 0) buffer Buffer_a {
+  double a[];
+};
+layout(std430, set=0, binding = 1) buffer Buffer_b {
+  double b[];
+};
+layout(push_constant) uniform PushConstants {
+  int sarek_a_length;
+  int sarek_b_length;
+} pc;
+
+#define sarek_a_length pc.sarek_a_length
+#define sarek_b_length pc.sarek_b_length
+
+double sarek_f64_exp(double);
+
+double sarek_f64_exp(double x) {
+  if ((x < -708.0lf)) {
+    return 0.0lf;
+  } else {
+    if ((x > 709.78271289338397lf)) {
+      return int64BitsToDouble(9218868437227405312L);
+    } else {
+      precise double nf = floor(fma(x, 1.4426950408889634lf, 0.5lf));
+      precise double r_hi = fma(nf, -0.69314718036912382lf, x);
+      precise double r = fma(nf, -1.9082149292705877e-10lf, r_hi);
+      precise double p = fma(fma(fma(fma(fma(fma(fma(fma(fma(fma(fma(2.08767569878681e-09lf, r, 2.505210838544172e-08lf), r, 2.7557319223985888e-07lf), r, 2.7557319223985893e-06lf), r, 2.4801587301587302e-05lf), r, 0.00019841269841269841lf), r, 0.0013888888888888889lf), r, 0.0083333333333333332lf), r, 0.041666666666666664lf), r, 0.16666666666666666lf), r, 0.5lf), r, 1.0lf);
+      int n = int(nf);
+      return (fma(p, r, 1.0lf) * int64BitsToDouble((int64_t((n + 1023)) << 52)));
+    }
+  }
+}
+
+void main() {
+  int idx = int(gl_GlobalInvocationID.x);
+  b[idx] = sarek_f64_exp((a[idx]) * 0.69314718055994529lf);
+}
+|} ;
+
+  register_golden
+    "glsl"
+    "float64_log2_path"
+    {|#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+// Sarek-generated compute shader: float64_log2_path
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set=0, binding = 0) buffer Buffer_a {
+  double a[];
+};
+layout(std430, set=0, binding = 1) buffer Buffer_b {
+  double b[];
+};
+layout(push_constant) uniform PushConstants {
+  int sarek_a_length;
+  int sarek_b_length;
+} pc;
+
+#define sarek_a_length pc.sarek_a_length
+#define sarek_b_length pc.sarek_b_length
+
+double sarek_f64_log(double);
+
+double sarek_f64_log(double x) {
+  int64_t b = doubleBitsToInt64(x);
+  int k_raw = int(((b >> 52) & 2047L));
+  precise double m0 = int64BitsToDouble(((b & 4503599627370495L) | 4607182418800017408L));
+  bool big = (m0 > 1.4142135623730951lf);
+  precise double m = (big ? (m0 * 0.5lf) : m0);
+  int k = (big ? (k_raw - 1022) : (k_raw - 1023));
+  precise double s = ((m - 1.0lf) / (m + 1.0lf));
+  precise double z = (s * s);
+  precise double lm = fma(((s + s) * z), fma(fma(fma(fma(fma(fma(0.066666666666666666lf, z, 0.076923076923076927lf), z, 0.090909090909090912lf), z, 0.1111111111111111lf), z, 0.14285714285714285lf), z, 0.20000000000000001lf), z, 0.33333333333333331lf), (s + s));
+  precise double kf = double(k);
+  return fma(kf, 0.69314718036912382lf, fma(kf, 1.9082149292705877e-10lf, lm));
+}
+
+void main() {
+  int idx = int(gl_GlobalInvocationID.x);
+  b[idx] = (sarek_f64_log(a[idx]) * 1.4426950408889634lf);
+}
+|}
 
 let glsl_only_kernels () =
   [
@@ -1650,6 +2018,10 @@ let glsl_only_kernels () =
     ("float32_log10_path", float32_log10_path_kernel ());
     ("float64_log10_path", float64_log10_path_kernel ());
     ("float64_cbrt_path", float64_cbrt_path_kernel ());
+    ("float64_exp2_path", float64_exp2_path_kernel ());
+    ("float64_log2_path", float64_log2_path_kernel ());
+    ("float64_fmod_path", float64_fmod_path_kernel ());
+    ("float32_fmod_path", float32_fmod_path_kernel ());
   ]
 
 let glsl_only_tests () =
@@ -1676,7 +2048,8 @@ let () =
     "metal"
     "float32_cbrt_path"
     "#include <metal_stdlib>\n\
-     using namespace metal;\n\n\
+     using namespace metal;\n\
+     #pragma METAL fp contract(off)\n\n\
      kernel void float32_cbrt_path(device float* a [[buffer(0)]], constant int \
      &sarek_a_length [[buffer(1)]], device float* b [[buffer(2)]], constant \
      int &sarek_b_length [[buffer(3)]],\n\
@@ -1693,7 +2066,8 @@ let () =
     "metal"
     "float32_hypot_path"
     "#include <metal_stdlib>\n\
-     using namespace metal;\n\n\
+     using namespace metal;\n\
+     #pragma METAL fp contract(off)\n\n\
      kernel void float32_hypot_path(device float* a [[buffer(0)]], constant \
      int &sarek_a_length [[buffer(1)]], device float* b [[buffer(2)]], \
      constant int &sarek_b_length [[buffer(3)]], device float* c \
@@ -1711,7 +2085,8 @@ let () =
     "metal"
     "float32_expm1_path"
     "#include <metal_stdlib>\n\
-     using namespace metal;\n\n\
+     using namespace metal;\n\
+     #pragma METAL fp contract(off)\n\n\
      kernel void float32_expm1_path(device float* a [[buffer(0)]], constant \
      int &sarek_a_length [[buffer(1)]], device float* b [[buffer(2)]], \
      constant int &sarek_b_length [[buffer(3)]],\n\
@@ -1728,7 +2103,8 @@ let () =
     "metal"
     "float32_log1p_path"
     "#include <metal_stdlib>\n\
-     using namespace metal;\n\n\
+     using namespace metal;\n\
+     #pragma METAL fp contract(off)\n\n\
      kernel void float32_log1p_path(device float* a [[buffer(0)]], constant \
      int &sarek_a_length [[buffer(1)]], device float* b [[buffer(2)]], \
      constant int &sarek_b_length [[buffer(3)]],\n\
@@ -1777,8 +2153,6 @@ let tool_available cmd =
 
 let glslang_available = lazy (tool_available "glslangValidator")
 
-let naga_available = lazy (tool_available "naga")
-
 let read_file f =
   try
     let ic = open_in f in
@@ -1810,6 +2184,12 @@ let glslang_ok glsl =
   List.iter (fun f -> try Sys.remove f with _ -> ()) [src; spv; err; base] ;
   match rc with Unix.WEXITED 0 -> Ok () | _ -> Error out
 
+(** Invocation note: naga-cli's [--validate] flag takes a numeric
+    ValidationFlags BITMASK, not a keyword, so the former ["--validate all"]
+    exited non-zero during argument parsing for every input ("invalid digit
+    found in string") — this sweep could not ever have passed once naga was on
+    PATH. A single positional argument with no output file makes naga run the
+    full front-end + validator and print "Validation successful". *)
 let naga_ok wgsl =
   let base = Filename.temp_file "sarek_golden_wgsl_" "" in
   let src = base ^ ".wgsl" in
@@ -1818,40 +2198,150 @@ let naga_ok wgsl =
   output_string oc wgsl ;
   close_out oc ;
   let cmd =
-    Printf.sprintf
-      "naga --validate all %s >%s 2>&1"
-      (Filename.quote src)
-      (Filename.quote err)
+    Printf.sprintf "naga %s >%s 2>&1" (Filename.quote src) (Filename.quote err)
   in
   let rc = Unix.system cmd in
   let out = read_file err in
   List.iter (fun f -> try Sys.remove f with _ -> ()) [src; err; base] ;
   match rc with Unix.WEXITED 0 -> Ok () | _ -> Error out
 
+(* naga availability is a POSITIVE CONTROL, not `command -v` (#132).
+
+   `command -v` answers a question nobody asked. A naga on PATH that cannot
+   validate anything — wrong version, missing shared library, a shim — reports
+   available, and then every case FAILS for a reason that has nothing to do with
+   the shader. Worse in the other direction: when naga is genuinely absent this
+   sweep is the ONLY executable check WGSL has anywhere, so a quiet skip returns
+   the whole backend to unvalidated with a one-line note in a log nobody reads.
+   That is how the WGSL match emitter went uncovered long enough to accumulate
+   two defects (see wgsl_validation_only_kernels above).
+
+   So: probe by validating the smallest well-formed compute module, exactly as
+   Opencl_clang does, and make the skip state its reason. ci/assert-toolchain.sh
+   is what turns a missing naga into a CI FAILURE rather than a skip — the skip
+   stays correct behaviour on a developer machine and is never the normal
+   outcome in CI. *)
+let naga_probe =
+  "@group(0) @binding(0) var<storage, read_write> o : array<i32>;\n\
+  \   @compute @workgroup_size(1)\n\
+  \   fn main(@builtin(global_invocation_id) gid : vec3<u32>) {\n\
+  \    o[gid.x] = 1;\n\
+  \   }\n"
+
+let naga_unavailable_reason : string option Lazy.t =
+  lazy
+    (if not (tool_available "naga") then
+       Some
+         "naga is not on PATH — WGSL then has NO executable validation \
+          anywhere in this repository (ci/assert-toolchain.sh fails CI for \
+          this)"
+     else
+       match naga_ok naga_probe with
+       | Ok () -> None
+       | Error e ->
+           Some
+             ("naga is on PATH but could not validate a trivial compute \
+               module, so it can prove nothing about ours: " ^ e))
+
+let naga_available = lazy (Lazy.force naga_unavailable_reason = None)
+
 (** Per-case exclusions from the validation sweep, each with a cited reason. A
     golden here is still byte-exact-checked above; it is only skipped by the
     validator (e.g. it exercises an intentionally partial construct). Keyed by
     (backend, kernel_name). Empty unless a genuine, documented gap is found. *)
 let validation_exclusions : ((string * string) * string) list =
+  (* The former float64_log10_path / float64_cbrt_path exclusions are gone: the
+     GLSL backend now lowers every Float64 transcendental through the software
+     helper family (Sarek_ir_softmath), so both goldens emit valid GLSL and are
+     validated by the sweep below like every other case. *)
+  (* FINDING (#128 sweep, first run): Float64.abs_float and Float64.copysign are
+     declared in sarek/Sarek_float64/Float64.ml — user-callable — but are absent
+     from Sarek_pure_registry.float64_list, which is what every non-GLSL backend
+     dispatches through. GLSL survives only because it special-cases both in a
+     hardcoded arm. On OpenCL they die at codegen:
+
+       [OpenCL Codegen] Unknown intrinsic: Float64.abs_float
+       [OpenCL Codegen] Unknown intrinsic: Float64.copysign
+
+     Two exclusions rather than a fix, deliberately. Naively adding the names to
+     float64_list was tried and makes it worse, not better: the float64 template
+     emits the Sarek name verbatim (the float32 table carries an explicit
+     ("abs_float","fabsf","fabs") mapping; the float64 table is a bare name
+     list), so codegen then emits [abs_float(a[idx])] — clang: "use of
+     undeclared identifier 'abs_float'". And the module-level comment on
+     Sarek_pure_registry states the boundary directly: registering float64 names
+     the interpreter cannot evaluate converts an honest lookup failure into a
+     silent miscompile. A real fix needs a name mapping AND interpreter support,
+     across every backend — a separate change, not a rider on the gate that
+     found it. *)
   [
-    (* PRE-EXISTING float64-transcendental GLSL codegen gap (NOT related to the
-       vector-helper work): GLSL core has no double-precision overload for the
-       transcendental builtins, so the float64 log10 path emits [log(<double>)]
-       and the float64 cbrt path emits [pow(<double>, ...)], both of which
-       glslangValidator rejects ("no matching overloaded function"). These
-       goldens pin the current (float-builtin) lowering and are still
-       byte-exact-checked above; validating them is out of scope for this task
-       and would require a genuine double-precision transcendental lowering
-       (software polyfill) on the Vulkan backend. *)
-    ( ("glsl", "float64_log10_path"),
-      "GLSL core has no double overload for log(); pre-existing f64 \
-       transcendental codegen gap, out of scope" );
-    ( ("glsl", "float64_cbrt_path"),
-      "GLSL core has no double overload for pow(); pre-existing f64 \
-       transcendental codegen gap, out of scope" );
+    ( ("opencl", "float64_abs_float_path"),
+      "Float64.abs_float is user-callable but unmapped on every non-GLSL \
+       backend (Sarek_pure_registry.float64_list) — codegen raises Unknown \
+       intrinsic. Found by this sweep; see the note above for why the one-line \
+       fix is wrong." );
+    ( ("opencl", "float64_copysign_path"),
+      "Float64.copysign — same gap as float64_abs_float_path above." );
+    (* RESOLVED (#128 sweep, first run -> fixed by #75): the binder canary
+       reproduced the #75 EMatch-payload defect on OpenCL, in the shape a
+       compile gate provably cannot see. It emitted:
+
+         out[idx] = ((s.tag == Circle) ? (r * 2.0f) : (r + 7.0f));
+
+       — accepted by clang and by rusticl, and wrong, because the dropped
+       payload binder [r] silently resolved to the enclosing local [r]. Under
+       unique binder names the same emission was:
+
+         sk2_out[sk3_idx] = ((sk5_s.tag == Circle) ? (sk6_r * 2.0f) : (sk7_r + 7.0f));
+         error: use of undeclared identifier 'sk6_r'; did you mean 'sk4_r'?
+
+       That exclusion is GONE, and it was removed the way its own removal
+       condition demanded: not because a PR merged, but because the check
+       passes. Re-verified after the EMatch payload fix landed —
+       opencl-validate/ematch_payload_shadowed now reports [OK] ("clang OK:
+       ematch_payload_shadowed (+ binder canary)"), not [SKIP]. So the fix
+       covers the colliding-binder shape, not just the undeclared-identifier
+       one, which is the part a compile gate alone could never have confirmed.
+
+       [ematch_payload_shadowed] stays in the sweep corpus permanently as the
+       live regression check for that shape. *)
   ]
 
 let excluded backend name = List.assoc_opt (backend, name) validation_exclusions
+
+(** Kernels that exist only to be run through the GLSL validator, and carry no
+    golden — same discipline as {!opencl_validation_only_kernels} below.
+
+    WHY THIS EXISTS (#141). [glsl_type_of_elttype] maps [TInt64] to "int64_t",
+    which is the right WIDTH but not a spelling that exists under plain
+    [#version 450]: it needs [#extension GL_ARB_gpu_shader_int64 : require].
+    That extension was gated on the two float64 conditions only — the softmath
+    helpers that bit-cast a double, and a non-finite f64 literal — so a kernel
+    over a plain [int64 vector], with no float64 anywhere, emitted [int64_t]
+    with no extension line at all. glslangValidator rejects it:
+
+    ERROR: :6: '' : syntax error, unexpected IDENTIFIER
+
+    reproduced at exit 2 before the fix, exit 0 after. Nothing in the corpus
+    used int64 except through the f64 transcendentals, which is precisely why
+    the gap survived — hence a kernel whose ONLY wide type is int64. *)
+let glsl_validation_only_kernels () =
+  let out = make_var "out" (TVec TInt64) in
+  let idx = make_var "idx" TInt32 in
+  let body =
+    SLet
+      ( idx,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign (LArrayElem ("out", EVar idx), EConst (CInt64 7L)) )
+  in
+  let k =
+    empty_kernel
+      "int64_only_store"
+      [DParam (out, Some {arr_elttype = TInt64; arr_memspace = Global})]
+      []
+      body
+  in
+  [("int64_only_store", k)]
 
 (** GLSL corpus = cross-backend kernels + GLSL-only kernels. *)
 let glsl_validation_tests () =
@@ -1866,12 +2356,18 @@ let glsl_validation_tests () =
               Printf.printf
                 "  SKIP (excluded): glsl/%s — %s\n%!"
                 kernel_name
-                reason
+                reason ;
+              (* An excluded golden is not validated. Report SKIP so the
+                 exclusion list is visible in the runner output instead of
+                 hiding behind a green [OK] on a "glsl-validate/*" name. *)
+              Alcotest.skip ()
           | None -> (
               Gen_glsl.reset_state () ;
               let glsl = Gen_glsl.generate_with_types ~types:k.kern_types k in
-              if not (Lazy.force glslang_available) then
-                Printf.printf "  SKIP: glslangValidator not on PATH\n%!"
+              if not (Lazy.force glslang_available) then begin
+                Printf.printf "  SKIP: glslangValidator not on PATH\n%!" ;
+                Alcotest.skip ()
+              end
               else
                 match glslang_ok glsl with
                 | Ok () ->
@@ -1885,9 +2381,76 @@ let glsl_validation_tests () =
                       kernel_name
                       e
                       glsl)))
-    (test_kernels () @ glsl_only_kernels ())
+    (test_kernels () @ glsl_only_kernels () @ glsl_validation_only_kernels ())
 
-(** WGSL corpus = cross-backend kernels + WGSL-only kernels. *)
+(** Kernels that exist only to be run through the WGSL validator, and carry no
+    golden — same discipline as {!opencl_validation_only_kernels} below.
+
+    WHY THIS EXISTS (#132). The sweep corpus had no multi-field variant payload
+    and, worse, no [SMatch] at all: [variant_kernel] only CONSTRUCTS variants
+    (an [SIf] over [EVariant]) and never matches on one. So every accessor and
+    every [switch] the WGSL match emitter can produce was unreachable from any
+    executable gate, and the only coverage of that emitter anywhere was a string
+    comparison in test_ematch_payload_binding.ml. Two separate WGSL defects hid
+    behind that hole; both are named on the arms below. *)
+let wgsl_validation_only_kernels () =
+  (* Pair = MkOne of f32 | MkPair of f32 * f32, matched with SMatch and NO
+     wildcard arm.
+
+     Defect 1 (the one #132 was filed for, and which PR #306 had already
+     closed): the flat struct declares [MkPair_v_0] / [MkPair_v_1] while the
+     accessor used to spell [.MkPair_v._0] — naga: "invalid field accessor
+     'MkPair_v'". Both sites now go through
+     [Sarek_ir_codegen.wgsl_payload_layout], so this arm is the regression check
+     rather than the reproduction.
+
+     Defect 2 (still live when this case was added, fixed in the same commit):
+     the match is exhaustive over the constructors and therefore carries no
+     [PWild] arm, and the emitter only wrote [default:] when it saw one. WGSL
+     requires every [switch] to have exactly one default clause — naga:
+     "missing default case". The C family sidesteps this because C [switch]
+     needs no default, and GLSL likewise, so WGSL is the odd one out here too.
+
+     Both need a multi-payload constructor AND a real match, which is exactly
+     what nothing in the corpus had. *)
+  let pair_constrs =
+    [("MkOne", [TFloat32]); ("MkPair", [TFloat32; TFloat32])]
+  in
+  let pair_ty = TVariant ("Pair", pair_constrs) in
+  let ps = make_var "ps" (TVec pair_ty) in
+  let out = make_var "out" (TVec TFloat32) in
+  let idx = make_var "idx" TInt32 in
+  let a = make_var "a" TFloat32 in
+  let b = make_var "b" TFloat32 in
+  let body =
+    SLet
+      ( idx,
+        EIntrinsic ([], "global_thread_id", []),
+        SMatch
+          ( EArrayRead ("ps", EVar idx),
+            [
+              ( PConstr ("MkOne", ["a"]),
+                SAssign (LArrayElem ("out", EVar idx), EVar a) );
+              ( PConstr ("MkPair", ["a"; "b"]),
+                SAssign
+                  (LArrayElem ("out", EVar idx), EBinop (Add, EVar a, EVar b))
+              );
+            ] ) )
+  in
+  let k =
+    empty_kernel
+      "smatch_multi_payload"
+      [
+        DParam (ps, None);
+        DParam (out, Some {arr_elttype = TFloat32; arr_memspace = Global});
+      ]
+      []
+      body
+  in
+  [("smatch_multi_payload", {k with kern_variants = [("Pair", pair_constrs)]})]
+
+(** WGSL corpus = cross-backend kernels + WGSL-only kernels + validation-only
+    kernels. *)
 let wgsl_validation_tests () =
   List.map
     (fun (kernel_name, k) ->
@@ -1900,12 +2463,20 @@ let wgsl_validation_tests () =
               Printf.printf
                 "  SKIP (excluded): wgsl/%s — %s\n%!"
                 kernel_name
-                reason
+                reason ;
+              Alcotest.skip ()
           | None -> (
               Gen_wgsl.reset_state () ;
               let wgsl = Gen_wgsl.generate_with_types ~types:k.kern_types k in
-              if not (Lazy.force naga_available) then
-                Printf.printf "  SKIP: naga not on PATH\n%!"
+              if not (Lazy.force naga_available) then begin
+                Printf.printf
+                  "  SKIP: %s — %s\n%!"
+                  kernel_name
+                  (Option.value
+                     (Lazy.force naga_unavailable_reason)
+                     ~default:"") ;
+                Alcotest.skip ()
+              end
               else
                 match naga_ok wgsl with
                 | Ok () -> Printf.printf "  naga OK: %s\n%!" kernel_name
@@ -1915,7 +2486,375 @@ let wgsl_validation_tests () =
                       kernel_name
                       e
                       wgsl)))
-    (test_kernels () @ wgsl_only_kernels ())
+    (test_kernels () @ wgsl_only_kernels () @ wgsl_validation_only_kernels ())
+
+(** {1 OpenCL validation sweep (#128)}
+
+    OpenCL was the one backend with goldens but no validator, and it is the one
+    where the vendor compiler is least able to act as a safety net: on the
+    reference machine (RX 7900 XTX, rusticl/radeonsi) illegal generated OpenCL
+    crashed the host process instead of producing a build log, and valid-but-
+    wrong generated OpenCL produced no diagnostic at all.
+
+    Three layers per kernel, each with a different blind spot:
+
+    + {b recursion} ({!Opencl_recursion}) — reads the emitted text. No compiler
+      in reach diagnoses OpenCL recursion (measured: clang 22.1.6 accepts it on
+      four targets; rusticl SIGSEGVs on it), so this layer is not redundant with
+      the compile gate, it is the only cover for that class.
+    + {b compile} ({!Opencl_clang}) — [clang -x cl], the same language level and
+      builtin header a real ICD provides. Catches ill-typed and undeclared-
+      identifier defects.
+    + {b binder canary} ({!Ir_uniquify}) — regenerates from an α-converted twin
+      of the kernel and compiles that too. See ir_uniquify.ml: the compile layer
+      alone is structurally unable to see a dropped binder whose name collides
+      with something in scope, because such code IS valid OpenCL C. Under unique
+      binder names a collision cannot happen, so the class collapses into
+      "undeclared identifier", which layer 2 does catch.
+
+    What this sweep still cannot catch, stated plainly so a green run is not
+    mistaken for "our OpenCL is correct": anything that is well-formed OpenCL C
+    with all binders present but the wrong semantics — a wrong operator, a wrong
+    intrinsic mapping, a wrong index. That is what the goldens above and the e2e
+    runtime tests are for. *)
+
+(** Kernels that exist only to be run through the OpenCL validator, and carry no
+    golden: their point is what the gate says about the emitted source, not
+    which bytes it is. Keeping them out of [test_kernels ()] avoids minting five
+    backends' worth of goldens for a case that is about validation. *)
+let opencl_validation_only_kernels () =
+  (* Colliding-binder reproduction (#75 / PR #306). An enclosing local [r] and
+     an EMatch payload binder also called [r]. If the emitter drops the payload
+     binding, the arm's [r] resolves to the enclosing [r]: the source is VALID
+     OpenCL C, no compiler anywhere says a word, and the kernel returns a wrong
+     answer. Measured on an RX 7900 XTX (rusticl/radeonsi): 1024/1024 elements
+     wrong, first at index 0 — got 2000.0, expected 1.0. Layer 2 cannot see
+     this; layer 3 (binder canary) exists for it. *)
+  let shape_constrs = [("Circle", [TFloat32]); ("Square", [TFloat32])] in
+  let shape_ty = TVariant ("Shape", shape_constrs) in
+  let shapes = make_var "shapes" (TVec shape_ty) in
+  let out = make_var "out" (TVec TFloat32) in
+  let idx = make_var "idx" TInt32 in
+  let r = make_var "r" TFloat32 in
+  let s = make_var "s" shape_ty in
+  let body =
+    SLet
+      ( idx,
+        EIntrinsic ([], "global_thread_id", []),
+        SLet
+          ( r,
+            EConst (CFloat32 1000.0),
+            SLet
+              ( s,
+                EArrayRead ("shapes", EVar idx),
+                SAssign
+                  ( LArrayElem ("out", EVar idx),
+                    EMatch
+                      ( EVar s,
+                        [
+                          ( PConstr ("Circle", ["r"]),
+                            EBinop (Mul, EVar r, EConst (CFloat32 2.0)) );
+                          ( PConstr ("Square", ["r"]),
+                            EBinop (Add, EVar r, EConst (CFloat32 7.0)) );
+                        ] ) ) ) ) )
+  in
+  let k =
+    empty_kernel
+      "ematch_payload_shadowed"
+      [
+        DParam (shapes, None);
+        DParam (out, Some {arr_elttype = TFloat32; arr_memspace = Global});
+      ]
+      []
+      body
+  in
+  [
+    ( "ematch_payload_shadowed",
+      {k with kern_variants = [("Shape", shape_constrs)]} );
+  ]
+
+module Opencl_recursion = Opencl_gate.Opencl_recursion
+module Opencl_clang = Opencl_gate.Opencl_clang
+module Ir_uniquify = Opencl_gate.Ir_uniquify
+
+(** Mirror of the production path in [Opencl_plugin.generate_source]: the
+    generator plus the fp64 preamble the plugin prepends. Validating anything
+    else would validate a string we never ship. *)
+let opencl_production_source k =
+  Gen_opencl.reset_state () ;
+  let src = Gen_opencl.generate_with_types ~types:k.kern_types k in
+  if Sarek_ir_analysis.kernel_uses_float64 k then
+    "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n\n" ^ src
+  else src
+
+let opencl_validation_tests () =
+  List.map
+    (fun (kernel_name, k) ->
+      Alcotest.test_case
+        (Printf.sprintf "opencl-validate/%s" kernel_name)
+        `Quick
+        (fun () ->
+          (* CAPABILITY FIRST, exclusions second (#140).
+
+             The order is the fix. Previously the exclusion list was consulted
+             first and nothing consulted fp64 at all, so on a toolchain without
+             it the seven float64 cases in this corpus split into two SKIPs (for
+             an unrelated reason that happened to cover two of them) and five
+             FAILs — one missing capability, two verdicts, and no way to tell
+             from the output which was the real story.
+
+             Asking the capability first makes all seven report the same thing
+             for the same reason when it is absent, and lets the exclusions go
+             back to meaning only what they say: a documented codegen gap,
+             reported wherever fp64 is present. *)
+          if
+            Sarek_ir_analysis.kernel_uses_float64 k
+            && not (Opencl_clang.fp64_available ())
+          then begin
+            Printf.printf
+              "  SKIP (no fp64): opencl/%s — %s\n%!"
+              kernel_name
+              (Opencl_clang.why_no_fp64 ()) ;
+            Alcotest.skip ()
+          end ;
+          match excluded "opencl" kernel_name with
+          | Some reason ->
+              Printf.printf
+                "  SKIP (excluded): opencl/%s — %s\n%!"
+                kernel_name
+                reason ;
+              Alcotest.skip ()
+          | None ->
+              let src = opencl_production_source k in
+              (* Layer 1 — always runs, needs no external tool. *)
+              (match Opencl_recursion.cycles src with
+              | [] -> ()
+              | cs ->
+                  Alcotest.failf
+                    "generated OpenCL for %s contains recursion, which OpenCL \
+                     C forbids (§6.9.e) and no vendor compiler here diagnoses:\n\
+                     %s\n\
+                     --- source ---\n\
+                     %s"
+                    kernel_name
+                    (String.concat "\n" (List.map Opencl_recursion.describe cs))
+                    src) ;
+              if not (Opencl_clang.available ()) then begin
+                Printf.printf
+                  "  SKIP: %s — %s (recursion layer ran; compile and binder \
+                   layers did not)\n\
+                   %!"
+                  kernel_name
+                  (Opencl_clang.why_unavailable ()) ;
+                Alcotest.skip ()
+              end
+              else begin
+                (* Layer 2 — the kernel as we ship it. *)
+                (match Opencl_clang.run_clang src with
+                | Ok () -> ()
+                | Error e ->
+                    Alcotest.failf
+                      "clang rejected generated opencl/%s:\n\
+                       %s\n\
+                       --- source ---\n\
+                       %s"
+                      kernel_name
+                      e
+                      src) ;
+                (* Layer 3 — the same kernel with every binder made unique. *)
+                match Ir_uniquify.uniquify_kernel k with
+                | exception Ir_uniquify.Unsupported r ->
+                    Printf.printf
+                      "  clang OK: %s (binder canary skipped: %s)\n%!"
+                      kernel_name
+                      r
+                | ku -> (
+                    let usrc = opencl_production_source ku in
+                    match Opencl_clang.run_clang usrc with
+                    | Ok () ->
+                        Printf.printf
+                          "  clang OK: %s (+ binder canary)\n%!"
+                          kernel_name
+                    | Error e ->
+                        Alcotest.failf
+                          "binder canary FAILED for opencl/%s.\n\
+                           The kernel compiles as written but not after \
+                           α-renaming every binder to a unique name, so a \
+                           binder the emitter drops is currently being \
+                           resolved by an unrelated same-named identifier in \
+                           scope — valid OpenCL C computing the wrong answer, \
+                           with no diagnostic on the shipped source.\n\
+                           %s\n\
+                           --- α-renamed source ---\n\
+                           %s"
+                          kernel_name
+                          e
+                          usrc)
+              end))
+    (test_kernels () @ glsl_only_kernels () @ opencl_validation_only_kernels ())
+
+(** {1 Metal validation sweep (#139)}
+
+    Metal was the LAST backend with committed goldens and no validator, and it
+    cost exactly what that costs: [record_kernel] and [variant_kernel] had been
+    emitting [constant T* &v] — a reference to a pointer whose pointee has no
+    address space, which Metal rejects outright — and nothing in the project
+    could see it. It was found by running on an Apple M4 (macOS 15.6.1, Apple
+    clang 17), and confirmed pre-existing there against a control with the
+    contraction pragma stripped.
+
+    Two layers, and the split matters more here than anywhere else:
+
+    + {b address space} ({!Metal_gate.Metal_addrspace}) — pure text, no
+      toolchain, so it runs on the Linux machines where this code is written and
+      where the defect was introduced. Covers the class above.
+    + {b compile} ({!Metal_gate.Metal_compile}) — [xcrun metal]. macOS only.
+      Everything a signature check cannot see (bodies, struct layout, intrinsic
+      names) lives here, and on Linux nothing covers it. Its skip says so.
+
+    A green run on Linux therefore means "the signatures are well-formed", not
+    "our Metal is valid" — which is a smaller claim than the other three sweeps
+    make, deliberately stated. *)
+
+module Metal_addrspace = Metal_gate.Metal_addrspace
+module Metal_compile = Metal_gate.Metal_compile
+
+let metal_validation_corpus () = test_kernels () @ metal_only_kernels ()
+
+let metal_validation_tests () =
+  List.map
+    (fun (kernel_name, k) ->
+      Alcotest.test_case
+        (Printf.sprintf "metal-validate/%s" kernel_name)
+        `Quick
+        (fun () ->
+          match excluded "metal" kernel_name with
+          | Some reason ->
+              Printf.printf
+                "  SKIP (excluded): metal/%s — %s\n%!"
+                kernel_name
+                reason ;
+              Alcotest.skip ()
+          | None ->
+              Gen_metal.reset_state () ;
+              let src = Gen_metal.generate_with_types ~types:k.kern_types k in
+              (* Layer 1 — always runs, needs no external tool. *)
+              (match Metal_addrspace.offences src with
+              | [] -> ()
+              | os ->
+                  Alcotest.failf
+                    "generated Metal for %s has parameters Metal's \
+                     address-space rules reject:\n\
+                     %s\n\
+                     --- source ---\n\
+                     %s"
+                    kernel_name
+                    (String.concat "\n" (List.map Metal_addrspace.describe os))
+                    src) ;
+              if not (Metal_compile.available ()) then
+                Printf.printf
+                  "  metal address-space OK: %s (compile layer SKIPPED: %s)\n%!"
+                  kernel_name
+                  (Metal_compile.why_unavailable ())
+              else begin
+                (* Layer 2 — the kernel as we ship it. *)
+                match Metal_compile.run_metal src with
+                | Ok () -> Printf.printf "  metal OK: %s\n%!" kernel_name
+                | Error e ->
+                    Alcotest.failf
+                      "the Metal compiler rejected generated metal/%s:\n\
+                       %s\n\
+                       --- source ---\n\
+                       %s"
+                      kernel_name
+                      e
+                      src
+              end))
+    (metal_validation_corpus ())
+
+(* ANTI-VACUITY CONTROL. The sweep above asserts nothing if its corpus is empty,
+   which is what happens the day a fixture list is renamed. Same reason the
+   contraction-pragma group carries one. *)
+let metal_validation_coverage () =
+  Alcotest.test_case
+    "the metal sweep inspects a non-empty corpus"
+    `Quick
+    (fun () ->
+      let n = List.length (metal_validation_corpus ()) in
+      if n = 0 then
+        Alcotest.fail
+          "the Metal validation corpus is empty, so every metal-validate case \
+           above asserted nothing")
+
+(* The Metal contraction defence, pinned separately from the byte-exact goldens.
+
+   The goldens above would notice the pragma disappearing, but they would report
+   it as "some Metal source changed", which is the wrong diagnosis for a
+   conformance regression. This says what actually broke and why it matters.
+
+   MEASURED on Apple M4 / macOS 15.6.1 / Apple clang 17.0.0: without this
+   pragma, a*b+c is contracted into an fma on all 8773 observable elements of a
+   65536-input sweep; with it, 0. NO MTLCompileOptions setting achieves that —
+   not mathMode=Safe, not fastMathEnabled=NO. See
+   tools/probes/metal_contraction_barrier_probe.m and
+   docs/fp-contraction-policy.md §10. *)
+let metal_contraction_pragma_tests () =
+  let pragma = "#pragma METAL fp contract(off)" in
+  let contains hay needle =
+    let nh = String.length needle and h = String.length hay in
+    let rec go i =
+      i + nh <= h && (String.sub hay i nh = needle || go (i + 1))
+    in
+    go 0
+  in
+  List.filter_map
+    (fun (kernel_name, k) ->
+      Some
+        (Alcotest.test_case
+           (Printf.sprintf
+              "metal/%s carries the contraction pragma"
+              kernel_name)
+           `Quick
+           (fun () ->
+             (* BOTH entry points. Sarek_ir_metal has two preamble sites -
+                [generate] and [generate_with_types] - and the pragma was added
+                to each. Checking only the one the goldens happen to use would
+                leave the other free to drift back to contracting silently,
+                which is exactly the hole CodeRabbit found here. *)
+             metal_backend.reset () ;
+             let via_types = metal_backend.generate ~types:[] k in
+             Gen_metal.reset_state () ;
+             let via_plain = Gen_metal.generate k in
+             List.iter
+               (fun (entry, actual) ->
+                 if not (contains actual pragma) then
+                   Alcotest.failf
+                     "generated Metal for %s via %s does not contain %S.\n\
+                      Metal contracts a*b+c into an fma by default and NO \
+                      MTLCompileOptions setting prevents it (measured on Apple \
+                      M4 / macOS 15.6.1: mathMode=Safe leaves 8773/8773 \
+                      elements contracted, this pragma leaves 0). Dropping it \
+                      silently removes a rounding \
+                      docs/fp-contraction-policy.md §1 promises, and breaks \
+                      every error-free transformation in Sarek_df64 on Metal."
+                     kernel_name
+                     entry
+                     pragma)
+               [("generate_with_types", via_types); ("generate", via_plain)])))
+    (test_kernels ())
+
+(* ANTI-VACUITY CONTROL: the check above is worthless if it inspects an empty
+   list, which is exactly what happens if the golden fixture names change. *)
+let metal_contraction_pragma_coverage () =
+  Alcotest.test_case
+    "the pragma check inspects a non-empty set of kernels"
+    `Quick
+    (fun () ->
+      let n = List.length (metal_contraction_pragma_tests ()) in
+      if n = 0 then
+        Alcotest.fail
+          "no metal golden kernels were found, so the contraction-pragma check \
+           above asserted nothing")
 
 let () =
   Alcotest.run
@@ -1927,4 +2866,10 @@ let () =
         ("metal_only", metal_only_tests ());
         ("glsl_validation_sweep", glsl_validation_tests ());
         ("wgsl_validation_sweep", wgsl_validation_tests ());
+        ("opencl_validation_sweep", opencl_validation_tests ());
+        ( "metal_validation_sweep",
+          metal_validation_coverage () :: metal_validation_tests () );
+        ( "metal_contraction_pragma",
+          metal_contraction_pragma_coverage ()
+          :: metal_contraction_pragma_tests () );
       ])

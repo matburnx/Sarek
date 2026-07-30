@@ -45,12 +45,6 @@ let check (ctx : string) (result : cu_result) : unit =
     ctx
     result
 
-(** Hooks invoked with a device id right before its context is destroyed.
-    [Kernel] registers an eviction hook here (after [Kernel.cache] is defined
-    below) so that [Device.destroy] can retire per-device compiled kernels
-    without a circular module dependency. *)
-let device_destroy_hooks : (int -> unit) list ref = ref []
-
 (** Host-side kernel-argument buffers (the [CArray] of argument pointers plus
     the per-argument value cells) for launches that may still be in flight,
     keyed by device id.
@@ -270,15 +264,30 @@ module Device = struct
   let destroy dev =
     (* Evict from device_cache first: leaving a stale entry means a later
        [get idx] returns a handle whose context has already been destroyed
-       (mirrors the Vulkan fix in Vulkan_api_device.ml). Also run the
-       registered destroy hooks (Kernel.cache eviction) while the context
-       is still current, so stale module/function handles for this device
-       can't be returned by [Kernel.compile_cached] after the context is
-       recreated. *)
+       (mirrors Vulkan_api_device.destroy). *)
     Hashtbl.remove device_cache dev.id ;
-    List.iter (fun hook -> hook dev.id) !device_destroy_hooks ;
+    (* Notify BEFORE anything is released, while the context is still current:
+       the listeners are the cache layers — this backend's own [Kernel.cache]
+       (which unloads this device's modules) and, above it, memos closing over
+       exactly those handles. Doing it here is what stops a stale
+       module/function handle being returned by [Kernel.compile_cached] after
+       the context is recreated under the same index.
+       [notify_device_destroy] re-raises the first failing listener, and
+       [device_cache] has already been emptied, so letting it escape here would
+       leave the device unreachable with its context still alive and its modules
+       still loaded. Capture it, finish the teardown, re-raise at the end. A
+       failure in the teardown itself (cuCtxDestroy) legitimately wins over a
+       memoization-drop failure. *)
+    let listener_exn =
+      match
+        Spoc_framework.Cache_hooks.notify_device_destroy ~backend:"CUDA" dev.id
+      with
+      | () -> None
+      | exception e -> Some e
+    in
     retire_device dev.id ;
-    check "cuCtxDestroy" (cuCtxDestroy dev.context)
+    check "cuCtxDestroy" (cuCtxDestroy dev.context) ;
+    Option.iter raise listener_exn
 end
 
 (** {1 Memory Management} *)
@@ -293,7 +302,12 @@ module Memory = struct
 
   let alloc device size kind =
     Device.set_current device ;
-    let elem_size = Ctypes_static.sizeof (Ctypes.typ_of_bigarray_kind kind) in
+    (* NOT Ctypes_static.sizeof (Ctypes.typ_of_bigarray_kind kind): ctypes'
+       kind GADT has no Float16 arm and raises Failure "Unsupported bigarray
+       kind" there, so [Vector.create Vector.float16 n] died on this line with
+       an opaque ctypes error (#57 slice 1 review, MF2). Spoc_core's pure table
+       knows f16 is 2 bytes; see Spoc_core.Memory.bigarray_elem_size. *)
+    let elem_size = Spoc_core.Memory.bigarray_elem_size kind in
     let bytes = Unsigned.Size_t.of_int (size * elem_size) in
     let ptr = allocate cu_deviceptr Unsigned.UInt64.zero in
     check "cuMemAlloc" (cuMemAlloc ptr bytes) ;
@@ -313,18 +327,26 @@ module Memory = struct
 
   (* A blocking memcpy on the default stream drains all prior launches on that
      stream, so it is a safe point to release the device's retained kernargs. *)
+  (* Both transfers acquire the host pointer through
+     [Spoc_core.Memory.bigarray_void_ptr] rather than [Ctypes.bigarray_start]:
+     the latter raises Failure "Unsupported bigarray kind" for Float16 (#57
+     slice 1 review, MF2). That helper also returns a MANAGED pointer, so the
+     bigarray stays GC-rooted across the memcpy for every element type; the
+     explicit keepalive documents the same obligation locally. *)
   let host_to_device ~src ~dst =
     Device.set_current dst.device ;
-    let src_ptr = bigarray_start array1 src |> to_voidp in
+    let src_ptr = Spoc_core.Memory.bigarray_void_ptr src in
     let bytes = Unsigned.Size_t.of_int (Bigarray.Array1.size_in_bytes src) in
     check "cuMemcpyHtoD" (cuMemcpyHtoD dst.ptr src_ptr bytes) ;
+    ignore (Sys.opaque_identity src) ;
     retire_stream dst.device.id default_stream_key
 
   let device_to_host ~src ~dst =
     Device.set_current src.device ;
-    let dst_ptr = bigarray_start array1 dst |> to_voidp in
+    let dst_ptr = Spoc_core.Memory.bigarray_void_ptr dst in
     let bytes = Unsigned.Size_t.of_int (Bigarray.Array1.size_in_bytes dst) in
     check "cuMemcpyDtoH" (cuMemcpyDtoH dst_ptr src.ptr bytes) ;
+    ignore (Sys.opaque_identity dst) ;
     retire_stream src.device.id default_stream_key
 
   (** Transfer from raw pointer to device buffer (for custom types) *)
@@ -461,37 +483,30 @@ module Kernel = struct
     | ArgFloat64 : float -> arg
     | ArgPtr : nativeint -> arg
 
-  (* Compilation cache *)
-  let cache : (string, t) Hashtbl.t = Hashtbl.create 16
+  (* Compilation cache. Guarded against concurrent multi-domain access by
+     [Spoc_framework.Guarded_cache]: cache lookup/insert, per-device key
+     tracking, eviction and clearing are all atomic, while the NVRTC compile
+     runs outside the lock. Keys are grouped by device id (via
+     [find_or_build ~device_id]) so a device destroy/recreate cycle can evict
+     exactly its own stale module/function handles without reversing the
+     (digested, opaque) cache key. *)
+  let cache : (string, t) Spoc_framework.Guarded_cache.t =
+    Spoc_framework.Guarded_cache.create
+      ~destroy:(fun k -> ignore (cuModuleUnload k.module_))
+      ()
 
-  (* Cache keys grouped by device id, so a device destroy/recreate cycle can
-     evict exactly its own stale module/function handles from [cache]
-     without needing to reverse the (digested, opaque) cache key. *)
-  let keys_by_device : (int, string list ref) Hashtbl.t = Hashtbl.create 16
-
-  let record_key_for_device device_id key =
-    match Hashtbl.find_opt keys_by_device device_id with
-    | Some keys -> keys := key :: !keys
-    | None -> Hashtbl.add keys_by_device device_id (ref [key])
-
-  (* Evict every cached kernel compiled for [device_id]. Registered as a
-     [device_destroy_hooks] callback below so [Device.destroy] retires
-     these handles before the underlying CUDA context is destroyed. *)
-  let evict_device device_id =
-    match Hashtbl.find_opt keys_by_device device_id with
-    | None -> ()
-    | Some keys ->
-        List.iter
-          (fun key ->
-            match Hashtbl.find_opt cache key with
-            | None -> ()
-            | Some k ->
-                let _ = cuModuleUnload k.module_ in
-                Hashtbl.remove cache key)
-          !keys ;
-        Hashtbl.remove keys_by_device device_id
-
-  let () = device_destroy_hooks := evict_device :: !device_destroy_hooks
+  (* Evict every cached kernel compiled for [device_id]. Registered on the
+     shared [Cache_hooks] registry — the one mechanism every backend uses (see
+     Cache_hooks.mli) rather than a CUDA-private hook list — so that
+     [Device.destroy], which fires the notification before it destroys
+     anything, retires these module handles while the context is still alive.
+     Match on the family name, never on the index alone: backend-local indices
+     collide across backends, and [evict_device] does not merely drop
+     memoization, it aborts in-flight builds for that index. *)
+  let () =
+    Spoc_framework.Cache_hooks.on_device_destroy (fun ~backend index ->
+        if String.equal backend "CUDA" then
+          Spoc_framework.Guarded_cache.evict_device cache index)
 
   (* Replace the .target directive in a PTX string to match the given SM version.
      This makes a static PTX string portable: PTX written for sm_86 loads fine
@@ -616,8 +631,8 @@ module Kernel = struct
   (* Shared memoization for compiled/loaded kernels. The cache key must
      include device ID and the kernel name - a source file may define more
      than one kernel, and a resolved kernel handle for one name must never be
-     returned for another (see Compile_cache.mli). [record_key_for_device]
-     keeps the device-destroy eviction hook working for every entry. *)
+     returned for another (see Compile_cache.mli). Passing [~device_id] keeps
+     the device-destroy eviction hook working for every entry. *)
   let with_cache device ~name ~source build =
     let key =
       Spoc_framework.Compile_cache.make_key
@@ -626,13 +641,11 @@ module Kernel = struct
         ~source
         ()
     in
-    match Hashtbl.find_opt cache key with
-    | Some k -> k
-    | None ->
-        let k = build () in
-        Hashtbl.add cache key k ;
-        record_key_for_device device.Device.id key ;
-        k
+    Spoc_framework.Guarded_cache.find_or_build
+      cache
+      ~key
+      ~device_id:device.Device.id
+      build
 
   (** Cached variant of [load_from_ptx] — same cache as [compile_cached].
       Without it, every launch reloads (and re-JITs) the PTX module, which
@@ -646,13 +659,8 @@ module Kernel = struct
     with_cache device ~name ~source (fun () -> compile device ~name ~source)
 
   let clear_cache () =
-    Hashtbl.iter
-      (fun _ k ->
-        let _ = cuModuleUnload k.module_ in
-        ())
-      cache ;
-    Hashtbl.clear cache ;
-    Hashtbl.clear keys_by_device
+    Spoc_framework.Cache_hooks.around_clear (fun () ->
+        Spoc_framework.Guarded_cache.clear cache)
 
   (** Existential wrapper for keeping Ctypes-allocated values alive during FFI
       calls *)

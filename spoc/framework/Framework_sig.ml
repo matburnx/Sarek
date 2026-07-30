@@ -31,9 +31,50 @@ type capabilities = {
   total_global_mem : int64;
   compute_capability : int * int;
       (** (major, minor) for CUDA, (0,0) for OpenCL *)
-  supports_fp64 : bool;
+  device_features : Sarek_ir_analysis.feature list;
+      (** The wide element types this DEVICE provides, as the same vocabulary
+          {!Sarek_ir_analysis.kernel_uses} asks a kernel for. The pairing is the
+          point: a kernel says what it REQUIRES, this says what the device
+          PROVIDES, and a launch gate is one [List.mem] rather than a per-width
+          boolean added to this record every time a width is.
+
+          Replaces the former [supports_fp64 : bool] (#142). It was a single
+          boolean for a question that already had three answers — fp64, f16 and
+          int64 — and the missing one had teeth: an int64 kernel reached
+          [vkCreateShaderModule] declaring [OpCapability Int64] against a
+          logical device that had never enabled [shaderInt64], because nothing
+          in this record could express the int64 half of the question. Read it
+          through {!Sarek_capability.permits}, never by testing membership
+          directly: an unprobed device must not fall into the permitted bucket.
+
+          [Spoc_core.Device.allows_fp64] and [allows_int64] are the derived
+          accessors, so this stays the single source and the two cannot drift.
+      *)
+  coopmat : Sarek_coopmat.device_support option;
+      (** The cooperative-matrix (tensor-core) configurations this DEVICE
+          advertises, or [None] when the backend does not probe for them
+          (backlog-62 slice 2).
+
+          An OPTION rather than a plain list, for the same reason
+          {!Sarek_capability.device_verdict} takes one: an empty list and an
+          unprobed device are different facts, and collapsing them makes
+          "advertises nothing" indistinguishable from "nobody asked". Only the
+          first is evidence. {!Sarek_coopmat.verdict} maps [None] to
+          {!Sarek_capability.Unknown}, which does not permit.
+
+          Read it through {!Sarek_coopmat.verdict} or
+          {!Sarek_coopmat.find_config}, never by matching on the list directly.
+      *)
   supports_atomics : bool;
   warp_size : int;
+      (** Invocations that execute in lockstep — CUDA warp, AMD wavefront,
+          Vulkan/Metal subgroup. Load-bearing for cooperative matrices, whose
+          fragments are distributed across exactly this many invocations
+          ({!Sarek_coopmat.components_per_invocation}), so a wrong value here is
+          a wrong ABI rather than a wrong statistic. The Vulkan backend now
+          reports [VkPhysicalDeviceSubgroupProperties.subgroupSize] instead of a
+          hard-coded 32; on the RX 7900 XTX under radv / Mesa 26.1.4-arch3.1
+          that is 64. *)
   max_registers_per_block : int;
   clock_rate_khz : int;
   multiprocessor_count : int;
@@ -306,8 +347,19 @@ module type BACKEND = sig
       Direct/Custom backends.
       @param block
         Optional block dimensions (required for Vulkan/GLSL which embeds
-        workgroup size in shader) *)
-  val generate_source : ?block:dims -> Sarek_ir_types.kernel -> string option
+        workgroup size in shader)
+      @param soa_params
+        Names of custom (record) vector parameters to lower as
+        Structure-of-Arrays: each expands to N per-leaf base pointers + one
+        shared length instead of a single packed AoS pointer (the #260 PTX
+        emitter ABI). Honoured only by the CUDA/PTX backend; every other backend
+        ignores it and emits its ordinary AoS code. Defaults to [[]] (all AoS),
+        so existing callers are byte-identical. *)
+  val generate_source :
+    ?block:dims ->
+    ?soa_params:string list ->
+    Sarek_ir_types.kernel ->
+    string option
 
   (** Execute a kernel directly (for Direct/Custom backends). JIT backends
       should raise an error if this is called. The backend chooses which

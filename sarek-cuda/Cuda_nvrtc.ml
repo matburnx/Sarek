@@ -255,12 +255,330 @@ let check ctx result =
   | NVRTC_SUCCESS -> ()
   | err -> raise (Nvrtc_error (err, ctx))
 
+(** {2 CUDA header search path}
+
+    NVRTC has NO default include path. It is a library, not a driver, so it does
+    not inherit the built-in [-I] that nvcc adds, and [__half] is not an nvrtc
+    builtin. A generated kernel that says [#include <cuda_fp16.h>] — which is
+    exactly what the f16 codegen emits, see
+    [Sarek_codegen.Sarek_ir_cuda.cuda_fp16_include] — therefore fails with
+    [NVRTC_ERROR_COMPILATION] and
+
+    {v
+could not open source file "cuda_fp16.h" (no directories in search list)
+    v}
+
+    unless the toolkit's include directory is passed explicitly. Verified
+    against libnvrtc 13.3: byte-identical source compiles to PTX containing
+    [cvt.rn.f16.f32] with the flag and fails without it.
+
+    Discovery order (every surviving candidate is passed, so a partial toolkit
+    layout still resolves):
+
+    - [SAREK_CUDA_INCLUDE] — explicit ':'-separated override, kept if the
+      directory exists;
+    - [CUDA_PATH] / [CUDA_HOME] / [CUDA_ROOT] derived [include] and
+      [targets/<triple>/include];
+    - a short list of conventional install roots.
+
+    Derived and conventional candidates must additionally CONTAIN [cuda_fp16.h].
+    That marker is what keeps the discovery honest: a stale [CUDA_PATH] or a
+    bare [/usr/include] never becomes an [-I] that could shadow a real header.
+    On a machine with no CUDA headers the list is empty and the option array is
+    byte-identical to before, so non-CUDA hosts are unaffected.
+
+    Passed unconditionally rather than gated on the f16 detector: this module
+    never sees the IR, an unused include directory cannot change a kernel that
+    includes nothing, and gating here would leave any future header-using
+    codegen broken in the same way. *)
+let cuda_target_triples =
+  ["x86_64-linux"; "sbsa-linux"; "aarch64-linux"; "ppc64le-linux"]
+
+let cuda_conventional_roots = ["/opt/cuda"; "/usr/local/cuda"; "/usr/lib/cuda"]
+
+let cuda_fp16_header = "cuda_fp16.h"
+
+let is_dir d = try Sys.is_directory d with Sys_error _ -> false
+
+let has_fp16_header d = Sys.file_exists (Filename.concat d cuda_fp16_header)
+
+let env_nonempty v =
+  match Sys.getenv_opt v with Some s when s <> "" -> Some s | _ -> None
+
+(** Existing CUDA include directories, most-specific first, de-duplicated. *)
+let cuda_include_paths : string list Lazy.t =
+  lazy
+    (let override =
+       match env_nonempty "SAREK_CUDA_INCLUDE" with
+       | None -> []
+       | Some s -> String.split_on_char ':' s |> List.filter (fun d -> d <> "")
+     in
+     let roots =
+       List.filter_map env_nonempty ["CUDA_PATH"; "CUDA_HOME"; "CUDA_ROOT"]
+       @ cuda_conventional_roots
+     in
+     let derived =
+       List.concat_map
+         (fun root ->
+           Filename.concat root "include"
+           :: List.map
+                (fun t -> Filename.concat root ("targets/" ^ t ^ "/include"))
+                cuda_target_triples)
+         roots
+     in
+     let keep = List.filter is_dir override in
+     let keep =
+       keep @ List.filter (fun d -> is_dir d && has_fp16_header d) derived
+     in
+     let seen = Hashtbl.create 8 in
+     List.filter
+       (fun d ->
+         if Hashtbl.mem seen d then false
+         else (
+           Hashtbl.replace seen d () ;
+           true))
+       keep)
+
+(** The [--include-path=] flags derived from {!cuda_include_paths}. *)
+let cuda_include_flags : string list Lazy.t =
+  lazy
+    (List.map (fun d -> "--include-path=" ^ d) (Lazy.force cuda_include_paths))
+
+(** {2 Floating-point conformance guard}
+
+    Raised when an nvrtc option would change binary32 semantics in a way the
+    interpreter — Sarek's cross-backend oracle — cannot follow. Carries the
+    offending option and why it is refused. *)
+exception Fp_conformance_violation of string
+
+(** The floating-point option classes this path refuses, and why.
+
+    The rule these encode: Sarek's DSL semantics are IEEE-754 binary32 with
+    every operation rounded as written, and the interpreter implements exactly
+    that. An option that FLUSHES SUBNORMALS or DOWNGRADES a division/square root
+    to an approximate form makes the device disagree with the interpreter on
+    inputs the test suite already uses, and — unlike HIP's contraction case,
+    where appending [-ffp-contract=off] last neutralises the caller — there is
+    no later flag that undoes it. So these are rejected rather than warned
+    about.
+
+    - [-use_fast_math] implies
+      [--ftz=true --prec-div=false --prec-sqrt=false --fmad=true] (CUDA nvrtc
+      documentation, [dependencies/Cuda/nvrtc.h]).
+    - [-ftz=true] flushes binary32 subnormals to zero. MEASURED, host-side on
+      CUDA 13.3 (nvcc/ptxas V13.3.73, no NVIDIA device): compiling the generated
+      [f16_midround] kernel for sm_90 with [-use_fast_math] or [-ftz=true] turns
+      [FMUL]/[FADD] into [FMUL.FTZ]/[FADD.FTZ]. [1e-5] is already lane 5 of the
+      [test_hip_f16] input array, so this is reachable from the existing test
+      data, not a hypothetical.
+    - [--prec-div=false] / [--prec-sqrt=false] select approximate division and
+      square root. Sarek_df64 already spends its whole error budget on the
+      correctly-rounded forms — the PTX emitter switched [div.approx.f32] to
+      [div.rn.f32] for exactly this reason (audit finding M2).
+
+    [--fmad=true] is NOT refused: it is nvrtc's default, so refusing it would
+    refuse the status quo. Contraction is instead defeated by construction where
+    it matters (see [Sarek_df64]'s contraction barrier). It warns, so a caller
+    who sets it deliberately is told the guarantee it is trading away.
+
+    NVRTC ACCEPTS AN OPTION AND ITS VALUE AS TWO SEPARATE ARRAY ELEMENTS. An
+    earlier version of this guard matched [["--ftz=true"]] and walked straight
+    past [["--ftz"; "true"]] — executed against libnvrtc 13.3 through these
+    bindings, the separated form compiled and the PTX carried [.ftz] on the f32
+    arithmetic, with no exception and no warning. So the scan below is written
+    around the OPTION, not its spelling: a value-taking name consumes the next
+    array element when there is no [=], and is FAIL-CLOSED — [--ftz] with no
+    determinable value is refused, because a guard that cannot tell what a flag
+    is set to must not assume the safe answer.
+    ([Hip_rtc.fp_relaxing_option_prefixes] never had this hole; it matches by
+    prefix on options whose value is always inline.) *)
+
+type fp_verdict = Fp_reject of string | Fp_warn of string
+
+(** [(name, value_semantics, why)]. [value_semantics] answers "is this setting
+    dangerous?" given the resolved value, where [None] means the value could not
+    be determined. *)
+let fp_option_classes :
+    (string * (string option -> bool) * [`Reject | `Warn] * string) list =
+  (* Fail-closed on an indeterminate value: an unresolved [--ftz] is treated as
+     dangerous, not as safe. *)
+  let dangerous_unless_false = function
+    | Some ("false" | "0") -> false
+    | _ -> true
+  in
+  let dangerous_unless_true = function
+    | Some ("true" | "1") -> false
+    | _ -> true
+  in
+  [
+    ( "use_fast_math",
+      (fun _ -> true),
+      `Reject,
+      "implies --ftz=true --prec-div=false --prec-sqrt=false, which flush \
+       binary32 subnormals and downgrade div/sqrt; the interpreter oracle does \
+       neither" );
+    ( "ftz",
+      dangerous_unless_false,
+      `Reject,
+      "flushes binary32 subnormals to zero (measured: FMUL.FTZ/FADD.FTZ in the \
+       generated f16 kernel's SASS at sm_90, CUDA 13.3); the interpreter keeps \
+       them, so device and oracle diverge" );
+    ( "prec-div",
+      dangerous_unless_true,
+      `Reject,
+      "selects approximate binary32 division; Sarek_df64 requires the \
+       correctly-rounded form (div.rn.f32)" );
+    ( "prec-sqrt",
+      dangerous_unless_true,
+      `Reject,
+      "selects approximate binary32 square root; Sarek_df64's Newton/Karp step \
+       squares the seed error and has no margin for it" );
+    ( "fmad",
+      dangerous_unless_false,
+      `Warn,
+      "re-enables multiply-add contraction; Sarek_df64 defeats contraction by \
+       construction (mul_rn) rather than by flag, but a caller-written kernel \
+       that feeds a live float32 product into a df64 entry point is exposed" );
+  ]
+
+(** Names that take a value, and may therefore carry it in the NEXT array
+    element. [use_fast_math] is a bare switch and is deliberately absent. *)
+let fp_value_taking_names =
+  List.filter_map
+    (fun (n, _, _, _) -> if n = "use_fast_math" then None else Some n)
+    fp_option_classes
+
+(** Split an nvrtc option into its name (leading dashes stripped) and inline
+    value, if any. [--ftz=true] -> [("ftz", Some "true")]; [-use_fast_math] ->
+    [("use_fast_math", None)]. *)
+let split_nvrtc_option (opt : string) : string * string option =
+  let n = String.length opt in
+  let i = ref 0 in
+  while !i < n && opt.[!i] = '-' do
+    incr i
+  done ;
+  let body = String.sub opt !i (n - !i) in
+  match String.index_opt body '=' with
+  | None -> (body, None)
+  | Some j ->
+      ( String.sub body 0 j,
+        Some (String.sub body (j + 1) (String.length body - j - 1)) )
+
+let looks_like_option s = String.length s > 0 && s.[0] = '-'
+
+(** Scan a WHOLE option array, resolving values that live in a following
+    element. Pure, so it can be exercised without libnvrtc or a device — and
+    list-level, because the separated form is invisible to any per-element
+    check. *)
+let fp_scan (opts : string list) : fp_verdict list =
+  let rec go acc = function
+    | [] -> List.rev acc
+    | opt :: rest -> (
+        let name, inline_value = split_nvrtc_option opt in
+        (* The value may be the next array element: nvrtc accepts both
+           ["--ftz=true"] and ["--ftz"; "true"]. *)
+        let value, rest, rendered =
+          match inline_value with
+          | Some _ -> (inline_value, rest, opt)
+          | None -> (
+              match rest with
+              | v :: tl
+                when List.mem name fp_value_taking_names
+                     && not (looks_like_option v) ->
+                  (Some v, tl, opt ^ " " ^ v)
+              | _ -> (None, rest, opt))
+        in
+        match
+          List.find_map
+            (fun (n, dangerous, severity, why) ->
+              if n = name && dangerous value then Some (severity, why) else None)
+            fp_option_classes
+        with
+        | Some (`Reject, why) ->
+            go
+              (Fp_reject
+                 (Printf.sprintf
+                    "nvrtc option %S is refused on the Sarek CUDA path: %s. \
+                     Sarek's cross-backend oracle is the interpreter, which \
+                     evaluates binary32 exactly as written; see \
+                     docs/fp-contraction-policy.md."
+                    rendered
+                    why)
+              :: acc)
+              rest
+        | Some (`Warn, why) ->
+            go
+              (Fp_warn
+                 (Printf.sprintf
+                    "nvrtc option %S relaxes floating-point evaluation: %s. \
+                     See docs/fp-contraction-policy.md."
+                    rendered
+                    why)
+              :: acc)
+              rest
+        | None -> go acc rest)
+  in
+  go [] opts
+
+(** The reason the option array [opts] must be refused, or [None]. *)
+let fp_rejection_reason_list (opts : string list) : string option =
+  List.find_map
+    (function Fp_reject m -> Some m | Fp_warn _ -> None)
+    (fp_scan opts)
+
+(** Single-element convenience wrapper. Correct only for options that carry
+    their value inline — use {!fp_rejection_reason_list} for anything that might
+    be split across elements. *)
+let fp_rejection_reason (opt : string) : string option =
+  fp_rejection_reason_list [opt]
+
+let fp_warning_reason_list (opts : string list) : string option =
+  List.find_map
+    (function Fp_warn m -> Some m | Fp_reject _ -> None)
+    (fp_scan opts)
+
+let fp_warning_reason (opt : string) : string option =
+  fp_warning_reason_list [opt]
+
+(** Reject FP-relaxing options and warn about the merely risky ones.
+
+    Applied to the WHOLE array, at the single point where an array reaches
+    [nvrtcCompileProgram], so it covers options from any source — a caller, a
+    future environment-variable escape hatch, or a hardcoded flag added by a
+    later maintainer — and both spellings of every value-taking option. *)
+let check_fp_conformance (opts : string list) : unit =
+  List.iter
+    (function
+      | Fp_reject msg -> raise (Fp_conformance_violation msg)
+      | Fp_warn msg -> Spoc_core.Log.warnf Spoc_core.Log.Kernel "%s" msg)
+    (fp_scan opts)
+
+(** The exact option array this module hands to [nvrtcCompileProgram] for one
+    architecture attempt. Split out so the composition (caller options + the
+    module's own flags) can be screened in a test, not only the caller's half —
+    a hardcoded FP flag added here later must be caught the same way a caller's
+    is. *)
+let nvrtc_option_array ?arch ~(options : string list)
+    ~(include_opts : string list) () : string list =
+  (match arch with None -> [] | Some a -> ["--gpu-architecture=" ^ a])
+  @ options @ include_opts
+
 (** Compile CUDA source to PTX.
     @param source CUDA C source code
     @param name Optional program name
     @param arch Target architecture (e.g., "compute_75")
+    @param options
+      Extra nvrtc options, prepended to the ones this module supplies. Screened
+      by {!check_fp_conformance}: an option that would break binary32 agreement
+      with the interpreter raises {!Fp_conformance_violation} BEFORE any nvrtc
+      call, so the check is reachable on a host with no CUDA at all.
     @return PTX code as string *)
-let compile_to_ptx ?(name = "kernel") ~arch (source : string) : string =
+let compile_to_ptx ?(name = "kernel") ~arch ?(options = []) (source : string) :
+    string =
+  (* Fail fast, before touching libnvrtc: a bad flag is a programming error in
+     the caller, not a compilation failure. *)
+  check_fp_conformance options ;
+
   (* Create program *)
   let prog = allocate nvrtc_program_ptr (from_voidp nvrtc_program null) in
   check
@@ -291,24 +609,45 @@ let compile_to_ptx ?(name = "kernel") ~arch (source : string) : string =
     else [arch; "compute_80"; "compute_75"; "compute_70"]
   in
 
-  let compile_with_opts numopts opt_ptr =
-    nvrtcCompileProgram prog_handle numopts opt_ptr
+  (* The CUDA header search path. Prepended to every attempt (including the
+     no-arch last resort) so a generated `#include <cuda_fp16.h>` resolves —
+     nvrtc supplies no default include path of its own. Empty on a host with no
+     CUDA headers, in which case the option array is exactly as before. *)
+  let include_opts = Lazy.force cuda_include_flags in
+
+  let compile_with_string_opts (opts : string list) =
+    (* Chokepoint. Every array that reaches nvrtcCompileProgram passes here,
+       including the ones this module builds itself, so a flag added later
+       anywhere in this function is screened too. *)
+    check_fp_conformance opts ;
+    match opts with
+    | [] -> nvrtcCompileProgram prog_handle 0 (from_voidp string null)
+    | _ ->
+        let opt_array = CArray.of_list string opts in
+        let res =
+          nvrtcCompileProgram
+            prog_handle
+            (CArray.length opt_array)
+            (CArray.start opt_array)
+        in
+        ignore (Sys.opaque_identity (opts, opt_array)) ;
+        res
   in
 
   let rec try_arch = function
     | [] ->
-        (* Last resort: no arch flag *)
+        (* Last resort: no arch flag (the include path is still supplied) *)
         Spoc_core.Log.warn
           Spoc_core.Log.Kernel
           "NVRTC: falling back to no arch option" ;
-        (compile_with_opts 0 (from_voidp string null), None)
+        ( compile_with_string_opts (nvrtc_option_array ~options ~include_opts ()),
+          None )
     | a :: rest -> (
         let opt_arch = "--gpu-architecture=" ^ a in
-        let opt_array = CArray.of_list string [opt_arch] in
         let res =
-          compile_with_opts (CArray.length opt_array) (CArray.start opt_array)
+          compile_with_string_opts
+            (nvrtc_option_array ~arch:a ~options ~include_opts ())
         in
-        ignore (Sys.opaque_identity (opt_arch, opt_array)) ;
         match res with
         | NVRTC_SUCCESS -> (res, Some a)
         | NVRTC_ERROR_INVALID_OPTION | NVRTC_ERROR_INVALID_INPUT ->
@@ -320,7 +659,14 @@ let compile_to_ptx ?(name = "kernel") ~arch (source : string) : string =
         | other -> (other, Some a))
   in
 
-  let compile_result, used_arch = try_arch arch_candidates in
+  (* The chokepoint guard can raise from inside try_arch. Destroy the program
+     before the exception leaves, or the handle leaks. *)
+  let compile_result, used_arch =
+    try try_arch arch_candidates
+    with e ->
+      ignore (nvrtcDestroyProgram prog) ;
+      raise e
+  in
 
   (match used_arch with
   | Some a ->

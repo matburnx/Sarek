@@ -187,7 +187,8 @@ module Backend : Framework_sig.BACKEND = struct
       it, and Execute then raised the opaque "generate_source returned None"
       with the name lost (PR #259 review). This function therefore always
       returns [Some _] on success. *)
-  let generate_source ?block (ir : Sarek_ir_types.kernel) : string option =
+  let generate_source ?block ?soa_params:_ (ir : Sarek_ir_types.kernel) :
+      string option =
     let block_tuple =
       match block with
       | Some b -> Some (b.Framework_sig.x, b.Framework_sig.y, b.Framework_sig.z)
@@ -342,9 +343,6 @@ let find_intrinsic = Vulkan_intrinsics.find
 
 (** Generate GLSL source with custom types *)
 let generate_with_types = Sarek_ir_glsl.generate_with_types
-
-(** Generate GLSL source for a kernel *)
-let generate_source = Sarek_ir_glsl.generate
 
 (** Check if glslangValidator is available *)
 let glslang_available = Vulkan_api.glslang_available

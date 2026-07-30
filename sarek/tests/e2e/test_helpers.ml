@@ -252,4 +252,686 @@ let time_it f =
   let t1 = Unix.gettimeofday () in
   (result, (t1 -. t0) *. 1000.0)
 
+(* ========================================================================== *)
+(* fp64 result classification (shared by the float64 / real64 E2E tests)      *)
+(* ========================================================================== *)
+
+(** [true] iff [haystack] contains [needle] as a substring. *)
+let string_contains ~needle haystack =
+  let nl = String.length needle and hl = String.length haystack in
+  if nl = 0 then true
+  else begin
+    let rec go i =
+      i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1))
+    in
+    go 0
+  end
+
+(** [true] iff [(framework, device)] identifies a rusticl (Mesa) OpenCL device.
+
+    The rusticl fp64 KNOWN-ISSUE (div/sqrt at ~single precision, see
+    [classify_fp64_result]) is a limitation of exactly this one ICD, so the
+    annotation must be gated on rusticl IDENTITY rather than on the generic
+    ["OpenCL"] framework tag. Otherwise a conformant NON-rusticl ICD that
+    regressed its fp64 div/sqrt into the tolerance envelope would be silently
+    masked as "known" instead of FAILing (audit finding #52 / F5).
+
+    We key on the OpenCL device name: rusticl reports its Gallium driver as
+    ["radeonsi"] in CL_DEVICE_NAME on the campaign hardware (observed: "AMD
+    Radeon RX 7900 XTX (radeonsi, navi31, ...)" and the CPU-socket-named
+    "raphael_mendocino" device, which despite its name is the integrated GPU and
+    reports CL_DEVICE_TYPE=GPU — verified with clinfo during the #74
+    investigation), and the ICD/platform identifies itself as ["rusticl"]. We
+    match either token, case-insensitively.
+
+    Why the device name and NOT the [RUSTICL_FEATURES] env var: the run-rules
+    export [RUSTICL_FEATURES=fp64] for the WHOLE test process, so the variable
+    is present for every device in the run and cannot discriminate a
+    co-installed non-rusticl ICD from rusticl within the same process. The
+    device name is per-device and can. Name sniffing is admittedly driver-string
+    dependent; if a future rusticl build changes CL_DEVICE_NAME this predicate
+    must be revisited (a bare non-rusticl over-tolerance simply FAILs, which is
+    the safe direction). *)
+let is_rusticl_device ~framework ~device =
+  framework = "OpenCL"
+  &&
+  let d = String.lowercase_ascii device in
+  string_contains ~needle:"rusticl" d || string_contains ~needle:"radeonsi" d
+
+(** Default relative-error envelope for the rusticl fp64 div/sqrt KNOWN-ISSUE.
+
+    rusticl / Mesa fp64 (with RUSTICL_FEATURES=fp64) computes fp64 division and
+    sqrt at only ~single precision while +, -, * stay exact. Measured directly
+    with a hand-written OpenCL C repro (briefs/opencl-f64-while-loop-impl.md,
+    harness clprobe.c) on both rusticl devices: sqrt/div rel err ~1.8e-8, mul
+    ~4e-16. Vulkan/RADV on the same GPU is exact, so this is a driver
+    limitation, not a Sarek codegen artefact (evidence: PR #266). *)
+let opencl_fp64_transcendental_envelope = 1e-5
+
+(** Classify one fp64 result as [`Pass], the documented rusticl fp64 div/sqrt
+    KNOWN-ISSUE, or a genuine [`Fail]. Single source of truth for the fp64 E2E
+    tests (audit finding #52 / F4), replacing the constant + classifier + label
+    previously copy-pasted across test_real64, test_real64_single_source,
+    test_float64_kernel_arith and test_ktype_record_f64_arith.
+
+    - [framework], [device]: the running device's framework tag and name; used
+      only to decide rusticl identity via [is_rusticl_device] (F5 gating).
+    - [within_tol]: the result met its normal tolerance -> [`Pass] outright.
+    - [transcendental]: this result depends on fp64 div/sqrt (the ops rusticl
+      computes at ~single precision). Only such results are eligible for the
+      KNOWN-ISSUE annotation. A result that uses only +,-,* is never eligible
+      and, over tolerance, always [`Fail]s.
+    - [exact_ok]: the companion parts that MUST stay exact (e.g. escape-loop
+      iteration counts, or add/sub/mul in the same pass) are exact. A violation
+      here is a real regression -> [`Fail].
+    - [max_rel]: worst relative error of the transcendental part.
+    - [non_finite]: a non-finite (NaN/inf) result was observed. This forces
+      [`Fail] independently of [max_rel] (a NaN must never fit the envelope).
+    - [envelope]: KNOWN-ISSUE ceiling (default
+      [opencl_fp64_transcendental_envelope] = 1e-5).
+    - [label]: the KNOWN-ISSUE text surfaced (and printed) when annotated.
+
+    A result is annotated [`Known_issue] iff it is over tolerance AND on a
+    rusticl device AND transcendental AND its exact companions are exact AND the
+    error is finite AND within [envelope]; everything else [`Fail]s. *)
+let classify_fp64_result ~framework ~device ~within_tol ~transcendental
+    ~exact_ok ~max_rel ~non_finite
+    ?(envelope = opencl_fp64_transcendental_envelope) ~label () =
+  if within_tol then `Pass
+  else if
+    is_rusticl_device ~framework ~device
+    && transcendental && exact_ok && (not non_finite) && Float.is_finite max_rel
+    && max_rel <= envelope
+  then `Known_issue label
+  else `Fail
+
+(* ========================================================================== *)
+(* df64 (double-float) precision classification                               *)
+(* ========================================================================== *)
+
+(* Single source of truth for the Sarek_df64 precision gates, shared by
+   test_df64, test_real64 and test_real64_single_source.
+
+   WHY THIS EXISTS (task #118). All three tests previously widened the
+   tolerance to [0x1p-22] (2.38e-07) on the backends with a documented df64
+   deviation. 0x1p-22 is FOUR TIMES the float32 unit roundoff, so a df64 that
+   had collapsed all the way to plain float32 (measured 5.84e-08 on RADV) and a
+   df64 that met its contract (measured 9.07e-15) BOTH read as PASS. The gate
+   could not tell the bug from the fix — the "threshold wider than the effect"
+   failure mode. It is also how the real-NVIDIA contraction collapse survived
+   in CUDA/PTX and OpenCL undetected.
+
+   The replacement never widens a ceiling. A deviating (framework, device, op)
+   is checked against a two-sided BAND and reported as an explicit
+   KNOWN-DEVIATION, never as PASS:
+
+     err <= df64 contract bound      -> XPASS  (the deviation is gone; the
+                                                allowlist below is stale)
+     contract < err <= collapsed ceiling, and on the allowlist
+                                     -> KNOWN-DEVIATION (expected failure)
+     anything else                   -> FAIL
+
+   So a device that degrades BEYOND plain float32 now fails, a device NOT on
+   the allowlist is always held to the full contract, and a driver fix is
+   surfaced instead of being absorbed. *)
+
+(** Relative-error bound of [df64_add] / [df64_sub].
+
+    Derivation, not a round number. A df64 value is an unevaluated pair of
+    binary32s [hi + lo] with [|lo| <= ulp(hi)/2], i.e. a ~2p = 48-bit
+    significand (p = 24 for binary32). Sarek_df64's add/sub are the Knuth/Dekker
+    two_sum + quick_two_sum sequence, whose classical bound for the
+    double-double form is 2 ulp of the 2p-bit format, i.e. 2 * 2^-(2p) * 2 =
+    2^-(2p-1) = 2^-47 for p = 24. Measured worst case on the contract-meeting
+    backends: add 5.33e-15, sub 6.51e-15, against 2^-47 = 7.11e-15. *)
+let df64_tol_add_sub = 0x1p-47
+
+(** Relative-error bound of [df64_mul] / [df64_div] / [df64_sqrt].
+
+    Same derivation, one binade looser: the fast two_prod-based multiply drops
+    the [lo*lo] cross term and div/sqrt close with a single rounded Newton /
+    Karp correction, which costs the low word its last bit — 4 ulp of the 48-bit
+    format, i.e. 2^-(2p-2) = 2^-46 for p = 24. Measured worst case on the
+    contract-meeting backends: mul 9.07e-15, div 5.08e-15, sqrt 1.08e-14,
+    against 2^-46 = 1.42e-14. *)
+let df64_tol_mul_div_sqrt = 0x1p-46
+
+(** Ceiling of the COLLAPSED band: the worst relative error a df64 op may show
+    while still being explainable as "the extended-precision machinery was lost
+    and only float32 information survived".
+
+    Derivation: the binary32 unit roundoff is u = 2^-24 = 5.96e-08. When
+    TwoProd's error term is lost, [df64_mul] degenerates to a value carrying at
+    most one correctly-rounded binary32 product plus a lo word that no longer
+    corrects it, so the relative error is that of a chain of at most two
+    binary32 roundings: 2u = 2^-23 = 1.19e-07. Measured collapsed values sit
+    just under ONE u — 5.84e-08 (mul) and 5.86e-08 (div) on RADV, 5.9e-08 on
+    Native — so 2u is a real ceiling with one rounding of headroom and not a
+    round number chosen to fit. Anything above it is worse than plain float32
+    and is a genuine FAIL even on an allowlisted device. *)
+let df64_collapsed_ceiling = 0x1p-23
+
+(** [true] iff [device] is a Mesa RADV (AMD Vulkan) device.
+
+    Keyed on the Vulkan [deviceName], which RADV builds as
+    ["AMD Radeon RX 7900 XTX (RADV NAVI31)"] / ["... (RADV RAPHAEL_MENDOCINO)"]
+    — the ["RADV"] token is inserted by the driver itself, not by the board
+    vendor. Same discipline (and same caveat) as [is_rusticl_device]: a driver
+    rename reopens the gate as a plain FAIL, which is the safe direction. *)
+let is_radv_device ~framework ~device =
+  framework = "Vulkan"
+  && string_contains ~needle:"radv" (String.lowercase_ascii device)
+
+(** [true] iff [device] is a Mesa ANV (Intel Vulkan) device.
+
+    ANV reports the marketing name only —
+    ["Intel(R) UHD Graphics 630 (CFL GT2)"] on the quoted hardware,
+    ["Intel(R) Arc(tm) Graphics (MTL)"] on the hardware this was measured on —
+    with no driver token anywhere in [VkPhysicalDeviceProperties::deviceName].
+    So this matches the vendor string. That is looser than [is_radv_device] and
+    it is the weakest predicate here: it would also match a future non-Mesa
+    Intel Vulkan driver.
+
+    NOW MEASURED (backlog #123), and the arm is KEPT because it fired: Intel Arc
+    Graphics (Meteor Lake-P), Mesa ANV 26.1.2-arch3.1, Vulkan 1.4.348,
+    [test_df64] mul 5.84e-08 / div 5.86e-08, [test_real64] mul 5.93e-08 / div
+    5.83e-08, against add 5.33e-15, sub 6.51e-15, sqrt 9.57e-15 on the same run.
+    See docs/fp-contraction-policy.md §11.
+
+    WHY THE VENDOR STRING IS STILL THE KEY, having looked for a better one. A
+    real driver token does exist in the Vulkan API on this driver —
+    [VkPhysicalDeviceDriverProperties] reports [driverName] = "Intel open-source
+    Mesa driver" and a [driverID] of [VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA], and
+    that struct is Vulkan 1.2 core, so it is available on every device this
+    backend can reach. Sarek does not plumb it:
+    [sarek-vulkan/Vulkan_api_device.ml] fills [Device.name] from
+    [VkPhysicalDeviceProperties::deviceName] and queries nothing else, so no
+    driver token reaches this predicate. Narrowing the key is therefore a
+    Vulkan-backend change (query the driver properties, expose the driver ID on
+    [Device.t]), not a test change, and it is deliberately not bundled into a
+    measurement commit. Until then the vendor string is the strongest key
+    available at this call site, and the failure direction is safe: a non-Mesa
+    Intel Vulkan driver that MEETS the contract trips the strict-XPASS branch
+    below and says so by name, rather than passing silently. *)
+let is_anv_device ~framework ~device =
+  framework = "Vulkan"
+  && string_contains ~needle:"intel" (String.lowercase_ascii device)
+
+(** One entry of the df64 deviation allowlist.
+
+    - [entry]: the match arm in [df64_known_deviation] that produced this, in a
+      form a reader can find and delete. Surfaced verbatim in the strict-XPASS
+      failure message, so it must stay in step with the arm that returns it.
+    - [label]: the KNOWN-DEVIATION text printed when the deviation is observed
+      as expected. *)
+type df64_deviation = {entry : string; label : string}
+
+(** The documented df64 deviation for [(framework, device, op)], if any.
+
+    This is an ALLOWLIST: every device not named here — including NVIDIA Vulkan,
+    which meets the full contract (mul 9.07e-15 on a GTX 1070 Max-Q, driver
+    580.119.02) — is held to the strict bound. That is the task #118 fix for the
+    LIMITATION previously recorded in test_df64.ml: the old gate keyed on the
+    bare ["Vulkan"] framework tag, so a contraction-class regression on NVIDIA
+    Vulkan would have passed silently.
+
+    Each arm is an EXPECTED FAILURE in the strict sense (pytest's
+    [xfail(strict=True)]): observing the deviation is tolerated, and NOT
+    observing it fails the run. See [classify_df64_result]. *)
+let df64_known_deviation ~framework ~device ~op =
+  match (framework, op) with
+  | "Native", _ ->
+      (* NOT AN OPEN BUG. The Native backend runs Sarek float32 as OCaml
+         binary64, so every error-free transformation cancels identically
+         (lo = 0) and df64 degenerates to plain float32 storage precision. That
+         is structural, not a defect to be chased: df64 exists to buy extra
+         precision on devices that lack binary64, and Native HAS binary64, so
+         running df64 there is POINTLESS rather than broken. Nothing downstream
+         is wrong — anyone wanting precision on Native uses float64 (or
+         Sarek_real64, which selects Native_f64 there automatically). The entry
+         covers all five ops because the cancellation is the same for all
+         five. *)
+      Some
+        {
+          entry = "Native, _ (all ops)";
+          label =
+            "KNOWN-DEVIATION (Native evaluates float32 at binary64; EFTs \
+             cancel — df64 on Native is pointless, not broken)";
+        }
+  | "Vulkan", ("mul" | "div") when is_radv_device ~framework ~device ->
+      (* RADV's GLSL [fma] is not correctly rounded, so TwoProd's error term is
+         lost. NOT the ptxas contraction bug (add/sub/sqrt are unaffected and
+         meet the contract on the same device). Mesa also does not honour the
+         GLSL [precise] qualifier that Sarek_ir_glsl.ml emits on float locals.
+         Measured on AMD Radeon RX 7900 XTX (RADV NAVI31), Mesa 26.1.4-arch3.1,
+         Vulkan 1.4.354, kernel 7.1.2-3-cachyos: mul 5.84e-08, div 5.86e-08. *)
+      Some
+        {
+          entry = "Vulkan, (mul|div) when is_radv_device";
+          label = "KNOWN-DEVIATION (RADV fma not correctly rounded)";
+        }
+  | "Vulkan", ("mul" | "div") when is_anv_device ~framework ~device ->
+      (* Same shape and the same attribution as the RADV arm above, and now on
+         the same evidence rather than on a quotation. Measured on Intel Arc
+         Graphics (Meteor Lake-P), Mesa ANV 26.1.2-arch3.1, Vulkan 1.4.348:
+         mul 5.84e-08, div 5.86e-08, with add/sub/sqrt meeting the strict bound
+         on the same run — exactly RADV's pattern.
+
+         Contraction is RULED OUT as the cause here, not assumed:
+         test_vulkan_no_contraction reports 0 of 7 contraction shapes contracted
+         on this device with AND without `precise`, so the compiler is not
+         fusing the multiply that closes quick_two_sum. What is left is the same
+         explanation the RADV arm carries — a GLSL `fma` that is not correctly
+         rounded, which loses TwoProd's error term while leaving the add/sub/
+         sqrt paths (which do not use it) intact. That is an inference from
+         elimination plus an identical error signature, not a direct sweep of
+         `fma` correct-rounding, and it is written down that way in
+         docs/fp-contraction-policy.md §11.
+
+         NOTE ON GENERATION. This measurement is Xe-LPG (Meteor Lake Arc). The
+         figure this arm was originally quoted from is UHD Graphics 630 (CFL
+         GT2) — a different architecture and a different generation. It is a
+         second data point for ANV, not a confirmation of the first. *)
+      Some
+        {
+          entry = "Vulkan, (mul|div) when is_anv_device";
+          label =
+            "KNOWN-DEVIATION (Mesa ANV fma not correctly rounded; contraction \
+             ruled out)";
+        }
+  | _ -> None
+
+(** Strict df64 contract bound for [op]. *)
+let df64_tol_for_op = function
+  | "add" | "sub" -> df64_tol_add_sub
+  | _ -> df64_tol_mul_div_sqrt
+
+(** Classify one df64 op's worst relative error.
+
+    - [`Pass]: within the strict contract bound, and no deviation was expected.
+    - [`Xpass msg]: within the strict bound on a device the allowlist expects to
+      deviate. {b This is a FAILURE} — the allowlist entry is stale and must be
+      deleted. Callers MUST count it towards their failure total and exit
+      nonzero; [msg] already names the arm to remove.
+    - [`Known_deviation label]: over the contract bound, on the allowlist, and
+      inside the collapsed band. An expected failure, tolerated.
+    - [`Fail]: everything else, including a non-finite error and any error above
+      [df64_collapsed_ceiling] on an allowlisted device.
+
+    WHY [`Xpass] IS HARD (strict xfail). An earlier revision of this classifier
+    printed XPASS and left the run green, on the reasoning that an unrelated
+    driver upgrade should not turn CI red. That was wrong for the same reason
+    the [test_cuda_f16_sass] / mma-probe bug was wrong (PR #300): a status that
+    is printed but leaves the exit code at 0 is indistinguishable from a pass to
+    everything that consumes the exit code, so the allowlist rots silently and
+    the suite goes on claiming a deviation that no longer exists. It is also
+    what pytest's [xfail(strict=True)] default exists to prevent.
+
+    The cost is small and bounded: the GitHub CI runners have no GPU, so the
+    RADV and ANV arms never evaluate there and cannot flake CI, and when this
+    does fire on a workstation the fix is deleting one match arm from
+    [df64_known_deviation]. *)
+let classify_df64_result ~framework ~device ~op ~err =
+  let tol = df64_tol_for_op op in
+  let deviation = df64_known_deviation ~framework ~device ~op in
+  if Float.is_finite err && err <= tol then
+    match deviation with
+    | Some {entry; label} ->
+        `Xpass
+          (Printf.sprintf
+             "XPASS (STALE ALLOWLIST ENTRY) - %s / %s / %s now MEETS the df64 \
+              contract (%.3g <= %.3g), but Test_helpers.df64_known_deviation \
+              still expects a deviation there. DELETE the match arm [%s]. Was: \
+              %s"
+             framework
+             device
+             op
+             err
+             tol
+             entry
+             label)
+    | None -> `Pass
+  else
+    match deviation with
+    | Some {label; _} when Float.is_finite err && err <= df64_collapsed_ceiling
+      ->
+        `Known_deviation label
+    | _ -> `Fail
+
+(* ========================================================================== *)
+(* CPU-OpenCL float32 math-intrinsic classification                           *)
+(* ========================================================================== *)
+
+(** [true] iff [dev] is an OpenCL device whose CL_DEVICE_TYPE is CPU.
+
+    Unlike [is_rusticl_device], this predicate does NOT sniff the device name:
+    it uses the real OpenCL device-type query. [capabilities.is_cpu] is filled
+    from [CL_DEVICE_TYPE & CL_DEVICE_TYPE_CPU] in [sarek-opencl/Opencl_api.ml],
+    so the predicate holds for ANY CPU-OpenCL ICD (Intel oneAPI CPU runtime,
+    pocl, rusticl-on-llvmpipe, ...) and never for a real GPU, whatever its
+    CL_DEVICE_NAME string happens to say. That matters here: the CI runner's
+    device reports itself as "AMD EPYC 9V45 96-Core Processor", which matches
+    none of the rusticl/radeonsi name tokens, while the two OpenCL devices on
+    the campaign workstation are named after the CPU socket ("AMD Ryzen 9 7950X
+    16-Core Processor (radeonsi, raphael_mendocino)") yet are
+    CL_DEVICE_TYPE=GPU. Name matching would get both cases backwards; the
+    device-type query gets both right. *)
+let is_cpu_opencl_device (dev : Device.t) =
+  Device.is_opencl dev && Device.is_cpu dev
+
+(** CL_DEVICE_NAME prefixes pocl uses for its CPU device: ["pthread-"] on the
+    1.x series (what Ubuntu 22.04 ships) and ["cpu-"] from 3.x on. *)
+let pocl_device_name_prefixes = ["pthread-"; "cpu-"]
+
+(** [true] iff [dev] is pocl's CPU device.
+
+    {b Currently inert: the CI image ships no pocl.} It is kept because it is
+    the precondition for ever adding one. The CPU-OpenCL known-issue suppression
+    below is keyed on "some CPU OpenCL device", and pocl's device is also
+    CL_DEVICE_TYPE=CPU — so a second, conformant CPU ICD would be swallowed by
+    the same carve-out and buy no coverage at all (task #79). This predicate is
+    what makes pocl's failures hard.
+
+    An attempt to install pocl 1.8 on jammy was reverted: it cannot compile a
+    kernel in that image (`error: unknown target CPU 'generic'`), and pinning
+    the E2E tests to it made them SKIP. It moves to a separate experimental PR;
+    this predicate is pre-positioned for it.
+
+    This does sniff the device name, which [is_cpu_opencl_device] deliberately
+    avoids — but here the alternative is worse: the device-type query cannot
+    distinguish two CPU ICDs, and SPOC's [Device.t] carries no platform or
+    vendor field. When pocl does land, [ci/assert-toolchain.sh] must assert that
+    a device matching these prefixes really enumerates, so a pocl rename fails
+    the build loudly instead of quietly re-widening the suppression. *)
+let is_pocl_device (dev : Device.t) =
+  (* [is_cpu_opencl_device], not a bare [Device.is_opencl]: the contract above
+     is "pocl's CPU device", and pocl's device is CL_DEVICE_TYPE=CPU. The name
+     prefixes alone do not carry that — as the comment on
+     [is_cpu_opencl_device] records, an OpenCL device on this workstation is
+     named after the CPU socket while reporting CL_DEVICE_TYPE=GPU, so a
+     name-only test is exactly the classifier that gets such a device wrong.
+     The callers' outer CPU check currently masks the difference; that is a
+     property of the callers, not of this predicate. *)
+  is_cpu_opencl_device dev
+  && List.exists
+       (fun p -> String.starts_with ~prefix:p (String.lowercase_ascii dev.name))
+       pocl_device_name_prefixes
+
+(** KNOWN-ISSUE label for the CPU-OpenCL float32 transcendental flake. *)
+let cpu_opencl_float32_math_label =
+  "CPU-OpenCL float32 transcendentals (sin/cos/exp/sqrt) are miscompiled by \
+   the CI CPU OpenCL runtime on an unrecognised host CPU"
+
+(** Shape of one verified float32 array comparison — what went wrong and where,
+    not merely whether anything did.
+
+    [classify_cpu_opencl_math_result] needs this because a device-identity-only
+    gate is unsound (audit finding #74 / F1): on a CPU-OpenCL device it would
+    turn ANY wrongness of ANY extent into a non-blocking KNOWN-ISSUE, including
+    an all-zeros buffer — exactly what a kernel that never ran leaves behind,
+    since both tests pre-fill their output vector with 0.0.
+
+    - [first_bad_index]: index of the first element outside tolerance, [None] if
+      none.
+    - [bad_count]: how many elements are outside tolerance.
+    - [total]: how many elements were compared.
+    - [non_finite]: a NaN or infinity was seen in the produced or expected
+      values. NaN comparisons are false-y, so a verifier must flag them
+      explicitly rather than let [diff > tol] silently accept them. *)
+type float_check_shape = {
+  first_bad_index : int option;
+  bad_count : int;
+  total : int;
+  non_finite : bool;
+}
+
+(** The shape of a comparison that was not performed (e.g. [--no-verify]):
+    treated exactly like a clean result. *)
+let float_check_not_verified =
+  {first_bad_index = None; bad_count = 0; total = 0; non_finite = false}
+
+(** How many individual mismatches a verifier prints before going quiet. *)
+let max_reported_mismatches = 5
+
+(** Single source of truth for computing a [float_check_shape]: compare [total]
+    elements of [got] against [expected] at absolute tolerance [tolerance],
+    calling [report] for the first [max_reported_mismatches] mismatches.
+
+    Factored out of the two E2E verifiers (test_float32_sin_pure.verify_result
+    and test_math_intrinsics.verify_float_arrays) so the shape that gates the
+    CPU-OpenCL KNOWN-ISSUE is computed in exactly ONE place, and so it can be
+    fixture-tested device-free (test_float_check_shape.ml). If this miscomputed
+    [first_bad_index], [bad_count] or [non_finite] the classifier would silently
+    be fed garbage and the #74 / F1 masking hole would reopen with no test
+    failing. [expected] and [got] are index functions so callers can compare an
+    array against an array or against a computed reference without materialising
+    one.
+
+    The [Float.is_nan diff] guard is load-bearing: every comparison against a
+    NaN is false, so [diff > tolerance] alone silently ACCEPTS a NaN buffer.
+    Non-finite values on either side also raise [non_finite], which the
+    classifier treats as never-excusable. *)
+let compute_float_check_shape ~total ~tolerance ~expected ~got ~report =
+  let errors = ref 0 in
+  let first_bad = ref None in
+  let non_finite = ref false in
+  for i = 0 to total - 1 do
+    let e = expected i and g = got i in
+    if not (Float.is_finite g && Float.is_finite e) then non_finite := true ;
+    let diff = Float.abs (g -. e) in
+    if Float.is_nan diff || diff > tolerance then begin
+      if !first_bad = None then first_bad := Some i ;
+      if !errors < max_reported_mismatches then
+        report ~index:i ~expected:e ~got:g ~diff ;
+      incr errors
+    end
+  done ;
+  {
+    first_bad_index = !first_bad;
+    bad_count = !errors;
+    total;
+    non_finite = !non_finite;
+  }
+
+(** Vector lane width of the miscompiled CPU-OpenCL math library (SSE, 4 x
+    float32). The observed flake never damages the scalar prologue, so a genuine
+    wrong result at an index below this bound is NEVER the known issue. *)
+let cpu_opencl_math_lane_width = 4
+
+(** Classify one float32 math-intrinsic result, tolerating the documented
+    CPU-OpenCL KNOWN-ISSUE.
+
+    Evidence (PR #282, run 30134740526): the GitHub runner's CPU-OpenCL device
+    ("AMD EPYC 9V45 96-Core Processor", Intel oneAPI CPU runtime, which logs
+    "SYCL CPU RT Warning: Unknown host CPU") intermittently returns wrong values
+    from Float32 sin/cos/exp/sqrt kernels — zeros, neighbouring input elements,
+    or garbage magnitudes (got 3041634.0 for an expected -2.34). Both failures
+    start at element 4, an SSE 4-wide lane boundary: the scalar prologue is
+    correct and the vectorised body is not, i.e. the runtime mis-JITs its vector
+    math library when it cannot identify the host CPU. The same commit passed on
+    its parent, on a plain re-run, and on Native / Interpreter / GPU devices, so
+    it is a device-runtime defect and not a Sarek codegen regression.
+
+    Device identity alone is NOT sufficient to annotate (audit finding #74 / F1,
+    and the same discipline [classify_fp64_result] applies for #52 / F5): the
+    failure must also match the flake's SHAPE. [`Known_issue] iff ALL of
+
+    - [is_cpu_opencl_device dev] — the ICD really reports CL_DEVICE_TYPE=CPU;
+    - [not (is_pocl_device dev)] — if a conformant CPU ICD (pocl) is ever
+      present, it is never excused: any wrongness from it is a hard failure
+      whatever its shape (#79). Inert today; see [is_pocl_device];
+    - [first_bad_index >= cpu_opencl_math_lane_width] (= 4) — the scalar
+      prologue is intact. A wrong intrinsic-name mapping or a swapped operand in
+      an emitter is wrong from element 0, and a kernel that never executed is
+      wrong from element 1 (element 0 accidentally matches for sin, since sin 0
+      = 0 = the pre-fill); both must FAIL;
+    - [not non_finite] — a NaN/inf result is never this flake. Tested FIRST, so
+      a non-finite result [`Fail]s even if the shape claims nothing was out of
+      tolerance (see the note in the body);
+    - [bad_count < total] — a partially wrong buffer. An all-elements-wrong
+      result (dead kernel, dead queue, wrong buffer bound) must always FAIL.
+
+    Everything else [`Fail]s, on every device.
+
+    Known residual: a partial, all-finite wrongness starting at index >= 4 on a
+    CPU-OpenCL device is excused — e.g. a dropped final work-group leaving the
+    0.0 pre-fill in the buffer tail. That is the deliberate trade that
+    suppresses the flake. It is still covered on Native, Interpreter and every
+    GPU device. The [is_pocl_device] carve-out narrows the residual to the Intel
+    runtime rather than to "CPU OpenCL" as a class, so a conformant CPU ICD
+    would close it as soon as one is available in CI.
+
+    Suppression review: this KNOWN-ISSUE exists only until the CI OpenCL ICD is
+    fixed or replaced (task #74). Re-evaluate by 2027-01-01, or earlier if the
+    [`Pass]-on-known-issue-device note below starts appearing in CI logs — that
+    note means the device produced a CORRECT result and the suppression may
+    already be dead weight masking future regressions. *)
+let classify_cpu_opencl_math_result ~dev ~(shape : float_check_shape)
+    ?(label = cpu_opencl_float32_math_label) () =
+  (* A non-finite value FAILs first, ahead of the clean-result branch. Today
+     [non_finite] implies [bad_count >= 1] (a non-finite on either side makes
+     [diff] inf or NaN, and [compute_float_check_shape] counts both), so this
+     ordering is not what makes the current code correct — it is what keeps it
+     correct. That implication is an incidental property of the verifier, not an
+     enforced invariant: with the [Float.is_nan] guard removed the shape becomes
+     [{first_bad_index = None; bad_count = 0; non_finite = true}], and a
+     [bad_count = 0 -> `Pass] test placed first would hand back `Pass on a NaN
+     buffer. Checked structurally here so no future edit to the verifier can
+     reintroduce that. Pinned by test_cpu_opencl_known_issue. *)
+  if shape.non_finite then `Fail
+  else if shape.bad_count = 0 then begin
+    (* F2: the suppression must be able to expire. Announce every correct
+       result from a device we would otherwise excuse, so a fixed ICD is
+       visible in the log instead of silently keeping the annotation alive.
+       Gated on [total > 0]: under --no-verify nothing was compared (see
+       [float_check_not_verified]), and claiming a CORRECT result there would be
+       a misleading expiry signal. *)
+    if is_cpu_opencl_device dev && (not (is_pocl_device dev)) && shape.total > 0
+    then
+      Printf.printf
+        "NOTE: known-issue device produced a CORRECT result — re-evaluate the \
+         CPU-OpenCL suppression (task #74)\n\
+         %!" ;
+    `Pass
+  end
+  else if
+    is_cpu_opencl_device dev
+    (* A conformant ICD exists to give these tests real coverage from
+       SOMETHING (#79); excusing it would defeat that, so pocl is explicitly
+       outside the suppression and a pocl miscomputation is always a hard
+       failure. Inert while the CI image ships only the Intel runtime. *)
+    && (not (is_pocl_device dev))
+    && shape.bad_count < shape.total
+    &&
+    match shape.first_bad_index with
+    | Some i -> i >= cpu_opencl_math_lane_width
+    | None -> false
+  then `Known_issue label
+  else `Fail
+
+(** Emit a GitHub Actions warning annotation, so a KNOWN-ISSUE suppression is
+    visible on the checks page and not only to whoever opens the raw log (audit
+    finding #74 / F3). Outside Actions this is just a line of stdout. *)
+let github_warning ~title msg =
+  Printf.printf "::warning title=%s::%s\n%!" title msg
+
+(* ========================================================================== *)
+(* df64 / real64 status reporting                                             *)
+(* ========================================================================== *)
+
+(** Human-readable text for a df64/real64 status, as printed in the per-op line.
+
+    [`Known_issue], [`Known_deviation] and [`Xpass] all carry a ready-to-print
+    message from their classifier, so they print it verbatim. *)
+let string_of_df64_status = function
+  | `Pass -> "PASS"
+  | `Known_issue s | `Known_deviation s | `Xpass s -> s
+  | `Fail -> "FAIL"
+
+(** [true] iff the status must count towards the test's failure total.
+
+    [`Xpass] is included: a stale allowlist entry that only warned would leave
+    the exit code at 0 and rot unnoticed. See the "WHY [`Xpass] IS HARD" note on
+    [classify_df64_result]. *)
+let df64_status_is_failure = function `Fail | `Xpass _ -> true | _ -> false
+
+(** Emit the GitHub Actions annotation for a non-[`Pass], non-[`Fail] df64 or
+    real64 status.
+
+    Without this, a suppression exists only in the raw log: a df64 collapse on
+    RADV would be invisible on the checks page even though the run is green by
+    design, which is the same visibility gap audit finding #74 / F3 closed for
+    the CPU-OpenCL known-issue. [`Fail] needs no annotation — it already turns
+    the job red — and [`Xpass] gets one *in addition to* failing the run, so the
+    stale entry is visible without opening the log. *)
+let annotate_df64_status ~framework ~device ~op ~err ~tol status =
+  match status with
+  | `Pass | `Fail -> ()
+  | `Xpass msg -> github_warning ~title:"df64 STALE ALLOWLIST ENTRY" msg
+  | (`Known_deviation label | `Known_issue label) as s ->
+      let kind =
+        match s with
+        | `Known_deviation _ -> "df64 KNOWN-DEVIATION"
+        | _ -> "fp64 KNOWN-ISSUE"
+      in
+      github_warning
+        ~title:kind
+        (Printf.sprintf
+           "%s / %s / %s: max rel err %.3g exceeds the tolerance %.3g and is \
+            SUPPRESSED as an expected failure — %s"
+           framework
+           device
+           op
+           err
+           tol
+           label)
+
+(* ========================================================================== *)
+(* real64 per-substrate tolerance and classification                          *)
+(* ========================================================================== *)
+
+(* Shared by test_real64 and test_real64_single_source, which previously carried
+   byte-identical copies of both functions. Keeping two copies is the same drift
+   risk that produced the f32-grade df64 tolerances in the first place: the df64
+   classifier moved here, but these two wrappers were left behind.
+
+   Parameterised on a plain [~native_f64] flag rather than on
+   [Sarek_real64.substrate], so [test_helpers] does not have to take a
+   dependency on sarek.real64 (it is linked into many tests that have no use for
+   it). Callers pass [substrate = Real64.Native_f64]. *)
+
+(** Relative tolerance for the native binary64 substrate. Not the df64 contract:
+    this path runs real IEEE-754 binary64 instructions, so it is held to a
+    binary64-grade bound with room for one fused/reassociated operation. *)
+let real64_native_f64_tol = 1e-12
+
+(** Per-op relative tolerance for a real64 pass. The df64 substrate gets the
+    derived df64 contract bound with NO per-backend widening; deviations are
+    expressed as strict expected failures in [df64_known_deviation]. *)
+let real64_tol_for ~native_f64 ~op =
+  if native_f64 then real64_native_f64_tol else df64_tol_for_op op
+
+(** Classify one real64 op.
+
+    The two substrates need different classifiers and must not be crossed:
+
+    - [Fallback_df64] uses no fp64 instruction at all, so the rusticl fp64
+      KNOWN-ISSUE cannot apply to it, and that classifier's 1e-5 envelope would
+      swallow a total df64 collapse whole.
+    - [Native_f64] is the only path that can hit the rusticl div/sqrt error, and
+      only for div/sqrt; +, -, * stay exact there. *)
+let classify_real64_result ~native_f64 ~framework ~device ~op ~err =
+  if native_f64 then
+    classify_fp64_result
+      ~framework
+      ~device
+      ~within_tol:(err <= real64_native_f64_tol)
+      ~transcendental:(op = "div" || op = "sqrt")
+      ~exact_ok:true
+      ~max_rel:err
+      ~non_finite:(not (Float.is_finite err))
+      ~label:"KNOWN-ISSUE (rusticl fp64 sqrt/div)"
+      ()
+  else classify_df64_result ~framework ~device ~op ~err
+
 module Benchmarks = Benchmarks

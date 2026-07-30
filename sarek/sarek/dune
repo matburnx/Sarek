@@ -1,7 +1,3 @@
-; ir_extract/ contains tools for extracting reference IR
-
-(dirs ir_extract)
-
 ; Main sarek library - V2 path, no SPOC dependency
 ; sarek_interp (FFI-free) provides Sarek_float32/Sarek_value/type helpers.
 ; sarek_execute provides Execute/Execute_error.
@@ -25,6 +21,7 @@
   Sarek_ir
   Sarek_fusion
   Sarek_cpu_runtime_types
+  Sarek_float64_native
   Sarek_cpu_runtime_exec
   Sarek_cpu_runtime_pools
   Sarek_cpu_runtime
@@ -32,11 +29,13 @@
   Kirc_error
   Fusion_error
   Sarek_ir_interp
+  Sarek_float16
   Sarek_float32
   Sarek_value
   Interp_error
   Sarek_type_helpers
   Execute
-  Execute_error)
+  Execute_error
+  Soa_launch)
  (instrumentation
   (backend bisect_ppx)))

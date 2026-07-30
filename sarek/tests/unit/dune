@@ -3,7 +3,6 @@
   test_types
   test_env
   test_typer
-  test_lower
   test_parse
   test_core_primitives
   test_tailrec
@@ -24,21 +23,75 @@
   test_mono
   test_ir_interp
   test_execute
-  test_kirc_kernel)
+  test_kirc_kernel
+  test_float16
+  test_type_width_totality
+  test_host_ir_width_agreement
+  test_diagnostic_locations)
+ (modules
+  test_types
+  test_env
+  test_typer
+  test_parse
+  test_core_primitives
+  test_tailrec
+  test_tailrec_analysis
+  test_tailrec_elim
+  test_tailrec_bounded
+  test_tailrec_pragma
+  test_native_helpers
+  test_native_intrinsics
+  test_error
+  test_quote
+  test_lower_ir
+  test_reserved
+  test_ppx_registry
+  test_quote_ir
+  test_convergence
+  test_scheme
+  test_mono
+  test_ir_interp
+  test_execute
+  test_kirc_kernel
+  test_float16
+  test_type_width_totality
+  test_host_ir_width_agreement
+  test_diagnostic_locations)
  ; Link sarek_stdlib to trigger auto-registration of intrinsics
- (libraries sarek_ppx_lib sarek_stdlib sarek alcotest ppxlib str)
+ ; ctypes is listed explicitly (not relied on transitively via sarek): the
+ ; GC-root canary in test_float16 asserts the managed-vs-unmanaged asymmetry
+ ; of the f16 host pointer directly, so it names Ctypes/Ctypes_bigarray.
+ ; sarek.interp: test_execute drives Sarek_interp_capability directly — the
+ ; interpreter's own launch gate (backlog-154), which is not reachable through
+ ; the Sarek.Execute surface.
+ (libraries
+  sarek_ppx_lib
+  sarek_stdlib
+  sarek
+  sarek.interp
+  alcotest
+  ppxlib
+  str
+  ctypes)
  (preprocess
   (pps ppxlib.metaquot)))
 
 (test
  (name test_cpu_runtime)
+ (modules test_cpu_runtime)
  (libraries sarek alcotest))
 
-; Fusion tests use sarek library directly (no ppx needed)
+; Fusion tests use sarek library directly (no ppx needed).
+;
+; sarek.codegen and str are for the backlog-153 cases: the defect there was
+; only OBSERVABLE in emitted backend source (a bare `sarek_temp_length` for a
+; parameter fusion had deleted), so the regression test asserts on generated
+; CUDA/OpenCL/Metal rather than on the IR alone.
 
 (test
  (name test_fusion)
- (libraries sarek))
+ (modules test_fusion)
+ (libraries sarek sarek.codegen str))
 
 ; Interpreter tests removed - Sarek_interp was legacy SPOC-dependent
 
@@ -46,19 +99,41 @@
 
 (test
  (name test_float32)
+ (modules test_float32)
  (libraries sarek))
 
 ; Float64 module tests
 
 (test
  (name test_float64)
+ (modules test_float64)
  (libraries sarek.float64))
 
 ; PTX snapshot test — CPU-only, no CUDA device required
 
 (test
  (name test_ptx_snapshot)
+ (modules test_ptx_snapshot)
  (libraries sarek.codegen alcotest unix str))
+
+; ptxas sweep over the WHOLE PTX intrinsic surface: one kernel per intrinsic
+; name, enumerated from Sarek_ir_ptx_expr's own dispatch registry so a new
+; intrinsic is assembled automatically. Skips cleanly without ptxas.
+
+(test
+ (name test_ptx_intrinsic_sweep)
+ (modules test_ptx_intrinsic_sweep)
+ (libraries sarek.codegen alcotest unix str))
+
+; WGSL identifier escaping: injectivity + legality of escape_wgsl_name, and
+; coverage of the WGSL keyword/reserved-word table. Pure string-level test —
+; no naga, no device — complementing the whole-shader naga sweep in
+; test_shader_recursion_vector below.
+
+(test
+ (name test_wgsl_escape)
+ (modules test_wgsl_escape)
+ (libraries sarek.codegen alcotest))
 
 ; Shader-validation gate for recursion + vector-parameter helpers.
 ; GLSL assembled with glslangValidator; WGSL validated with naga if present,
@@ -66,13 +141,15 @@
 
 (test
  (name test_shader_recursion_vector)
- (libraries sarek.codegen alcotest unix))
+ (modules test_shader_recursion_vector)
+ (libraries sarek.codegen sarek_backend_error alcotest unix))
 
 ; Software f64 transcendentals for PTX: IR-level accuracy vs the OCaml stdlib
 ; (pure scalar evaluation of the helper bodies — CPU-only, no device needed)
 
 (test
  (name test_f64_softmath)
+ (modules test_f64_softmath)
  (libraries sarek.codegen spoc.ir alcotest))
 
 ; Aggregate byte-layout test — pins the host ABI (packed offsets, variant
@@ -80,6 +157,7 @@
 
 (test
  (name test_ir_layout)
+ (modules test_ir_layout)
  (libraries spoc.ir alcotest))
 
 ; Regression test: Sarek_ppx.scan_file_for_sarek_types's `with _ -> ()`
@@ -90,10 +168,128 @@
 
 (test
  (name test_ppx_scan_diagnostics)
+ (modules test_ppx_scan_diagnostics)
  (libraries sarek_ppx alcotest))
 
 ; Tier 1a: host-side SoA layout/transpose round-trip (pure ctypes, no device)
 
 (test
  (name test_soa)
+ (modules test_soa)
  (libraries spoc_core spoc.ir ctypes alcotest))
+
+; Negative controls for the OpenCL validation gate (#127/#128). Proves each
+; layer of the gate can go red: recursion detection, the clang compile gate
+; under a removed declaration, and the α-renaming binder canary. Also pins the
+; #127 backend policy (budgeted self-recursion bounded, every other cycle
+; refused). CPU-only, no device; clang-dependent cases self-skip.
+
+(test
+ (name test_opencl_gate)
+ (modules test_opencl_gate)
+ (libraries sarek.codegen spoc.ir opencl_gate alcotest str unix))
+
+; Negative controls for the Metal validation gate (#139). Layer 2 (xcrun metal)
+; cannot run outside macOS, so layer 1 (address-space text check) is the only
+; cover on the machines this code is written on — these cases are the proof it
+; can go red, driven from the pre-fix golden verbatim. CPU-only, no device.
+
+(test
+ (name test_metal_gate)
+ (modules test_metal_gate)
+ (libraries metal_gate alcotest str))
+
+; Per-backend emission of SBarrier / SWarpBarrier / SMemFence. These are six
+; hand-written match arms with nothing holding them to the instruction each
+; target actually has, and the Metal one had drifted to a non-existent MSL
+; function. See the module header for what these assertions are and are not.
+
+(test
+ (name test_sync_stmt_emission)
+ (modules test_sync_stmt_emission)
+ (libraries sarek.codegen sarek_ppx_lib spoc.ir alcotest))
+
+; Cross-backend intrinsic arm parity (#94). Records, per intrinsic, what each of
+; the five source backends does with it — so a divergence gained or lost is a
+; deliberate table edit rather than something a user of one backend discovers.
+
+(test
+ (name test_backend_arm_parity)
+ (modules test_backend_arm_parity)
+ (libraries sarek.codegen sarek_ir alcotest))
+
+; An emitter must declare every name it uses (backlog-156). Within ONE backend,
+; between the half that declares a generated identifier and the half that uses
+; it — the axis the cross-backend arm-parity matrix cannot see.
+
+(test
+ (name test_emitted_name_declared)
+ (modules test_emitted_name_declared)
+ (libraries sarek.codegen sarek_ir alcotest unix))
+
+; A backend's two entry points must agree (backlog-155). generate is defined as
+; generate_with_types ~types:k.kern_types, so their outputs must be byte-equal;
+; each used to be a separate copy of the emit sequence that dropped the
+; type-declaration step. Agreement, not correctness — the goldens own that.
+
+(test
+ (name test_entry_point_agreement)
+ (modules test_entry_point_agreement)
+ (libraries sarek.codegen sarek_ir alcotest))
+
+; Intrinsic-surface reconciliation: derives its expectation from
+; Sarek_registry's link-time record of every let%sarek_intrinsic, and checks it
+; against Sarek_pure_registry (GPU codegen) and Sarek_cpu_runtime (native).
+; Closes the "declared but unroutable" class rather than the reported names.
+
+(test
+ (name test_intrinsic_surface)
+ (modules test_intrinsic_surface)
+ (libraries
+  sarek
+  sarek.float64
+  sarek.codegen
+  sarek_stdlib
+  sarek_ppx_lib
+  sarek_registry
+  sarek_ir
+  opencl_gate
+  alcotest
+  str
+  unix))
+
+; backlog-165: the TRIGGER CONDITIONS of Sarek_lower_ir's two ppx-time refusals
+; (barrier-bearing constant initializer; a helper that both references and
+; rebinds a constant name). Both refusals are `raise_errorf`s and this tree has
+; no negative-compile infrastructure, so before this test each was code observed
+; firing exactly once by hand. This pins the PREDICATES that decide to refuse,
+; not the raise — see the test's header for that boundary stated explicitly.
+;
+; Links sarek_frontend directly (a plain wrapped-false library with no .mli),
+; the same way sarek/tests/e2e/test_stdlib_meta_proof does.
+
+(test
+ (name test_lower_ir_refusal_triggers)
+ (modules test_lower_ir_refusal_triggers)
+ (libraries sarek_frontend))
+
+; Audit finding M8: Sarek_worklist.Host.drive must stop at the first OVERFLOW.
+; The e2e worklist test needs a device and never calls drive on an overflowing
+; queue, so the guard at Sarek_worklist.ml:208 was pinned by nothing. drive is
+; pure host logic, so this drives it against a simulated device - CPU-only.
+
+(test
+ (name test_worklist_drive)
+ (modules test_worklist_drive)
+ (libraries sarek.worklist spoc_core alcotest))
+
+; Audit finding L1: the tuple-shape registry's build-and-insert must be
+; single-winner, so concurrent first-time builders of one shape all observe the
+; SAME custom_type (hence the same Type_id the Native path resolves through
+; descriptor_by_name). Multi-domain; see the file header for what this test can
+; and cannot decide about the data-race half of the fix.
+
+(test
+ (name test_tuple_vec_registry)
+ (modules test_tuple_vec_registry)
+ (libraries sarek.tuple_vec spoc_core spoc.ir alcotest))

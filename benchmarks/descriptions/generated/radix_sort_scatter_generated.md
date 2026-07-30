@@ -51,17 +51,17 @@ layout(std430, set=0, binding = 2) buffer Buffer_counters {
   int counters[];
 };
 layout(push_constant) uniform PushConstants {
-  int inputv_len;
-  int outputv_len;
-  int counters_len;
+  int sarek_inputv_length;
+  int sarek_outputv_length;
+  int sarek_counters_length;
   int n;
   int shift;
   int mask;
 } pc;
 
-#define inputv_len pc.inputv_len
-#define outputv_len pc.outputv_len
-#define counters_len pc.counters_len
+#define sarek_inputv_length pc.sarek_inputv_length
+#define sarek_outputv_length pc.sarek_outputv_length
+#define sarek_counters_length pc.sarek_counters_length
 #define n pc.n
 #define shift pc.shift
 #define mask pc.mask
@@ -82,6 +82,7 @@ void main() {
 ```metal
 #include <metal_stdlib>
 using namespace metal;
+#pragma METAL fp contract(off)
 
 kernel void sarek_kern(device int* input [[buffer(0)]], constant int &sarek_input_length [[buffer(1)]], device int* output [[buffer(2)]], constant int &sarek_output_length [[buffer(3)]], device atomic_int* counters [[buffer(4)]], constant int &sarek_counters_length [[buffer(5)]], constant int &n [[buffer(6)]], constant int &shift [[buffer(7)]], constant int &mask [[buffer(8)]],
 uint3 __metal_gid [[thread_position_in_grid]],

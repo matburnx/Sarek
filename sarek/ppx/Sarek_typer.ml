@@ -40,6 +40,18 @@ let unify_or_error t1 t2 loc =
   | Ok () -> Ok ()
   | Error (Cannot_unify (t1, t2)) -> Error [Cannot_unify (t1, t2, loc)]
   | Error (Occurs_check (_, t)) -> Error [Recursive_type (t, loc)]
+  | Error Float16_where_numeric_required ->
+      (* A generalized numeric operand instantiated at f16 — e.g. a polymorphic
+         helper's parameter. Report the same actionable message a directly
+         f16-typed operand gets, rather than "Cannot unify types: 't3[0] and
+         float16", which names a variable the user never wrote. *)
+      Error
+        [
+          Float16_operand
+            ( "a polymorphic helper instantiated at float16 (its body requires \
+               a numeric type)",
+              loc );
+        ]
 
 (** {1 Reserved-Prefix Policy}
 
@@ -91,12 +103,37 @@ let check_reserved_prefix_all (names : string list) (loc : Sarek_ast.loc) :
     @return Ok () if numeric, Error with type mismatch otherwise
 
     See also: {!Sarek_types.is_numeric} for bool predicate version. *)
-let check_numeric t loc =
+let check_numeric ?(what = "this operator") t loc =
   match repr t with
   | TPrim TInt32 -> Ok ()
   | TReg (Int64 | Int | Float32 | Float64) -> Ok ()
-  | TVar _ -> Ok () (* Will be constrained later *)
+  | TReg Float16 ->
+      (* #57 slice 1 review, MF4b. The fall-through below reported this as
+         [expected int32, got float16], which is both misleading (int32 is not
+         what is wanted) and unactionable. f16 has ONE remedy and the message
+         names it. *)
+      Error [Float16_operand (what, loc)]
+  | TVar _ as tv ->
+      (* An operand type may still be unresolved here. Plain [Ok ()] left it
+         unchecked forever (MF4b): nothing re-examined the operator once
+         unification bound the tvar. Record the constraint instead, so a later
+         link to float16 is refused in [unify]. *)
+      register_numeric_required tv ;
+      Ok ()
   | t -> Error [Type_mismatch {expected = t_int32; got = t; loc}]
+
+(** Reject a float16 operand for an operator that is not numeric-checked (the
+    equality and boolean/bitwise families). f16 is storage-only, so no operator
+    may see it — [Eq]/[Ne] skipped {!check_numeric} entirely, which is how
+    [a.(i) = b.(i)] on a [float16 vector] compiled and emitted
+    [a[tid] == b[tid]] on [__half] (#57 slice 1 review, MF4a). *)
+let reject_float16 ~what t loc =
+  match repr t with
+  | TReg Float16 -> Error [Float16_operand (what, loc)]
+  | TVar _ as tv ->
+      register_numeric_required tv ;
+      Ok ()
+  | _ -> Ok ()
 
 (** Check that a type is integer (int32, int64, int).
 
@@ -177,36 +214,68 @@ let rec type_of_type_expr_ctx env (ctx : tvar_ctx) te =
 let type_of_type_expr_env env te =
   type_of_type_expr_ctx env (fresh_tvar_ctx ~level:env.current_level ()) te
 
+(** Human-readable operator name for diagnostics. *)
+let binop_name = function
+  | Add -> "'+' / '+.'"
+  | Sub -> "'-' / '-.'"
+  | Mul -> "'*' / '*.'"
+  | Div -> "'/' / '/.'"
+  | Mod -> "'mod'"
+  | And -> "'&&'"
+  | Or -> "'||'"
+  | Eq -> "'='"
+  | Ne -> "'<>'"
+  | Lt -> "'<'"
+  | Le -> "'<='"
+  | Gt -> "'>'"
+  | Ge -> "'>='"
+  | Land -> "'land'"
+  | Lor -> "'lor'"
+  | Lxor -> "'lxor'"
+  | Lsl -> "'lsl'"
+  | Lsr -> "'lsr'"
+  | Asr -> "'asr'"
+
 (** Infer type of a binary operation *)
 let infer_binop op t1 t2 loc =
+  let what = binop_name op in
   match op with
   | Add | Sub | Mul | Div ->
       (* Numeric ops: both operands same type, result same type *)
       let* () = unify_or_error t1 t2 loc in
-      let* () = check_numeric t1 loc in
+      let* () = check_numeric ~what t1 loc in
       Ok t1
   | Mod ->
       (* Integer only *)
       let* () = unify_or_error t1 t2 loc in
+      let* () = reject_float16 ~what t1 loc in
       let* () = check_integer t1 loc in
       Ok t1
   | Eq | Ne ->
-      (* Equality: both same type, result bool *)
+      (* Equality: both same type, result bool.
+         No [check_numeric] here on purpose — equality is legal on bool, records
+         and variants. But it is NOT legal on f16, and skipping every check is
+         what let `a.(i) = b.(i)` on a float16 vector compile (MF4a). *)
       let* () = unify_or_error t1 t2 loc in
+      let* () = reject_float16 ~what t1 loc in
+      let* () = reject_float16 ~what t2 loc in
       Ok t_bool
   | Lt | Le | Gt | Ge ->
       (* Comparison: both same numeric type, result bool *)
       let* () = unify_or_error t1 t2 loc in
-      let* () = check_numeric t1 loc in
+      let* () = check_numeric ~what t1 loc in
       Ok t_bool
   | And | Or ->
       (* Boolean ops *)
+      let* () = reject_float16 ~what t1 loc in
+      let* () = reject_float16 ~what t2 loc in
       let* () = check_boolean t1 loc in
       let* () = check_boolean t2 loc in
       Ok t_bool
   | Land | Lor | Lxor | Lsl | Lsr | Asr ->
       (* Bitwise ops: integer only *)
       let* () = unify_or_error t1 t2 loc in
+      let* () = reject_float16 ~what t1 loc in
       let* () = check_integer t1 loc in
       Ok t1
 
@@ -214,12 +283,14 @@ let infer_binop op t1 t2 loc =
 let infer_unop op t loc =
   match op with
   | Neg ->
-      let* () = check_numeric t loc in
+      let* () = check_numeric ~what:"unary '-' / '-.'" t loc in
       Ok t
   | Not ->
+      let* () = reject_float16 ~what:"'not'" t loc in
       let* () = check_boolean t loc in
       Ok t_bool
   | Lnot ->
+      let* () = reject_float16 ~what:"'lnot'" t loc in
       let* () = check_integer t loc in
       Ok t
 
@@ -789,7 +860,26 @@ let rec infer (env : t) (expr : expr) : (texpr * t) result =
           (* Regular function application *)
           let ret_ty = fresh_tvar () in
           let expected_fn_ty = TFun (List.map (fun t -> t.ty) targs, ret_ty) in
-          let* () = unify_or_error tfn.ty expected_fn_ty fn.expr_loc in
+          let* () =
+            (* When the callee is NAMED, say so. A bare [Cannot_unify] here
+               reads "Cannot unify types: float32 and float64" and names
+               neither the helper nor why it is constrained, which is the
+               reported failure mode for a polymorphic [@sarek.module] helper
+               instantiated at a non-default element type (#97). *)
+            match unify_or_error tfn.ty expected_fn_ty fn.expr_loc with
+            | Ok () -> Ok ()
+            | Error errs -> (
+                match fn.e with
+                | EVar callee ->
+                    Error
+                      (List.map
+                         (function
+                           | Cannot_unify (t1, t2, l) ->
+                               Instantiation_mismatch {callee; t1; t2; loc = l}
+                           | e -> e)
+                         errs)
+                | _ -> Error errs)
+          in
           Ok (mk_texpr (TEApp (tfn, targs)) (repr ret_ty) loc, env))
   (* Let bindings *)
   | EAssign _ | ELet _ | ELetMut _ | ELetRec _ ->
@@ -848,6 +938,16 @@ let rec infer (env : t) (expr : expr) : (texpr * t) result =
             loc,
           env' )
   | ESuperstep (name, divergent, step_body, cont) ->
+      (* The superstep name is a user-written binder: guard it against the
+         reserved-name policy exactly as other binders (see [MFun]) — a
+         reserved C/CUDA/OpenCL keyword or the generated [sarek_] prefix. Latent
+         today (the name is never emitted as an identifier), but this closes the
+         collision class should a future emission path use it. *)
+      let* () =
+        if Sarek_reserved.is_reserved name then
+          Error [Reserved_keyword (name, loc)]
+        else check_reserved_prefix name loc
+      in
       (* Type the superstep body - should be unit *)
       let* tstep_body, env = infer env step_body in
       let* () = unify_or_error tstep_body.ty t_unit step_body.expr_loc in
@@ -1160,7 +1260,20 @@ let infer_kernel (env : t) (kernel : Sarek_ast.kernel) : tkernel result =
                  so it can reference itself in its body *)
               let param_types = List.map (fun p -> p.tparam_type) tparams in
               let ret_type_var =
-                TVar (ref (Unbound (fresh_var_id (), env_inner.current_level)))
+                (* [fresh_tvar_id], NOT [fresh_var_id] (backlog-183). This was
+                   the only site in the tree drawing a TYPE-variable id from the
+                   TERM-variable counter ([Sarek_typed_ast.var_id_counter]);
+                   every other tvar uses [Sarek_types.tvar_counter]. Two separate
+                   [Atomic]s, both starting at 0, so the two id spaces overlapped.
+
+                   Not cosmetic since [float_literal_ids] and
+                   [numeric_required_ids] landed: both are keyed on tvar ids and
+                   consulted inside [unify] as set membership, so an id leaked
+                   from the term counter could be spuriously present in one of
+                   them and REJECT A LEGAL PROGRAM. Reachable for any kernel with
+                   a recursive local function, which is what this placeholder is
+                   for. *)
+                TVar (ref (Unbound (fresh_tvar_id (), env_inner.current_level)))
               in
               let fn_ty_placeholder = TFun (param_types, ret_type_var) in
               let env_body =

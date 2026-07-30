@@ -82,15 +82,15 @@ layout(std430, set=0, binding = 1) buffer Buffer_histogram {
   int histogram[];
 };
 layout(push_constant) uniform PushConstants {
-  int inputv_len;
-  int histogram_len;
+  int sarek_inputv_length;
+  int sarek_histogram_length;
   int n;
   int shift;
   int mask;
 } pc;
 
-#define inputv_len pc.inputv_len
-#define histogram_len pc.histogram_len
+#define sarek_inputv_length pc.sarek_inputv_length
+#define sarek_histogram_length pc.sarek_histogram_length
 #define n pc.n
 #define shift pc.shift
 #define mask pc.mask
@@ -130,6 +130,7 @@ void main() {
 ```metal
 #include <metal_stdlib>
 using namespace metal;
+#pragma METAL fp contract(off)
 
 kernel void sarek_kern(device int* input [[buffer(0)]], constant int &sarek_input_length [[buffer(1)]], device atomic_int* histogram [[buffer(2)]], constant int &sarek_histogram_length [[buffer(3)]], constant int &n [[buffer(4)]], constant int &shift [[buffer(5)]], constant int &mask [[buffer(6)]],
 uint3 __metal_gid [[thread_position_in_grid]],

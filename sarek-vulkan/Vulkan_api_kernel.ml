@@ -113,8 +113,41 @@ let validate_buffer_indices ~expected_count
               (List.map (fun (idx, _) -> string_of_int idx) entries)))
     else Ok ()
 
-(* Compilation cache *)
-let cache : (string, t) Hashtbl.t = Hashtbl.create 16
+(* Compilation cache (compiled compute pipelines). Guarded against concurrent
+   multi-domain access by [Spoc_framework.Guarded_cache]: lookup/insert and
+   clearing are atomic critical sections, while GLSL->SPIR-V compilation and
+   pipeline creation run outside the lock. The on-disk SPIR-V cache
+   ([Framework_cache]) is a separate layer. *)
+let cache : (string, t) Spoc_framework.Guarded_cache.t =
+  Spoc_framework.Guarded_cache.create
+    ~destroy:(fun k ->
+      vkDestroyPipeline k.device.Device.device k.pipeline null ;
+      vkDestroyPipelineLayout k.device.Device.device k.pipeline_layout null ;
+      vkDestroyDescriptorPool k.device.Device.device k.descriptor_pool null ;
+      vkDestroyDescriptorSetLayout
+        k.device.Device.device
+        k.descriptor_set_layout
+        null ;
+      vkDestroyShaderModule k.device.Device.device k.shader_module null)
+    ()
+
+(* Per-device eviction (#90). Every object [destroy] above releases belongs to
+   [k.device.Device.device], so they MUST be released before that logical
+   device is destroyed — otherwise [Vulkan_api_device.destroy] takes the device
+   down under them and the entries stay in this table, referencing a dead
+   VkDevice, to be handed to the next [compile_cached] for a recreated index.
+   [Vulkan_api_device.destroy] fires the notification before it destroys
+   anything, so this listener runs while the device is still alive.
+
+   Registered on [Cache_hooks] rather than on a Vulkan-private hook list because
+   [Vulkan_api_device] is compiled before this module and cannot reference it —
+   the same constraint CUDA and HIP solve the same way. Match on the family
+   name, never on the index alone: backend-local indices collide across
+   backends. *)
+let () =
+  Spoc_framework.Cache_hooks.on_device_destroy (fun ~backend index ->
+      if String.equal backend "Vulkan" then
+        Spoc_framework.Guarded_cache.evict_device cache index)
 
 (** Create shader module from SPIR-V *)
 let create_shader_module device spirv =
@@ -156,10 +189,19 @@ let create_shader_module device spirv =
        (addr create_info)
        null
        shader_module) ;
+  (* [create_info.pCode] holds a bare address into [code]; [setf] dropped the
+     fat pointer that rooted it, so [code] must be kept reachable across the
+     call or the GC may free the SPIR-V out from under the driver. *)
+  ignore (Sys.opaque_identity code) ;
   !@shader_module
 
 (** Compile GLSL source to compute pipeline *)
 let compile device ~name ~source =
+  (* Same hazard as [launch] below: Vulkan reads through the pointers we store
+     into the *CreateInfo structs during the call, but [setf] keeps only the
+     bare address, dropping the fat pointer that rooted the referent. Every
+     such referent must stay reachable until the call returns. *)
+  let keep = Sys.opaque_identity in
   (* 1. Check cache for SPIR-V *)
   let driver_version =
     let maj, min, patch = device.Device.api_version in
@@ -250,6 +292,7 @@ let compile device ~name ~source =
        (addr dsl_create_info)
        null
        dsl) ;
+  ignore (keep bindings) ;
 
   (* Create pipeline layout *)
   let pl_create_info = make vk_pipeline_layout_create_info in
@@ -286,6 +329,8 @@ let compile device ~name ~source =
        (addr pl_create_info)
        null
        pipeline_layout) ;
+  ignore (keep push_constant_range) ;
+  ignore (keep dsl) ;
 
   (* Create compute pipeline *)
   let stage_info = make vk_pipeline_shader_stage_create_info in
@@ -300,7 +345,11 @@ let compile device ~name ~source =
     shader_stage_stage
     (Unsigned.UInt32.of_int vk_shader_stage_compute_bit) ;
   setf stage_info shader_stage_module shader_module ;
-  setf stage_info shader_stage_pName "main" ;
+  (* Held explicitly: [stage_info] is copied BY VALUE into [pipeline_info]
+     below, so even keeping [stage_info] alive would not root the entry-point
+     string buffer. *)
+  let entry_name = CArray.of_string "main" in
+  setf stage_info shader_stage_pName (CArray.start entry_name) ;
   setf stage_info shader_stage_pSpecializationInfo null ;
 
   let pipeline_info = make vk_compute_pipeline_create_info in
@@ -326,6 +375,8 @@ let compile device ~name ~source =
       pipeline
   in
   check "vkCreateComputePipelines" result ;
+  ignore (keep entry_name) ;
+  ignore (keep stage_info) ;
 
   (* Create descriptor pool *)
   let pool_size = make vk_descriptor_pool_size in
@@ -350,6 +401,7 @@ let compile device ~name ~source =
   check
     "vkCreateDescriptorPool"
     (vkCreateDescriptorPool device.Device.device (addr pool_info) null pool) ;
+  ignore (keep pool_size) ;
 
   (* Allocate persistent descriptor set *)
   let ds_ai = make vk_descriptor_set_allocate_info in
@@ -368,7 +420,7 @@ let compile device ~name ~source =
   check
     "vkAllocateDescriptorSets"
     (vkAllocateDescriptorSets device.Device.device (addr ds_ai) desc_set) ;
-  ignore dsl_ptr ;
+  ignore (keep dsl_ptr) ;
   {
     shader_module;
     pipeline = !@pipeline;
@@ -393,26 +445,19 @@ let compile_cached device ~name ~source =
       ~source
       ()
   in
-  match Hashtbl.find_opt cache key with
-  | Some k -> k
-  | None ->
-      let k = compile device ~name ~source in
-      Hashtbl.add cache key k ;
-      k
+  (* [~device_id] is the same backend-local index the key already carries;
+     without it the entry is not grouped by device and [evict_device] can never
+     reach it, which is why per-device eviction used to be inexpressible here
+     at either layer (#90). *)
+  Spoc_framework.Guarded_cache.find_or_build
+    cache
+    ~key
+    ~device_id:device.Device.id
+    (fun () -> compile device ~name ~source)
 
 let clear_cache () =
-  Hashtbl.iter
-    (fun _ k ->
-      vkDestroyPipeline k.device.Device.device k.pipeline null ;
-      vkDestroyPipelineLayout k.device.Device.device k.pipeline_layout null ;
-      vkDestroyDescriptorPool k.device.Device.device k.descriptor_pool null ;
-      vkDestroyDescriptorSetLayout
-        k.device.Device.device
-        k.descriptor_set_layout
-        null ;
-      vkDestroyShaderModule k.device.Device.device k.shader_module null)
-    cache ;
-  Hashtbl.clear cache
+  Spoc_framework.Cache_hooks.around_clear (fun () ->
+      Spoc_framework.Guarded_cache.clear cache)
 
 let create_args () =
   {

@@ -46,8 +46,32 @@ type memspace = Global | Shared | Local
 type elttype =
   | TInt32
   | TInt64
+  | TFloat16
+      (** IEEE binary16 {e storage} type. Values are stored/loaded as binary16;
+          arithmetic promotes to [TFloat32], computes there, and rounds back on
+          store. There is deliberately no [CFloat16] constant: f16 values are
+          produced by conversion ([ECast (TFloat16, _)]), never by a literal. *)
   | TFloat32
   | TFloat64
+  | TUint8
+      (** Unsigned 8-bit integer {e storage} type (backlog-62 slice 3).
+
+          It exists for one reason and its scope is deliberately that narrow: it
+          is the element type of a cooperative-matrix OPERAND BUFFER. Every one
+          of the twelve integer configurations the local RX 7900 XTX advertises
+          has 8-bit operands with a 32-bit accumulator, and [coopMatLoad]
+          requires the backing array's element type to MATCH the fragment's
+          component type — so there is no route to an integer fragment through a
+          wider buffer, and no way to reach the strict-contract tensor-core path
+          without an 8-bit element type in the IR.
+
+          There is no arithmetic on it. No binop, no literal, no cast to or from
+          it is emitted by any backend; a [TUint8] value reaches a kernel only
+          by being read by {!Sarek_ir_types.CM_load} and leaves only by
+          {!Sarek_ir_types.CM_store}. That is not an oversight to be filled in
+          later — widening it into a general arithmetic type is a separate
+          decision with its own promotion and overflow questions, and this slice
+          measured none of them. *)
   | TBool
   | TUnit
   | TRecord of string * (string * elttype) list
@@ -161,6 +185,89 @@ type stmt =
       gpu : framework:string -> string;  (** Generate GPU code for framework *)
       ocaml : ocaml_closure;  (** Typed OCaml fallback *)
     }  (** Inline native GPU code with OCaml fallback *)
+  | SCoopmat of coopmat_op
+      (** A cooperative-matrix (tensor-core) operation — backlog-62 slice 3.
+
+          {b Why ONE statement constructor carrying an operation family, rather
+             than four constructors.} Seventeen places in this repository match
+          exhaustively on {!stmt}, and most of them are backends whose only
+          correct response to any of these operations is the same refusal. Four
+          constructors would be sixty-eight arms to write and to keep in
+          agreement; one is seventeen, and a backend that handles [SCoopmat] at
+          all is then forced by the compiler to consider every member of
+          {!coopmat_op} in one place where the four cases sit next to each
+          other.
+
+          {b Why fragments are NOT [var]s and NOT an [elttype].} A fragment is a
+          subgroup-cooperative value: the whole subgroup collectively holds
+          [rows * columns] components and each invocation holds a few of them at
+          an implementation-defined position. It cannot be indexed, assigned to,
+          added, cast, passed to a helper, or stored in an array. Giving it an
+          {!elttype} would make every one of those spellable in the IR and would
+          oblige ~36 exhaustive [elttype] matches to invent an answer for a type
+          none of them can represent. Fragments therefore live in their own
+          namespace, addressed by name, and the only things that can be done to
+          one are the four below. *)
+
+(** The four things that can be done with a cooperative-matrix fragment.
+
+    Fragment names live in a namespace of their own, separate from {!var}. They
+    are plain strings for the same reason an [SShared] array name is: a fragment
+    is not an l-value, cannot be captured, and cannot escape the kernel body, so
+    there is nothing for a [var]'s mutability or type field to carry that
+    {!Sarek_coopmat_types.fragment} does not already say. *)
+and coopmat_op =
+  | CM_decl of {name : string; frag : Sarek_coopmat_types.fragment}
+      (** Bring a fragment into scope for the rest of the enclosing block.
+
+          Statement-level rather than a scoping form like {!SLet}, because GLSL,
+          MSL and C all admit a declaration in the middle of a block and because
+          [D = A * B + C] wants four fragments live at once — nesting four
+          [SLet]-shaped binders to express that is noise with no invariant
+          behind it. *)
+  | CM_load of {
+      dst : string;
+      frag : Sarek_coopmat_types.fragment;
+      src : string;
+      index : expr;
+      stride : expr;
+    }
+      (** Fill [dst] from the buffer [src], row-major, starting at element
+          [index], with [stride] elements between consecutive rows.
+
+          [frag] is repeated here rather than looked up from the [CM_decl]: a
+          codegen backend must be able to emit this statement without carrying a
+          fragment environment, and an interpreter must be able to CHECK the two
+          agree. A single source of truth that every consumer has to reconstruct
+          is not a single source of truth.
+
+          Column-major is deliberately absent. It is one more enumerant in GLSL,
+          but it is a second layout to verify on hardware and this slice
+          measured only row-major — an emitted layout nothing has executed is a
+          claim without evidence. *)
+  | CM_store of {
+      src : string;
+      frag : Sarek_coopmat_types.fragment;
+      dst : string;
+      index : expr;
+      stride : expr;
+    }  (** The inverse of {!CM_load}. *)
+  | CM_muladd of {
+      dst : string;
+      a : string;
+      b : string;
+      c : string;
+      cfg : Sarek_coopmat_types.config;
+    }
+      (** [dst = a * b + c], the tensor-core instruction itself.
+
+          [cfg] is the whole point of carrying a configuration rather than four
+          fragments: it is what the device gate is keyed on, it is what says
+          whether the accumulation SATURATES (a property of the operation and
+          not of any operand), and it is what
+          {!Sarek_coopmat_types.accumulation_is_exact} reads to decide whether
+          this statement is under the strict contract or needs the relaxation of
+          docs/design/f16-relaxed-accuracy.md §1.6. *)
 
 (** Declarations *)
 and decl =
@@ -280,3 +387,41 @@ type kernel = {
   kern_native_fn : native_fn_t option;
       (** Optional pre-compiled native function for CPU execution *)
 }
+
+(** A kernel with every field at its empty value, for use as the base of a
+    record update: [{default_kernel with kern_name = "k"; kern_body = b}].
+
+    WHY THIS EXISTS. OCaml requires every field at every record literal, so
+    adding one field to {!kernel} used to mean editing all 119 construction
+    sites in the tree — which is why the type has been avoided rather than
+    extended. A record UPDATE names only the fields it sets, so once a site is
+    written this way a new field costs it nothing.
+
+    Prefer this over spelling out the empty fields. {!make_kernel} is the same
+    thing with labels, for new code that would otherwise set most fields. *)
+let default_kernel =
+  {
+    kern_name = "";
+    kern_params = [];
+    kern_locals = [];
+    kern_body = SEmpty;
+    kern_types = [];
+    kern_variants = [];
+    kern_funcs = [];
+    kern_native_fn = None;
+  }
+
+(** {!default_kernel} with labels. [~name] and [~body] are required because a
+    kernel with neither is not a kernel; everything else defaults to empty. *)
+let make_kernel ?(params = []) ?(locals = []) ?(types = []) ?(variants = [])
+    ?(funcs = []) ?native_fn ~name ~body () =
+  {
+    kern_name = name;
+    kern_params = params;
+    kern_locals = locals;
+    kern_body = body;
+    kern_types = types;
+    kern_variants = variants;
+    kern_funcs = funcs;
+    kern_native_fn = native_fn;
+  }

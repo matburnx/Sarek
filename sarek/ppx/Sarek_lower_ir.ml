@@ -26,10 +26,50 @@ let rec elttype_of_typ (ty : typ) : Ir.elttype =
   | TPrim TUnit -> Ir.TUnit
   | TReg Int64 -> Ir.TInt64
   | TReg Int -> Ir.TInt32 (* int maps to int32 on GPU *)
+  | TReg Float16 -> Ir.TFloat16
   | TReg Float32 -> Ir.TFloat32
   | TReg Float64 -> Ir.TFloat64
-  | TReg Char -> Ir.TInt32 (* char represented as int32 *)
-  | TReg (Custom _) -> Ir.TInt32 (* Custom types handled separately *)
+  | TReg Char ->
+      (* WRONG-WIDTH #5. `char` used to lower to [Ir.TInt32] "represented as
+         int32". It is not: [Spoc_core.Vector.char] is a Bigarray of OCaml
+         chars — ONE byte per element — while the device declaration produced
+         from [Ir.TInt32] is `int*`, four. A `char vector` kernel therefore
+         compiled clean and strode the buffer at 4x the host's element size,
+         with no diagnostic anywhere in the pipeline.
+
+         There is no 1-byte element type in the IR to map it to, so the honest
+         answer is to refuse rather than to guess a width. Nothing is lost by
+         refusing: [Execute.check_launch_args] already rejects a [Vector.Char]
+         argument against a [TInt32] parameter on physical width (see
+         test_float16.test_argcheck_width_fallback_for_unmappable_kinds), on
+         BOTH the device and the interpreter entry points — so a `char vector`
+         kernel could never launch on any backend. All this arm changes is WHEN
+         the user is told, and by a message that names the cause.
+
+         Same shape and same remedy as the float16 rejections
+         ([lower_param]'s scalar-parameter arm, Sarek_ir_layout, Soa). *)
+      Ppxlib.Location.raise_errorf
+        ~loc:Ppxlib.Location.none
+        "`char` is not a supported Sarek element type: a host `char` is 1 byte \
+         (Spoc_core.Vector.char) but the device IR has no 1-byte element type, \
+         so it would be accessed through a 4-byte `int`. Use `int32` (and \
+         convert on the host) instead."
+  | TReg (Custom name) ->
+      (* Same class as the [Char] arm above: a registered custom type is a
+         user-declared aggregate whose size comes from its registered layout,
+         so collapsing it to [Ir.TInt32] ("Custom types handled separately")
+         claims a 4-byte scalar for something that is generally neither 4 bytes
+         nor a scalar. Record and variant types reach lowering as
+         [TRecord]/[TVariant] with their fields, which are handled above; a
+         bare [TReg (Custom _)] is a type name that was never registered as a
+         Sarek type (it comes from [%sarek_intrinsic]'s fallback for unknown
+         type names), and its layout is genuinely unknown here. *)
+      Ppxlib.Location.raise_errorf
+        ~loc:Ppxlib.Location.none
+        "Type %S is not a registered Sarek type, so its device size is \
+         unknown. Declare it with [@@sarek.type] (records and variants), or \
+         use a built-in scalar type."
+        name
   | TVec elem_ty -> Ir.TVec (elttype_of_typ elem_ty)
   | TArr (elem_ty, mem) ->
       let ir_mem =
@@ -195,114 +235,229 @@ let memspace_of_memspace (mem : Sarek_types.memspace) : Ir.memspace =
   | Sarek_types.Shared -> Ir.Shared
   | Sarek_types.Local -> Ir.Local
 
-(** Get C type string for a typ *)
-let rec c_type_of_typ ty =
-  match repr ty with
-  | TPrim TInt32 -> "int"
-  | TPrim TBool -> "int"
-  | TPrim TUnit -> "void"
-  | TReg Int -> "int"
-  | TReg Int64 -> "long"
-  | TReg Float32 -> "float"
-  | TReg Float64 -> "double"
-  | TReg Char -> "char"
-  | TReg (Custom name) -> mangle_type_name name
-  | TRecord (name, _) -> "struct " ^ mangle_type_name name ^ "_sarek"
-  | TVariant (name, _) -> "struct " ^ mangle_type_name name ^ "_sarek"
-  | TVec t -> c_type_of_typ t ^ " *"
-  | TArr (t, _) -> c_type_of_typ t ^ " *"
-  | _ -> "int"
+(* REMOVED: [c_type_of_typ] / [record_constructor_strings] /
+   [variant_constructor_strings].
 
-(** Generate C struct definition and builder for record types *)
-let record_constructor_strings name (fields : (string * typ) list) =
-  let name = mangle_type_name name in
-  let struct_name = name ^ "_sarek" in
-  let struct_fields =
-    List.map
-      (fun (fname, fty) -> "  " ^ c_type_of_typ fty ^ " " ^ fname ^ ";")
-      fields
-  in
-  let struct_def =
-    "struct " ^ struct_name ^ " {\n" ^ String.concat "\n" struct_fields ^ "\n};"
-  in
-  let params =
-    String.concat
-      ", "
-      (List.map (fun (fname, fty) -> c_type_of_typ fty ^ " " ^ fname) fields)
-  in
-  let assigns =
-    String.concat
-      "\n"
-      (List.map
-         (fun (fname, _) -> "  res." ^ fname ^ " = " ^ fname ^ ";")
-         fields)
-  in
-  let builder =
-    "struct " ^ struct_name ^ " build_" ^ struct_name ^ "(" ^ params ^ ") {\n"
-    ^ "  struct " ^ struct_name ^ " res;\n" ^ assigns ^ "\n  return res;\n}"
-  in
-  [struct_def; builder]
+   These emitted C struct/union/builder source strings for registered record
+   and variant types, which [lower_kernel] returned and [Sarek_quote] passed
+   to [Sarek.Kirc_types.register_constructor_string]. That function appends to
+   [Kirc_types.constructors], a list that NOTHING in the tree ever reads: the
+   C-family backends build variant/record definitions themselves from
+   [kern_types]/[kern_variants] via [Sarek_ir_codegen.gen_variant_def], and
+   have done so since the Sarek_ir cutover. The strings were write-only.
 
-(** Generate C struct definitions and builders for variant types *)
-let variant_constructor_strings name constrs =
-  let name = mangle_type_name name in
-  let struct_name = name ^ "_sarek" in
-  let constr_structs =
-    List.map
-      (fun (cname, carg) ->
-        let field =
-          match carg with
-          | None -> "  int " ^ name ^ "_sarek_" ^ cname ^ "_t;"
-          | Some ty ->
-              "  " ^ c_type_of_typ ty ^ " " ^ name ^ "_sarek_" ^ cname ^ "_t;"
-        in
-        "struct " ^ name ^ "_sarek_" ^ cname ^ " {\n" ^ field ^ "\n};")
-      constrs
-  in
-  let union_fields =
-    List.map
-      (fun (cname, _) ->
-        "  struct " ^ name ^ "_sarek_" ^ cname ^ " " ^ name ^ "_sarek_" ^ cname
-        ^ ";")
-      constrs
-  in
-  let union_def =
-    "union " ^ name ^ "_sarek_union {\n"
-    ^ String.concat "\n" union_fields
-    ^ "\n};"
-  in
-  let main_struct =
-    "struct " ^ struct_name ^ " {\n" ^ "  int " ^ name ^ "_sarek_tag;\n"
-    ^ "  union " ^ name ^ "_sarek_union " ^ name ^ "_sarek_union;\n" ^ "};"
-  in
-  let builders =
-    List.mapi
-      (fun idx (cname, carg) ->
-        let params, assign =
-          match carg with
-          | None -> ("", "  /* no payload */")
-          | Some ty ->
-              let pname = "v" in
-              ( c_type_of_typ ty ^ " " ^ pname,
-                "  res." ^ name ^ "_sarek_union." ^ name ^ "_sarek_" ^ cname
-                ^ "." ^ name ^ "_sarek_" ^ cname ^ "_t = " ^ pname ^ ";" )
-        in
-        "struct " ^ struct_name ^ " build_" ^ name ^ "_" ^ cname ^ "(" ^ params
-        ^ ") {\n" ^ "  struct " ^ struct_name ^ " res;\n" ^ "  res." ^ name
-        ^ "_sarek_tag = " ^ string_of_int idx ^ ";\n" ^ assign ^ "\n"
-        ^ "  return res;\n}")
-      constrs
-  in
-  constr_structs @ (union_def :: main_struct :: builders)
+   They are removed rather than repaired because they could not be repaired.
+   [c_type_of_typ] ended in the wildcard [| _ -> "int"] — the
+   silently-succeeding shape of the wrong-width family, which declared 2-byte
+   float16 members as 4-byte `int`. Replacing that wildcard with the explicit
+   rejection the class demands immediately broke a real kernel
+   (sarek/tests/e2e/test_static_tag_erasure.ml), because this path is handed
+   types it has no C name for and depended on the placeholder to keep going.
+   A generator that only works while it is silently wrong, and whose output no
+   one reads, is dead weight with a live hazard attached. *)
 
 (* Debug counters for IR lowering *)
 let ir_lower_expr_count = ref 0
 
 let ir_lower_stmt_count = ref 0
 
+(* ── module constants referenced from a helper body (backlog-160) ─────────
+   A module constant is lexically visible inside a helper, but lowering puts it
+   in the KERNEL body while helpers are emitted out-of-line — so the helper names
+   an identifier its translation unit never declares. Emitted CUDA, verbatim:
+
+     __device__ float apply(float x) { return (x * scale); }
+     __global__ void k(...) { float scale = 2.0f; ... }
+
+   SEVEN paths break that way (CUDA-C, OpenCL, Metal, GLSL, WGSL, PTX and the
+   Interpreter); only Native works, because it emits an OCaml [let] the helper
+   closes over. A CPU-passes / device-fails divergence.
+
+   THE FIX IS TO PREFIX, NOT TO HOIST. Emitting the constants as top-level
+   [const] / [__constant] / [constant] / [__device__ const] declarations was the
+   first plan and it is unsound: a module-constant initializer is an arbitrary
+   kernel expression — the pipeline explicitly anticipates thread-dependent ones
+   (Sarek_convergence analyses thread/block and barrier usage) — and every one of
+   those storage classes requires a compile-time-constant initializer. Hoisting
+   [let (base : int32) = thread_idx_x] would break a kernel that compiles today.
+   Prefixing the [SLet] into the helper body handles both shapes, needs no IR
+   field and no backend change, and fixes all seven paths in one place.
+
+   ACCEPTED COST, stated because it is a real semantic change: the initializer is
+   evaluated once PER HELPER CALL instead of once per kernel. For a constant that
+   is what it says it is, that is redundant work and nothing else. For an
+   initializer containing a BARRIER it would change convergence, so that case is
+   refused rather than duplicated. *)
+
+(* FREE names of an IR statement: every [EVar]/[LVar] name that is not bound by
+   an enclosing binder. [bound] carries the binders in scope at each point.
+
+   The first version took no [bound] and collected every name, including
+   locally-bound ones, on the reasoning that over-approximating only costs a dead
+   declaration. It does not. The C-family backends emit [SLet] FLAT — [T name =
+   e;] followed by the body at the same indent, no braces — so a helper-local
+   [let c = ...] that merely SHARES a module constant's name made the constant
+   look referenced, got its [SLet] prefixed, and produced two [float c] in one
+   block: a redeclaration error on a helper that compiled fine before. Caught by
+   review on #362.
+
+   Binders covered: [SLet], [SLetMut], [SFor]. NOT match-pattern binders — those
+   stay uncovered, so a pattern-bound name still reads as free. That is the safe
+   direction (it can only over-approximate, never emit an undeclared identifier),
+   and it is why the fold below refuses a residual collision rather than assuming
+   this set is complete. *)
+let rec expr_names (e : Ir.expr) (bound : string list)
+    (acc : (string, unit) Hashtbl.t) : unit =
+  let add n = if not (List.mem n bound) then Hashtbl.replace acc n () in
+  let go a = expr_names a bound acc in
+  match e with
+  | Ir.EVar v -> add v.Ir.var_name
+  | Ir.EConst _ -> ()
+  | Ir.EBinop (_, a, b) ->
+      go a ;
+      go b
+  | Ir.EUnop (_, a) -> go a
+  | Ir.EArrayRead (n, i) ->
+      add n ;
+      go i
+  | Ir.EArrayReadExpr (b, i) ->
+      go b ;
+      go i
+  | Ir.ERecordField (b, _) -> go b
+  | Ir.EIntrinsic (_, _, args) -> List.iter go args
+  | Ir.ECast (_, a) -> go a
+  | Ir.ETuple es -> List.iter go es
+  | Ir.EApp (f, args) ->
+      go f ;
+      List.iter go args
+  | Ir.ERecord (_, fs) -> List.iter (fun (_, a) -> go a) fs
+  | Ir.EVariant (_, _, args) -> List.iter go args
+  | Ir.EArrayLen n -> add n
+  | Ir.EArrayCreate (_, sz, _) -> go sz
+  | Ir.EIf (c, t, e2) ->
+      go c ;
+      go t ;
+      go e2
+  | Ir.EMatch (sc, cases) ->
+      go sc ;
+      List.iter (fun (_, a) -> go a) cases
+
+and lvalue_names (lv : Ir.lvalue) (bound : string list)
+    (acc : (string, unit) Hashtbl.t) : unit =
+  let add n = if not (List.mem n bound) then Hashtbl.replace acc n () in
+  match lv with
+  | Ir.LVar v -> add v.Ir.var_name
+  | Ir.LArrayElem (n, i) ->
+      add n ;
+      expr_names i bound acc
+  | Ir.LArrayElemExpr (b, i) ->
+      expr_names b bound acc ;
+      expr_names i bound acc
+  | Ir.LRecordField (b, _) -> lvalue_names b bound acc
+
+and stmt_names (st : Ir.stmt) (bound : string list)
+    (acc : (string, unit) Hashtbl.t) : unit =
+  let goe e = expr_names e bound acc in
+  let gos s = stmt_names s bound acc in
+  match st with
+  | Ir.SAssign (lv, e) ->
+      lvalue_names lv bound acc ;
+      goe e
+  | Ir.SSeq sts -> List.iter gos sts
+  | Ir.SIf (c, t, e) ->
+      goe c ;
+      gos t ;
+      Option.iter gos e
+  | Ir.SWhile (c, b) ->
+      goe c ;
+      gos b
+  | Ir.SFor (v, lo, hi, _, b) ->
+      (* The bounds are evaluated outside the binding, the body inside it. *)
+      goe lo ;
+      goe hi ;
+      stmt_names b (v.Ir.var_name :: bound) acc
+  | Ir.SMatch (sc, cases) ->
+      goe sc ;
+      List.iter (fun (_, s) -> gos s) cases
+  | Ir.SReturn e -> goe e
+  | Ir.SExpr e -> goe e
+  | Ir.SLet (v, e, b) | Ir.SLetMut (v, e, b) ->
+      (* Same asymmetry: [let c = c *. 2.] genuinely references the outer [c], so
+         the initializer is walked with the OLD scope. *)
+      goe e ;
+      stmt_names b (v.Ir.var_name :: bound) acc
+  | Ir.SPragma (_, b) -> gos b
+  | Ir.SBlock b -> gos b
+  | Ir.SBarrier | Ir.SWarpBarrier | Ir.SMemFence | Ir.SEmpty -> ()
+  | Ir.SNative _ -> ()
+
+(* Every name BOUND anywhere in a statement, at any depth. Used to detect the
+   residual case the free-name fix cannot make safe: a helper that both
+   references a module constant and rebinds that same name ([let c = c *. 2.]).
+   The reference is real, so the constant must be prefixed; the rebinding then
+   emits a second declaration of the same identifier in the same flat block.
+   There is no correct code to emit, so the fold refuses. *)
+let rec stmt_binders (st : Ir.stmt) (acc : (string, unit) Hashtbl.t) : unit =
+  match st with
+  | Ir.SLet (v, _, b) | Ir.SLetMut (v, _, b) | Ir.SFor (v, _, _, _, b) ->
+      Hashtbl.replace acc v.Ir.var_name () ;
+      stmt_binders b acc
+  | Ir.SSeq sts -> List.iter (fun s -> stmt_binders s acc) sts
+  | Ir.SIf (_, t, e) ->
+      stmt_binders t acc ;
+      Option.iter (fun s -> stmt_binders s acc) e
+  | Ir.SWhile (_, b) -> stmt_binders b acc
+  | Ir.SMatch (_, cases) -> List.iter (fun (_, s) -> stmt_binders s acc) cases
+  | Ir.SPragma (_, b) | Ir.SBlock b -> stmt_binders b acc
+  | Ir.SAssign _ | Ir.SReturn _ | Ir.SExpr _ | Ir.SBarrier | Ir.SWarpBarrier
+  | Ir.SMemFence | Ir.SEmpty | Ir.SNative _ ->
+      ()
+
+(* Does this initializer contain a synchronising operation? Prefixing would
+   duplicate it per call site, which changes convergence, so that case is REFUSED
+   rather than duplicated.
+
+   The first version of this function returned [false] unconditionally, reasoning
+   that only the statement forms carry a barrier and an [Ir.expr] cannot. The
+   first half is true — no [Ir.expr] constructor holds an [Ir.stmt] — and the
+   conclusion was still wrong: barriers reach the IR as INTRINSICS
+   (Sarek_core_primitives registers [block_barrier], [memory_fence_block],
+   [memory_fence_device]; [warp_barrier] joined them in backlog-70), and
+   [EIntrinsic] is an expression. A guard that cannot fire is the defect class
+   this repository keeps closing, so it is named here rather than quietly left.
+
+   Matched by NAME because that is what the IR carries at this point: lowering
+   does not turn these into [SBarrier], it leaves them as intrinsic calls (there
+   is no barrier-specific arm in this file). If a name is added to the primitive
+   table without being added here, this guard silently stops covering it — which
+   is why the list is stated in one place and the refusal message names the
+   intrinsic it found. *)
+let synchronising_intrinsics =
+  ["block_barrier"; "warp_barrier"; "memory_fence_block"; "memory_fence_device"]
+
+let rec expr_barrier (e : Ir.expr) : string option =
+  let first =
+    List.fold_left
+      (fun acc x -> match acc with Some _ -> acc | None -> expr_barrier x)
+      None
+  in
+  match e with
+  | Ir.EIntrinsic (_, name, args) ->
+      if List.mem name synchronising_intrinsics then Some name else first args
+  | Ir.EConst _ | Ir.EVar _ | Ir.EArrayLen _ -> None
+  | Ir.EBinop (_, a, b) | Ir.EArrayReadExpr (a, b) -> first [a; b]
+  | Ir.EUnop (_, a) | Ir.ECast (_, a) | Ir.ERecordField (a, _) -> expr_barrier a
+  | Ir.EArrayRead (_, i) -> expr_barrier i
+  | Ir.EArrayCreate (_, sz, _) -> expr_barrier sz
+  | Ir.ETuple es -> first es
+  | Ir.EApp (f, args) -> first (f :: args)
+  | Ir.ERecord (_, fs) -> first (List.map snd fs)
+  | Ir.EVariant (_, _, args) -> first args
+  | Ir.EIf (c, t, e2) -> first [c; t; e2]
+  | Ir.EMatch (sc, cases) -> first (sc :: List.map snd cases)
+
 (** Lowering state *)
 type state = {
-  mutable next_var_id : int;
   fun_map : (string, tparam list * texpr) Hashtbl.t;
   lowering_stack : (string, unit) Hashtbl.t;
   lowered_funs : (string, Ir.helper_func) Hashtbl.t;
@@ -315,23 +470,48 @@ type state = {
   variants : (string, (string * Ir.elttype list) list) Hashtbl.t;
       (** Collected variant types: type_name ->
           [(constructor_name, payload_types); ...] *)
+  mod_consts : (string, Ir.var * Ir.expr) Hashtbl.t;
+      (** Module-level constants, by name, with their LOWERED initializer
+          (backlog-160). A helper body that names one must carry its own [SLet]:
+          the kernel-body copy is in a different scope, and helpers are emitted
+          out-of-line. See [prefix_referenced_consts]. *)
+  mutable mod_consts_order : string list;
+      (** Declaration order, reversed. Prefixing must be deterministic AND must
+          respect dependency order — a later constant may reference an earlier
+          one — so the prefix is emitted in declaration order, not hashtable
+          order. *)
 }
 
 let create_state fun_map =
   {
-    next_var_id = 0;
     fun_map;
     lowering_stack = Hashtbl.create 8;
     lowered_funs = Hashtbl.create 8;
     lowered_funs_order = [];
     types = Hashtbl.create 8;
     variants = Hashtbl.create 8;
+    mod_consts = Hashtbl.create 8;
+    mod_consts_order = [];
   }
 
-let fresh_id state =
-  let id = state.next_var_id in
-  state.next_var_id <- id + 1 ;
-  id
+(* There is ONE id allocator PER ID SPACE, and the distinction is load-bearing.
+   TERM-variable ids come from the typer's [Sarek_typed_ast.fresh_var_id]; TYPE
+   variable ids come from [Sarek_types.fresh_tvar_id]. They are separate
+   [Atomic]s, both starting at 0, so they are NOT interchangeable and a value
+   from one is meaningless in the other's space.
+
+   This note previously said only "There is ONE id allocator: fresh_var_id",
+   which read as though that counter served everything — and while it said so,
+   Sarek_typer really did build one tvar from it (backlog-183). Since
+   [float_literal_ids] and [numeric_required_ids] are keyed on tvar ids and read
+   inside [unify], that leak could reject a legal program. Enforced now by
+   scripts/check-tvar-id-allocator.sh rather than by this paragraph. A
+   third one used to appear to live here ([fresh_id] over a [next_var_id] field)
+   and was deleted with its field — it had no caller, and a commit message that
+   called it live was wrong. The tail-recursion transform draws from the typer
+   directly, so a transform id cannot collide with a typer id by construction.
+   The only other id convention is the NEGATIVE range for tuple temporaries
+   below, disjoint from the typer's by sign. *)
 
 (** Register the synthesized [_tup_*] record for a primitive-component tuple in
     the codegen types table, so a kernel-local slot typed by that record (see
@@ -600,23 +780,174 @@ let rec lower_expr (state : state) (te : texpr) : Ir.expr =
             (* First time - lower the function *)
             let params, body = Hashtbl.find state.fun_map name in
             let ret_ty = repr body.ty in
+            (* Wrong-width class, 3rd instance: a module-level helper whose
+               RETURN type is a primitive-component tuple ([let mk x y = (x, y)])
+               must be typed through the data mapper, not the bare
+               [elttype_of_typ] placeholder that collapses [TTuple]/[TFun] to
+               [Ir.TInt32]. The body already lowers a primitive tuple literal to
+               the synthesized [_tup_*] record (see the [TETuple] case), so a
+               placeholder return type declared the helper int-returning while
+               its body returned a compound — a silent miscompile. Routing
+               through [slot_elttype_of_typ] lowers the return to that same
+               [_tup_*] record end-to-end (backends already support an aggregate
+               helper return; see the record-arg/ret helper path). Register the
+               synthesized record so its [struct] definition is emitted even if
+               no other site did. A non-primitive tuple return raises the located
+               tuple-component error rather than miscompiling. *)
+            register_tuple_type state ret_ty ;
+            let name_of_helper = name in
+            (* Captured HERE, where [body] is still the helper's texpr: inside the
+               prefixing fold below, [body] is the accumulator statement and
+               shadows it. *)
+            let helper_loc = Sarek_ast.loc_to_ppxlib body.te_loc in
             Hashtbl.add state.lowering_stack name () ;
             let fun_body_ir = lower_stmt state body in
             Hashtbl.remove state.lowering_stack name ;
             (* Use make_returning to add return statements without re-traversing *)
             let fun_body_ir = make_returning fun_body_ir in
+            (* backlog-160: give the helper its own copy of every module constant
+               it references. Without this the emitted device function names an
+               identifier declared only in the kernel body — see the header above
+               [expr_names] for the emitted CUDA and for why hoisting to a
+               top-level [const] is unsound.
+
+               TRANSITIVE, and that is not decoration: a constant's initializer
+               may reference an earlier constant, so a fixpoint is taken over the
+               referenced set before prefixing. Prefixed in DECLARATION order, so
+               a dependency is declared before its user. Only the constants
+               actually referenced are prefixed — prefixing all of them would
+               evaluate initializers the helper does not need and, worse, would
+               drag an unreferenced barrier into the refusal path. *)
+            let referenced =
+              let acc = Hashtbl.create 8 in
+              stmt_names fun_body_ir [] acc ;
+              let rec close () =
+                let added = ref false in
+                Hashtbl.iter
+                  (fun name _ ->
+                    match Hashtbl.find_opt state.mod_consts name with
+                    | None -> ()
+                    | Some (_, init) ->
+                        let sub = Hashtbl.create 4 in
+                        expr_names init [] sub ;
+                        Hashtbl.iter
+                          (fun n () ->
+                            if
+                              Hashtbl.mem state.mod_consts n
+                              && not (Hashtbl.mem acc n)
+                            then begin
+                              Hashtbl.replace acc n () ;
+                              added := true
+                            end)
+                          sub)
+                  (Hashtbl.copy acc) ;
+                if !added then close ()
+              in
+              close () ;
+              acc
+            in
+            (* Names the helper binds anywhere, at any depth. A constant that is
+               both referenced AND rebound cannot be prefixed: the backends emit
+               [SLet] flat, so the prefix and the rebinding are two declarations
+               of one identifier in one block. Refused below rather than emitted.
+               Caught by review on #362. *)
+            let helper_binders =
+              let acc = Hashtbl.create 8 in
+              stmt_binders fun_body_ir acc ;
+              acc
+            in
+            let fun_body_ir =
+              List.fold_left
+                (fun body name ->
+                  if not (Hashtbl.mem referenced name) then body
+                  else if Hashtbl.mem helper_binders name then
+                    Ppxlib.Location.raise_errorf
+                      ~loc:helper_loc
+                      "Helper %S both references module constant %S and binds \
+                       a local of the same name. The constant has to be \
+                       declared inside the helper to be visible there, and the \
+                       generated device code declares locals in one flat \
+                       scope, so that would emit two declarations of %S in the \
+                       same block. Rename the local, or pass the constant in \
+                       as a parameter of %S."
+                      name_of_helper
+                      name
+                      name
+                      name_of_helper
+                  else
+                    match Hashtbl.find_opt state.mod_consts name with
+                    | None -> body
+                    | Some (v, init) -> (
+                        match expr_barrier init with
+                        | Some intr ->
+                            (* Duplicating a barrier per call site changes
+                               convergence, so this is refused rather than
+                               silently changed. Names both the constant and the
+                               intrinsic: "a barrier somewhere" is not actionable.
+
+                               LOCATED at the helper's body, not
+                               [Location.none]. The first version passed
+                               [Location.none] while the commit message and the
+                               PR body both claimed "a located error" — the claim
+                               was wider than the code, and a refusal the user
+                               cannot place in their source is barely better than
+                               a silent one. This file already threads real
+                               locations for comparable refusals (the [lsr] error
+                               and the shared-memory rejections), so there was no
+                               reason to drop it here. Caught by review on #362. *)
+                            Ppxlib.Location.raise_errorf
+                              ~loc:helper_loc
+                              "Module constant %S is referenced by helper %S \
+                               and its initializer calls %S, a synchronising \
+                               operation. Making it visible to the helper \
+                               means evaluating the initializer once per call, \
+                               which would execute %S once per call site and \
+                               change convergence. Move the value into a \
+                               parameter of %S, or compute it in the kernel \
+                               body and pass it in."
+                              name
+                              name_of_helper
+                              intr
+                              intr
+                              name_of_helper
+                        | None -> Ir.SSeq [Ir.SLet (v, init, Ir.SEmpty); body]))
+                fun_body_ir
+                (List.rev state.mod_consts_order)
+            in
             (* Convert tparam list to var list *)
+            (* backlog-158: the parameter's identity is the TYPER's id, not its
+               position. This was [List.mapi] handing each parameter its index
+               while [p.tparam_id] — the id every use site inside the body
+               carries — was destructured and discarded. The interpreter's
+               [lookup_var] resolves by id before name, so a reference resolved to
+               whichever parameter occupied that slot, and the name fallback was
+               silently load-bearing: it only rescued the cases where the id
+               lookup missed entirely.
+
+               Wrong exactly for 1 <= c <= n-1, where c is the global typer
+               counter when these parameters are allocated and n their count
+               (c = 0 makes positional and typer ids coincide by accident; c >= n
+               makes every lookup miss and fall back safely). A module constant
+               declared ahead of the helper puts c at 1, which is why the probe
+               needs one and why it must be the first kernel in a fresh file — the
+               counter is global and persists.
+
+               Measured, not reasoned: `combine a b c d = a +. b +. c` with
+               arguments 1 2 3 4 returned 9 on the Interpreter and 6 on OpenCL,
+               Vulkan and Native. Safe to change because every other consumer of
+               [hf_params] keys by NAME (PTX, GLSL, WGSL, inline_vec) and no
+               golden pins these ids. *)
             let hf_params =
-              List.mapi
-                (fun i (p : tparam) ->
-                  make_var p.tparam_name i p.tparam_type false)
+              List.map
+                (fun (p : tparam) ->
+                  make_var p.tparam_name p.tparam_id p.tparam_type false)
                 params
             in
             let helper_func : Ir.helper_func =
               {
                 hf_name = name;
                 hf_params;
-                hf_ret_type = elttype_of_typ ret_ty;
+                hf_ret_type = slot_elttype_of_typ ret_ty;
                 hf_body = fun_body_ir;
               }
             in
@@ -700,6 +1031,20 @@ let rec lower_expr (state : state) (te : texpr) : Ir.expr =
       match ref with
       | Sarek_env.IntrinsicRef (path, name) -> Ir.EIntrinsic (path, name, [])
       | Sarek_env.CorePrimitiveRef name -> Ir.EIntrinsic ([], name, []))
+  (* The two f16 width conversions are the only primitives that lower to a
+     typed IR cast instead of an intrinsic call. Going through [ECast] (rather
+     than an [EIntrinsic] carrying a device format string) is what lets each
+     backend emit its own documented narrowing -- CUDA/HIP __float2half, and on
+     the interpreter a narrowing through Sarek_float16 -- and it is also what
+     makes [Sarek_ir_analysis.kernel_uses_float16] see the conversion, since its
+     leaf inspects [ECast] target types. See the "conv_f16" primitives in
+     Sarek_core_primitives.ml. *)
+  | TEIntrinsicFun (Sarek_env.CorePrimitiveRef "float16_of_float32", _, [arg])
+    ->
+      Ir.ECast (Ir.TFloat16, lower_expr state arg)
+  | TEIntrinsicFun (Sarek_env.CorePrimitiveRef "float32_of_float16", _, [arg])
+    ->
+      Ir.ECast (Ir.TFloat32, lower_expr state arg)
   | TEIntrinsicFun (ref, _conv, args) -> (
       match ref with
       | Sarek_env.IntrinsicRef (path, name) ->
@@ -880,6 +1225,35 @@ and lower_stmt (state : state) (te : texpr) : Ir.stmt =
         | None -> Ir.EIntrinsic (["Sarek_stdlib"; "Gpu"], "block_dim_x", [])
       in
       let v = make_var name id (TArr (elem_ty, Sarek_types.Shared)) false in
+      (* Sibling of the helper-return wrong-width fix, REJECTED (round 2). A
+         [let%shared] whose ELEMENT type is a tuple/function was originally typed
+         by the bare [elttype_of_typ] placeholder, which collapses [TTuple]/[TFun]
+         to [Ir.TInt32] — a silent scalar-collapse miscompile. Routing it through
+         [slot_elttype_of_typ] to the synthesized [_tup_*] record (as data slots
+         do) was attempted, but a compound in shared memory is NOT supported by
+         the whole backend fleet: the PTX backend raises "unsupported construct:
+         btype of custom type" and Native raises "Cannot create default value for
+         this type" (proven on hardware: OpenCL/Vulkan/Interpreter passed,
+         CUDA/PTX-under-ZLUDA and Native failed; the rejection is locked by
+         sarek/tests/negative/test_shared_tuple.ml). Shipping a route that
+         miscompiles on shared-capable
+         devices is worse than a clean rejection, so a tuple/function shared
+         element is a located compile error, mirroring [lower_param]'s
+         parameter-boundary rejection. (Aggregate shared arrays are a follow-up
+         needing per-backend struct-in-__shared__ support first.) *)
+      (match repr elem_ty with
+      | TTuple _ ->
+          Ppxlib.Location.raise_errorf
+            ~loc:(Sarek_ast.loc_to_ppxlib te.te_loc)
+            "Tuple-typed shared-memory arrays are not supported; declare \
+             separate scalar [let%%shared] arrays for each component (a \
+             compound in shared memory is not supported across the CUDA/PTX \
+             and Native backends)."
+      | TFun _ ->
+          Ppxlib.Location.raise_errorf
+            ~loc:(Sarek_ast.loc_to_ppxlib te.te_loc)
+            "Function-typed shared-memory arrays are not supported."
+      | _ -> ()) ;
       let elem_ir = elttype_of_typ elem_ty in
       (* Use EArrayCreate with Shared memspace - codegen will emit proper declaration *)
       Ir.SLet
@@ -955,6 +1329,31 @@ and extract_pattern_vars (pat : tpattern) : string list =
 (** Convert a kernel parameter to IR declaration *)
 let lower_param (p : tparam) : Ir.decl =
   (match repr p.tparam_type with
+  | TReg Float16 ->
+      (* #57 slice 1: the delivered surface is `float16 vector`, NOT a scalar
+         f16 parameter — and nothing else in the pipeline stops one.
+
+         It type-checks, and Sarek_ir_cuda maps it to a by-value `__half`
+         formal. But [Execute.vector_arg] has no float16 constructor, so the
+         only way to supply an argument is [Float32 f], which becomes
+         [ArgFloat32] and pushes a 4-byte C float whose address the device then
+         reads as a 2-byte __half. Executed on gfx1100 with
+         `fun (out : float16 vector) (s : float16) -> out.(tid) <- s` and
+         `Float32 3.14159`: HIP produced 0.000476837158 with no error raised,
+         while the interpreter produced the correct 3.140625 — the two oracles
+         silently disagreed, which is the exact property test_hip_f16 exists to
+         guarantee.
+
+         Same class as the f16 rejections already in place for record fields
+         (Sarek_ir_layout), SoA fields (Soa.ml) and whole kernels (the five
+         backend gates); scalar params were the hole. *)
+      Ppxlib.Location.raise_errorf
+        ~loc:Ppxlib.Location.none
+        "Kernel parameter %S has type float16: f16 is a storage-only element \
+         type and cannot be a scalar kernel parameter. Pass a float32 scalar \
+         and narrow inside the kernel with float16_of_float32, or use a \
+         `float16 vector`."
+        p.tparam_name
   | TTuple _ ->
       Ppxlib.Location.raise_errorf
         ~loc:Ppxlib.Location.none
@@ -1013,7 +1412,7 @@ let lower_param (p : tparam) : Ir.decl =
   else Ir.DParam (v, None)
 
 (** Lower a complete kernel *)
-let lower_kernel (kernel : tkernel) : Ir.kernel * string list =
+let lower_kernel (kernel : tkernel) : Ir.kernel =
   (* Reset and log counters *)
   ir_lower_expr_count := 0 ;
   ir_lower_stmt_count := 0 ;
@@ -1078,24 +1477,28 @@ let lower_kernel (kernel : tkernel) : Ir.kernel * string list =
         match item with
         | TMConst (name, id, ty, expr) ->
             let v = make_var name id ty false in
-            Ir.SSeq [Ir.SLet (v, lower_expr state expr, Ir.SEmpty); acc]
+            let init = lower_expr state expr in
+            (* backlog-160: record it so a helper body that names this constant
+               can carry its own SLet. Populated HERE, while the kernel-body copy
+               is built, which is before the body is lowered — and helpers are
+               lowered lazily FROM the body, so by the time any helper needs a
+               constant, every constant is registered.
+
+               The residual ordering case, checked and stated rather than left
+               implicit: a helper can also be lowered while a CONSTANT's own
+               initializer is lowered (a constant may call a module function). At
+               that moment the constants declared after it are not yet in the
+               table, so such a helper gets only the earlier ones. That is the
+               correct scope — OCaml's own scoping gives the initializer access to
+               earlier bindings only — so the limitation matches the language
+               rather than being a gap. A helper referencing a LATER constant is
+               not expressible. *)
+            Hashtbl.replace state.mod_consts name (v, init) ;
+            state.mod_consts_order <- name :: state.mod_consts_order ;
+            Ir.SSeq [Ir.SLet (v, init, Ir.SEmpty); acc]
         | TMFun _ -> acc)
       all_mod_items
       Ir.SEmpty
-  in
-
-  (* Generate type constructors *)
-  let constructors =
-    List.concat
-      (List.map
-         (function
-           | TTypeRecord {tdecl_name; tdecl_fields; _} ->
-               (* Strip mutability flag from fields *)
-               let fields = List.map (fun (n, ty, _) -> (n, ty)) tdecl_fields in
-               record_constructor_strings tdecl_name fields
-           | TTypeVariant {tdecl_name; tdecl_constructors; _} ->
-               variant_constructor_strings tdecl_name tdecl_constructors)
-         kernel.tkern_type_decls)
   in
 
   (* Lower body *)
@@ -1128,19 +1531,18 @@ let lower_kernel (kernel : tkernel) : Ir.kernel * string list =
     List.rev state.lowered_funs_order
     |> List.filter_map (fun name -> Hashtbl.find_opt state.lowered_funs name)
   in
-  ( {
-      Ir.kern_name = Option.value kernel.tkern_name ~default:"sarek_kern";
-      (* "kernel" is reserved in OpenCL *)
-      kern_params = List.map lower_param kernel.tkern_params;
-      kern_locals = [];
-      kern_body = full_body;
-      kern_types = types_list;
-      kern_variants = variants_list;
-      kern_funcs = funcs_list;
-      kern_native_fn = None;
-      (* Native fn is added during quoting *)
-    },
-    constructors )
+  {
+    Ir.kern_name = Option.value kernel.tkern_name ~default:"sarek_kern";
+    (* "kernel" is reserved in OpenCL *)
+    kern_params = List.map lower_param kernel.tkern_params;
+    kern_locals = [];
+    kern_body = full_body;
+    kern_types = types_list;
+    kern_variants = variants_list;
+    kern_funcs = funcs_list;
+    kern_native_fn = None;
+    (* Native fn is added during quoting *)
+  }
 
 (** Get the return value declaration for a kernel *)
 let lower_return_value (kernel : tkernel) : Ir.decl option =

@@ -107,7 +107,21 @@ module Device = struct
     local_mem_size : int64;
     max_clock_freq : int;
     supports_fp64 : bool;
+    supports_int64 : bool;
+        (* 64-bit integer support. Core in the FULL profile; optional in
+           EMBEDDED_PROFILE, where it is gated on [cles_khr_int64]. Probed
+           rather than assumed — see the derivation at the call site. *)
     is_cpu : bool; (* True for CPU OpenCL devices - enables zero-copy *)
+    single_fp_config : int64;
+        (* CL_DEVICE_SINGLE_FP_CONFIG, verbatim. Read once at device
+           construction because [Program.build] needs it on every compile to
+           decide whether -cl-fp32-correctly-rounded-divide-sqrt is LEGAL on
+           this device: the OpenCL spec makes passing that option an error
+           (CL_INVALID_BUILD_OPTIONS) unless CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT
+           is set here. Kept as the raw bitfield rather than a decoded bool so
+           the other bits (notably CL_FP_DENORM, clear on both devices on this
+           machine) stay available without a second query. See
+           [Opencl_fp] for the full audit. *)
   }
 
   let get_devices platform device_type =
@@ -239,10 +253,40 @@ module Device = struct
       contains "cl_khr_fp64" extensions || contains "cl_amd_fp64" extensions
     in
 
+    (* 64-bit integer support (#142 follow-up).
+
+       This has to be PROBED, and the reason is the whole point of #142. The
+       first version of the capability list wrote [Int64] unconditionally here,
+       reasoning that [long] is a core OpenCL C type. That is true only of the
+       FULL profile. An EMBEDDED_PROFILE device may omit 64-bit integers
+       entirely, and advertises them — when it has them — through the
+       [cles_khr_int64] extension.
+
+       So the change that replaced "we ASSUME fp64" with "we PROBE fp64"
+       reintroduced, one backend over, a fresh "we ASSUME int64". The model's
+       failure mode is not ignorance about a DEVICE; it is misplaced confidence
+       about an API's GUARANTEES. That is exactly what produced the shaderInt64
+       hole, and it recurred inside the fix for it.
+
+       CL_DEVICE_ADDRESS_BITS is deliberately NOT consulted: it describes
+       pointer width, not the availability of the [long] type, and conflating
+       the two is the same category error one level down. *)
+    let profile = get_info_string handle CL_DEVICE_PROFILE in
+    let supports_int64 =
+      (* Full profile: [long]/[ulong] are core, no extension needed. *)
+      profile = "FULL_PROFILE"
+      (* Embedded profile: optional, gated on the KHR extension. *)
+      || contains "cles_khr_int64" extensions
+    in
+
     (* Check if device is CPU type *)
     let device_type = get_info_long handle CL_DEVICE_TYPE in
     let is_cpu = Int64.logand device_type 2L <> 0L in
     (* CL_DEVICE_TYPE_CPU = 2 *)
+
+    (* cl_device_fp_config is a cl_bitfield, i.e. cl_ulong — the same width
+       [get_info_long] already reads for CL_DEVICE_TYPE just above. *)
+    let single_fp_config = get_info_long handle CL_DEVICE_SINGLE_FP_CONFIG in
 
     {
       id = idx;
@@ -258,7 +302,9 @@ module Device = struct
       local_mem_size;
       max_clock_freq;
       supports_fp64;
+      supports_int64;
       is_cpu;
+      single_fp_config;
     }
 
   let init () = () (* OpenCL doesn't require explicit init *)
@@ -375,8 +421,13 @@ module Memory = struct
     zero_copy : bool; (* True if using CL_MEM_USE_HOST_PTR - skip transfers *)
   }
 
+  (* Element sizes come from Spoc_core's pure table, NOT from
+     Ctypes_static.sizeof (Ctypes.typ_of_bigarray_kind kind): ctypes' kind GADT
+     has no Float16 arm and raises Failure "Unsupported bigarray kind", so
+     [Vector.create Vector.float16 n] died here with an opaque ctypes error
+     (#57 slice 1 review, MF2). *)
   let alloc context size kind =
-    let elem_size = Ctypes_static.sizeof (Ctypes.typ_of_bigarray_kind kind) in
+    let elem_size = Spoc_core.Memory.bigarray_elem_size kind in
     let bytes = Unsigned.Size_t.of_int (size * elem_size) in
     let err = allocate cl_int 0l in
     let mem =
@@ -393,7 +444,7 @@ module Memory = struct
   (** Allocate buffer with zero-copy using host pointer. For CPU OpenCL devices,
       this avoids memory copies entirely. *)
   let alloc_with_host_ptr context size kind host_ptr =
-    let elem_size = Ctypes_static.sizeof (Ctypes.typ_of_bigarray_kind kind) in
+    let elem_size = Spoc_core.Memory.bigarray_elem_size kind in
     let bytes = Unsigned.Size_t.of_int (size * elem_size) in
     let err = allocate cl_int 0l in
     (* CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR *)
@@ -427,7 +478,10 @@ module Memory = struct
     if dst.zero_copy then ()
     else begin
       let bytes = Unsigned.Size_t.of_int (Bigarray.Array1.size_in_bytes src) in
-      let src_ptr = bigarray_start array1 src |> to_voidp in
+      (* Spoc_core.Memory.bigarray_void_ptr, not Ctypes.bigarray_start: the
+         latter has no Float16 arm (MF2), and the former returns a MANAGED
+         pointer that keeps [src] rooted across the blocking enqueue (MF3). *)
+      let src_ptr = Spoc_core.Memory.bigarray_void_ptr src in
       check
         "clEnqueueWriteBuffer"
         (clEnqueueWriteBuffer
@@ -439,7 +493,8 @@ module Memory = struct
            src_ptr
            Unsigned.UInt32.zero
            (from_voidp cl_event null)
-           (from_voidp cl_event null))
+           (from_voidp cl_event null)) ;
+      ignore (Sys.opaque_identity src)
     end
 
   let device_to_host queue ~src ~dst =
@@ -447,7 +502,9 @@ module Memory = struct
     if src.zero_copy then ()
     else begin
       let bytes = Unsigned.Size_t.of_int (Bigarray.Array1.size_in_bytes dst) in
-      let dst_ptr = bigarray_start array1 dst |> to_voidp in
+      (* See host_to_device above: MF2 (no Float16 kind in ctypes) and MF3
+         (managed pointer keeps [dst] rooted across this device->host WRITE). *)
+      let dst_ptr = Spoc_core.Memory.bigarray_void_ptr dst in
       check
         "clEnqueueReadBuffer"
         (clEnqueueReadBuffer
@@ -459,7 +516,8 @@ module Memory = struct
            dst_ptr
            Unsigned.UInt32.zero
            (from_voidp cl_event null)
-           (from_voidp cl_event null))
+           (from_voidp cl_event null)) ;
+      ignore (Sys.opaque_identity dst)
     end
 
   (** Transfer from raw pointer to device buffer (for custom types) *)
@@ -541,15 +599,44 @@ module Program = struct
     (* Store bigarray in record to prevent GC until after build *)
     {handle = prog; context; _source = ba}
 
+  (** Build a program.
+
+      [options] is what the CALLER wants; it is not what [clBuildProgram]
+      receives. {!Opencl_fp.build_options} screens it — raising
+      {!Opencl_fp.Fp_conformance_violation} on anything that would relax float
+      semantics below docs/fp-contraction-policy.md §1 — and appends the options
+      this backend requires on its own behalf, gated on the device's
+      [CL_DEVICE_SINGLE_FP_CONFIG].
+
+      This is the ONLY place an option string reaches [clBuildProgram], and that
+      is deliberately where the guard sits rather than at the caller: it screens
+      flags a FUTURE maintainer of this module adds itself, not merely a
+      caller's. Same placement argument as [Cuda_nvrtc.compile_with_string_opts]
+      (docs/fp-contraction-policy.md §5).
+
+      Until backlog #136 this function passed [options] straight through, and
+      every caller in the tree passed nothing — so the effective option string
+      was empty and Sarek silently accepted each vendor's default, including a
+      [sqrt] of up to 3 ulp. *)
   let build program ?(options = "") () =
     let devices = CArray.make cl_device_id 1 in
     CArray.set devices 0 program.context.device.Device.handle ;
+    let effective_options =
+      Opencl_fp.build_options
+        ~single_fp_config:program.context.device.Device.single_fp_config
+        ~caller:options
+    in
+    Spoc_core.Log.debugf
+      Spoc_core.Log.Kernel
+      "OpenCL clBuildProgram options: %S (device fp_config 0x%Lx)"
+      effective_options
+      program.context.device.Device.single_fp_config ;
     let result =
       clBuildProgram
         program.handle
         Unsigned.UInt32.one
         (CArray.start devices)
-        options
+        effective_options
         (from_voidp void null)
         (from_voidp void null)
     in

@@ -98,7 +98,8 @@
   test_inline_pragma
   test_nested_types
   test_ktype_mixed_align
-  test_ktype_record_f64_arith)
+  test_ktype_record_f64_arith
+  test_f16_host_path)
  (modules
   test_matrix_power
   test_dft
@@ -142,10 +143,12 @@
   test_bounded_recursion
   test_inline_pragma
   test_nested_types
-  test_ktype_record_f64_arith)
+  test_ktype_record_f64_arith
+  test_f16_host_path)
  (libraries
   sarek
   spoc.ir
+  sarek.interp
   sarek.stdlib
   sarek.float64
   sarek_geometry
@@ -189,6 +192,14 @@
  (alias runtest)
  (action
   (run %{dep:test_vector_add.exe})))
+
+; f16 host path on every enumerated backend (#57 slice 1 review, MF2).
+; CPU-safe: exercises whatever devices are present and self-skips otherwise.
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_f16_host_path.exe})))
 
 (rule
  (alias runtest)
@@ -363,21 +374,51 @@
 (rule
  (alias runtest)
  (action
+  (run %{dep:test_cpu_opencl_known_issue.exe})))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_float_check_shape.exe})))
+
+(rule
+ (alias runtest)
+ (action
   (run %{dep:test_domain_pool_stress.exe})))
+
+; test_inline_pragma EXECUTES again (#127) - it is no longer parked.
+;
+; It was build-only because it segfaulted DETERMINISTICALLY (not flakily)
+; whenever an OpenCL device was present. Never a test bug:
+;
+;   `pragma ["sarek.inline N"]` bounds the UNROLLING of a non-tail-recursive
+;   function but leaves a residual self-call, so the OpenCL backend emitted a
+;   genuinely recursive device function:
+;
+;     int pow2(int n) { ... return (2 * (... (2 * pow2(n-1-1-1-1-1-1-1))))); }
+;
+;   OpenCL C forbids recursion (1.2 6.9.e). rusticl (Mesa 26.1.4) does not
+;   diagnose it; it tries to inline and overflows its own compiler stack - a
+;   ~30800-frame recursion inside libRusticlOpenCL on a `clctxworker` thread,
+;   with zero SPOC/OCaml frames on the stack.
+;
+; Fixed in the backend: Sarek_ir_opencl.resolve_recursive_helpers elides the
+; residual call in a budgeted self-recursive helper (typed zero, matching what
+; PTX already does for the same pragma) and REFUSES every other cycle. Verified
+; on an AMD RX 7900 XTX (rusticl/radeonsi): exit 139 before, exit 0 with correct
+; results after. The generated OpenCL is now checked for recursion on every
+; codegen_golden run - see opencl_validation_sweep (#128), layer 1, which exists
+; because no compiler on this path reports this class.
+;
+; HISTORICAL NOTE, kept because the two were once filed as one class: this was
+; NOT the ctypes-rooting use-after-free fixed in sarek-vulkan (PR #303). Both
+; presented as SIGSEGV; they are unrelated. This one was OpenCL-only and
+; disappeared when the OpenCL ICD was hidden.
 
 ; compile-only alias: the assertion IS successful compilation (PPX
 ; convergence-analysis positive cases, or a smoke test with no runtime
 ; check). Build-only - not executed - since there is nothing to run that
 ; would add verification beyond "it compiled".
-;
-; test_inline_pragma is also parked here (build-only): it is otherwise
-; self-verifying and CPU-safe, but running it on this session's real GPU
-; segfaulted reproducibly when Device.all () selected the OpenCL device for
-; a non-tail-recursive `pragma ["sarek.inline N"]` kernel (see
-; briefs/make-tests-actually-run-impl-notes.md). That is a genuine backend
-; crash, out of scope here (no sarek-opencl / codegen changes in this task).
-; Keeping it out of default `runtest` avoids nondeterministically crashing
-; the suite on machines where a GPU happens to be the first device.
 
 (alias
  (name compile-only)
@@ -385,7 +426,6 @@
   test_pragma.exe
   test_barrier_converged.exe
   test_superstep.exe
-  test_inline_pragma.exe
   test_ppx_scan_failure_warning.exe))
 
 ; Build-gate the compile-only tests under default `runtest` too, so a
@@ -394,7 +434,7 @@
 ; deliberately distinct from the `(rule (alias runtest) (action (run ...)))`
 ; pattern used above for tests that must actually execute). See the
 ; comment block above and briefs/make-tests-actually-run-impl-notes.md for
-; why these four are build-only rather than run.
+; why these are build-only rather than run.
 
 (alias
  (name runtest)
@@ -402,8 +442,15 @@
   test_pragma.exe
   test_barrier_converged.exe
   test_superstep.exe
-  test_inline_pragma.exe
   test_ppx_scan_failure_warning.exe))
+
+; #127: executed, not build-only. Self-verifying (exit 1 on mismatch) and
+; self-skipping when Device.all () is empty.
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_inline_pragma.exe})))
 
 ; Regression tests wired to executing runtest rules (found unwired by
 ; scripts/check-test-alias-coverage.sh - the guard added after the 2026-07
@@ -424,6 +471,11 @@
  (alias runtest)
  (action
   (run %{dep:test_bare_float_is_float32.exe})))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_intrinsic_native_surface.exe})))
 
 (rule
  (alias runtest)
@@ -481,6 +533,26 @@
  (preprocess
   (pps sarek_ppx)))
 
+; The stdlib intrinsics that had no native target symbol. Compiling this file
+; at all is the regression guard (pre-fix: "Unbound value
+; Sarek.Sarek_cpu_runtime.Float32.copysign" from PPX-generated code); the value
+; checks additionally pin each one to its declared `ocaml = ...` semantics.
+; Run with: dune exec sarek/tests/e2e/test_intrinsic_native_surface.exe
+
+(executable
+ (name test_intrinsic_native_surface)
+ (modules test_intrinsic_native_surface)
+ (libraries
+  sarek
+  sarek_native
+  sarek_stdlib
+  sarek.float64
+  sarek_ir
+  spoc_core
+  unix)
+ (preprocess
+  (pps sarek_ppx)))
+
 ; Regression test: Sarek_ppx.scan_file_for_sarek_types's `with _ -> ()`
 ; catch-all. %sarek_includes a deliberately unparseable sibling fixture; this
 ; file must still compile (see fixture_scan_failure_include.ml.fixture and
@@ -503,6 +575,35 @@
  (name test_float32_sin_pure)
  (modules test_float32_sin_pure)
  (libraries sarek sarek_ir spoc_core test_helpers unix)
+ (preprocess no_preprocessing))
+
+; Strictness guard for the CPU-OpenCL float32-math KNOWN-ISSUE classifier used
+; by test_float32_sin_pure and test_math_intrinsics (flake #74). Device-free:
+; fabricates Device.t records and checks the classifier truth table, so a
+; future widening of the predicate (e.g. back to CL_DEVICE_NAME sniffing, which
+; would swallow a real GPU regression) fails here.
+; Run with: dune exec sarek/tests/e2e/test_cpu_opencl_known_issue.exe
+
+(executable
+ (name test_cpu_opencl_known_issue)
+ (modules test_cpu_opencl_known_issue)
+ ; unix: the F2 expiry-NOTE rows capture stdout to assert on a side effect
+ (libraries spoc_core spoc.framework test_helpers unix)
+ (preprocess no_preprocessing))
+
+; Fixture test for the OTHER half of the #74 / F1 contract: the classifier
+; truth table above assumes a correct float_check_shape, and this pins the
+; computation that produces it (Test_helpers.compute_float_check_shape, which
+; both test_float32_sin_pure and test_math_intrinsics delegate to). Without it a
+; miscomputed first_bad_index / bad_count / non_finite would feed the classifier
+; garbage and reopen the masking hole with no test failing. Array-in /
+; record-out: no device, no backend.
+; Run with: dune exec sarek/tests/e2e/test_float_check_shape.exe
+
+(executable
+ (name test_float_check_shape)
+ (modules test_float_check_shape)
+ (libraries spoc_core spoc.framework test_helpers)
  (preprocess no_preprocessing))
 
 ; Regression test for the DomainPool oversubscription race (dropped block
@@ -618,6 +719,25 @@
  (alias runtest)
  (action
   (run %{dep:test_df64.exe})))
+
+; CPU-only codegen guard: asserts df64 emits no contractable multiply.
+; See the header of test_df64_no_contraction.ml.
+
+(executable
+ (name test_df64_no_contraction)
+ (modules test_df64_no_contraction)
+ (libraries sarek sarek.stdlib sarek.df64 sarek.codegen spoc.ir spoc_core)
+ (preprocessor_deps
+  (file ../../Sarek_df64/Sarek_df64.ml))
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_df64_no_contraction.exe})))
 
 (executable
  (name test_real64)
@@ -1030,6 +1150,40 @@
  (action
   (run %{dep:test_local_tuple.exe})))
 
+; helper-tuple-return: a module-level helper whose RETURN type is a
+; primitive-component tuple ([let mk x y = (x, y)]). Locks the third
+; "wrong-width" instance — the helper return type must lower to the synthesized
+; [_tup_*] record (not the [elttype_of_typ] int placeholder), verified in the
+; emitted CUDA/OpenCL/GLSL (Axis 1) and behaviourally on every device (Axis 2).
+; CPU-safe and self-verifying, so it gates in the default runtest alias.
+
+(executable
+ (name test_helper_tuple_ret)
+ (modules test_helper_tuple_ret)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  sarek.codegen
+  spoc_core
+  test_helpers
+  sarek_native
+  sarek_interpreter
+  sarek_cuda
+  sarek_opencl
+  sarek_vulkan
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_helper_tuple_ret.exe})))
+
 ; deriver-variant-fields: a [@@sarek.type] record with a VARIANT-typed field as
 ; a vector element, round-tripping host->device->host on the value-based
 ; backends (Interpreter + Native). Fixes the L14-S2 PR #251
@@ -1075,3 +1229,297 @@
    RUSTICL_FEATURES
    fp64
    (run %{dep:test_ktype_record_f64_arith.exe}))))
+
+; -----------------------------------------------------------------------
+; Runtime kernel-cache regressions (#86).
+;
+; Four separate executables on purpose: the teardown and direct-clear cases
+; CRASH (SIGSEGV) rather than failing an assertion when the outer memo is not
+; invalidated, so they must not share a binary with anything else, and the reset
+; case drives Device.init/reset twice over different framework lists, which is
+; only meaningful in a process that has not enumerated devices yet.
+;
+; All four are Alcotest suites, NOT bare self-verifying executables. That is
+; load-bearing: the devices these need (two OpenCL devices, a Vulkan device) do
+; not exist on CI, and a plain executable that printed "SKIP" and exited 0 was
+; indistinguishable from one that ran and verified everything - which is what
+; these were, and why they gated nothing there. Under Alcotest a skip is a
+; distinct [SKIP] row and is excluded from the "N tests run" tally, so a suite
+; that verified nothing reports "0 test run".
+; -----------------------------------------------------------------------
+
+(executables
+ (names
+  test_runtime_cache_device_key
+  test_runtime_cache_teardown
+  test_runtime_cache_reset_ids
+  test_backend_cache_scope)
+ (modules
+  test_runtime_cache_device_key
+  test_runtime_cache_teardown
+  test_runtime_cache_reset_ids
+  test_backend_cache_scope)
+ (libraries
+  spoc_core
+  spoc_framework
+  spoc_framework_registry
+  test_helpers
+  alcotest))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_runtime_cache_device_key.exe})))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_runtime_cache_teardown.exe})))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_runtime_cache_reset_ids.exe})))
+
+; #75 — a match EXPRESSION whose arms bind and use a constructor payload must
+; execute correctly on every device. The binder deliberately shadows a
+; preceding local, so a dropped binding is a silent wrong answer rather than a
+; device-compiler error.
+
+(executable
+ (name test_ematch_payload_e2e)
+ (modules test_ematch_payload_e2e)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  sarek.codegen
+  spoc_core
+  test_helpers
+  sarek_native
+  sarek_interpreter
+  sarek_cuda
+  sarek_opencl
+  sarek_vulkan
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx))
+ (flags
+  (:standard -w -32-33-34-69)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_ematch_payload_e2e.exe})))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_backend_cache_scope.exe})))
+
+; Its own binary. The original rationale - that a Mesa host segfaults when a
+; Vulkan pipeline is created in a process that already enumerated OpenCL - was
+; WRONG: that crash was a use-after-free in our own ctypes bindings, fixed in
+; #303 (a8b5a193). OpenCL only supplied the heap pressure that made the GC
+; collect early. The split is kept anyway because it is genuinely simpler: this
+; binary links sarek_vulkan directly and inits only that plugin instead of
+; going through Test_helpers.Benchmarks.init_backends, so the Vulkan half of
+; the scope check is not entangled with backend discovery.
+
+(executable
+ (name test_vulkan_cache_device_scope)
+ (modules test_vulkan_cache_device_scope)
+ (optional)
+ (libraries
+  spoc_core
+  spoc_framework
+  spoc_framework_registry
+  sarek_vulkan
+  alcotest))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_vulkan_cache_device_scope.exe})))
+
+; Measurement (issue #126): does a Vulkan driver HONOUR the SPIR-V
+; NoContraction decoration that Sarek's `precise` float locals lower to?
+; Runs the same shader twice, differing only by `precise`, on every Vulkan
+; device present, and compares each contraction shape against a fused value
+; the DEVICE produced rather than an IEEE model.
+;
+; Classified e2e-gpu, deliberately: there is no Native/Interpreter fallback
+; (the whole point is what a specific driver does), so on a machine with no
+; Vulkan device it can only print [SKIP], and a [SKIP] sitting on the default
+; runtest alias is indistinguishable from a pass. It is NOT e2e-manual either -
+; it has a real failure mode and exits 1 on it: if an explicit fma() fails to
+; fuse, or a result matches neither candidate, the harness is not measuring
+; what it claims and says so. What it deliberately does NOT do is fail because
+; a driver's answer changed - that is a finding to record in
+; docs/fp-contraction-policy.md, not a build to break.
+
+(executable
+ (name test_vulkan_no_contraction)
+ (modules test_vulkan_no_contraction)
+ (optional)
+ (libraries sarek sarek_vulkan spoc_core))
+
+(rule
+ (alias e2e-gpu)
+ (action
+  (run %{dep:test_vulkan_no_contraction.exe})))
+
+; Vulkan-only regression test for #142 (the DEVICE half of GLSL wide types):
+; an int64 Sarek kernel must compile, run, and produce correct 64-bit results
+; on Vulkan. #141 fixed the emitter (GL_ARB_gpu_shader_int64 is now declared);
+; this exercises the second requirement, that the logical device actually
+; ENABLE VkPhysicalDeviceFeatures.shaderInt64, which the SPIR-V
+; `OpCapability Int64` demands. Device-filtered to Vulkan; skips (prints
+; [SKIP], exits 0) if no Vulkan device is present.
+
+(executable
+ (name test_vulkan_int64)
+ (modules test_vulkan_int64)
+ (optional)
+ (libraries sarek_ir sarek_execute sarek_vulkan spoc_core))
+
+(rule
+ (alias e2e-gpu)
+ (action
+  (run %{dep:test_vulkan_int64.exe})))
+
+; backlog-62 slice 3 — the integer coopmat path end to end: hand-built IR with
+; SCoopmat statements, emitted by Sarek_ir_glsl, executed on the GPU, compared
+; bit-for-bit against the interpreter. e2e-gpu: it needs a device advertising an
+; integer cooperative-matrix configuration, and skips (does not fail) otherwise.
+
+(executable
+ (name test_coopmat_integer_e2e)
+ (modules test_coopmat_integer_e2e)
+ (libraries
+  sarek
+  sarek_ir
+  sarek_codegen
+  sarek_vulkan
+  spoc_core
+  spoc_framework
+  test_helpers
+  unix)
+ (preprocess no_preprocessing))
+
+(rule
+ (alias e2e-gpu)
+ (action
+  (run %{dep:test_coopmat_integer_e2e.exe})))
+
+; float64 literal precision, Float64 scalar conversions, and the softmath
+; helper name collision on GLSL. One sub-expression per output slot, compared
+; bit-for-bit with OCaml binary64. The scalar parameter is deliberately named
+; `n` — see the header; renaming it disarms the collision guard.
+; Run with: dune exec sarek/tests/e2e/test_f64_scalar_conversions.exe
+
+(executable
+ (name test_f64_scalar_conversions)
+ (modules test_f64_scalar_conversions)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek.float64
+  sarek_ir
+  sarek_interpreter
+  spoc_core
+  test_helpers
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_f64_scalar_conversions.exe})))
+
+; Tail-recursive helpers taking a vector parameter, on every fp64 device, plus
+; a codegen assertion that the self call is eliminated rather than executed.
+; Run with: dune exec sarek/tests/e2e/test_tailrec_vector_param.exe
+
+(executable
+ (name test_tailrec_vector_param)
+ (modules test_tailrec_vector_param)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek.float64
+  sarek_ir
+  sarek_codegen
+  sarek_interpreter
+  spoc_core
+  test_helpers
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_tailrec_vector_param.exe})))
+
+; Helper-function scoping in the interpreter, checked against the GPU backends.
+; Three defects that each produced a silently wrong number on the oracle:
+; positional helper param ids, a callee inheriting the caller's scope, and
+; get_array preferring the kernel's vectors over the callee's own bindings.
+; Run with: dune exec sarek/tests/e2e/test_helper_scoping.exe
+
+(executable
+ (name test_helper_scoping)
+ (modules test_helper_scoping)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek.float64
+  sarek_ir
+  sarek_interpreter
+  spoc_core
+  test_helpers
+  unix
+  sarek_backend_error)
+ (preprocess
+  (pps sarek_ppx)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_helper_scoping.exe})))
+
+; A helper parameter has ONE identity (backlog-158). hf_params gave each param
+; its POSITIONAL index as var_id while every use site carried the typer's id, and
+; the interpreter resolves by id before name — so with a module constant ahead of
+; the helper (which puts the ids inside the 1 <= c <= n-1 failure window) every
+; reference was off by one.
+;
+; MUST be its own file: the typer's id counter is global and persists across
+; kernels, so a probe placed after other kernels falls outside the window and
+; passes with and without the fix. That is exactly why the previous probe
+; (test_helper_scoping case D) could not fail — that, and equal arguments.
+; Run with: dune exec sarek/tests/e2e/test_hf_param_identity.exe
+
+(executable
+ (name test_hf_param_identity)
+ (modules test_hf_param_identity)
+ (libraries
+  sarek
+  sarek.stdlib
+  sarek_ir
+  sarek_interpreter
+  spoc_core
+  test_helpers
+  unix)
+ (preprocess
+  (pps sarek_ppx)))
+
+(rule
+ (alias runtest)
+ (action
+  (run %{dep:test_hf_param_identity.exe})))

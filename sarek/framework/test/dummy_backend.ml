@@ -25,7 +25,7 @@ module Dummy_backend : BACKEND = struct
 
   let supported_source_langs = []
 
-  let generate_source ?block:_ _ir = None
+  let generate_source ?block:_ ?soa_params:_ _ir = None
 
   let execute_direct ~native_fn:_ ~ir:_ ~block:_ ~grid:_ _args = ()
 
@@ -85,7 +85,11 @@ module Dummy_backend : BACKEND = struct
         total_global_mem = 1073741824L;
         (* 1GB *)
         compute_capability = (0, 0);
-        supports_fp64 = false;
+        device_features = [];
+        (* backlog-62: no cooperative-matrix probe on this backend. [None] is
+           "not probed", which Sarek_coopmat.verdict maps to Unknown and therefore
+           refuses; an empty list would be a positive claim nobody measured. *)
+        coopmat = None;
         supports_atomics = false;
         warp_size = 1;
         max_registers_per_block = 0;

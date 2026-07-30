@@ -164,13 +164,13 @@ layout(std430, set=0, binding = 1) buffer Buffer_outputv {
   float outputv[];
 };
 layout(push_constant) uniform PushConstants {
-  int inputv_len;
-  int outputv_len;
+  int sarek_inputv_length;
+  int sarek_outputv_length;
   int n;
 } pc;
 
-#define inputv_len pc.inputv_len
-#define outputv_len pc.outputv_len
+#define sarek_inputv_length pc.sarek_inputv_length
+#define sarek_outputv_length pc.sarek_outputv_length
 #define n pc.n
 
 // Shared memory
@@ -249,6 +249,7 @@ void main() {
 ```metal
 #include <metal_stdlib>
 using namespace metal;
+#pragma METAL fp contract(off)
 
 kernel void sarek_kern(device float* input [[buffer(0)]], constant int &sarek_input_length [[buffer(1)]], device float* output [[buffer(2)]], constant int &sarek_output_length [[buffer(3)]], constant int &n [[buffer(4)]],
 uint3 __metal_gid [[thread_position_in_grid]],

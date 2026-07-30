@@ -34,6 +34,26 @@ type prim_type = TUnit | TBool | TInt32
 type registered_type =
   | Int  (** OCaml int - alias for int32 on GPU *)
   | Int64  (** 64-bit integer *)
+  | Float16
+      (** IEEE binary16 half float. A {e storage} type: f16 is deliberately NOT
+          in [is_numeric] / [is_float] / [float_literal_can_link], so f16 values
+          cannot be added, compared, passed to math intrinsics, or written as
+          bare literals.
+
+          The two conversions are the CORE PRIMITIVES [float32_of_float16] and
+          [float16_of_float32] (registered in [Sarek_core_primitives.all],
+          category ["conv_f16"]). There is NO [Float16] stdlib module and there
+          cannot be one in slice 1: a [%sarek_intrinsic] stdlib type
+          registration needs a [ctype], and Ctypes has no half type. An earlier
+          version of this comment named [Float16.of_float32] /
+          [Float16.to_float32]; those do not exist.
+
+          Rejection of f16 at an operator is enforced by {!Sarek_typer}
+          ([check_numeric]'s [TReg Float16] arm plus [reject_float16] for the
+          equality/boolean/bitwise families) and, for an operand type still
+          unresolved at that point, by the "never float16" tvar registry below.
+          Together that is what makes "store as binary16, compute in f32" a
+          type-system guarantee rather than a convention. *)
   | Float32  (** 32-bit float *)
   | Float64  (** 64-bit float (double) *)
   | Char  (** 8-bit character *)
@@ -86,8 +106,17 @@ let fresh_tvar ?(level = 0) () : typ =
       the GPGPU default.
 
     The registry is process-global but scoped per kernel: it is cleared at the
-    start of each [infer_kernel] and whenever the tvar counter is reset. IDs are
-    monotonic within a kernel so no stale collision is possible. *)
+    start of each [infer_kernel] and whenever the tvar counter is reset.
+
+    IDs are monotonic within a kernel so no stale collision is possible — and
+    that holds only because every tvar id comes from {!fresh_tvar_id}. It was
+    briefly untrue: one site in [Sarek_typer] drew a tvar id from the TERM
+    variable counter (backlog-183), which made this id space non-injective and
+    therefore made a lookup in this very registry able to hit a tvar that never
+    came from a float literal — rejecting a legal program. The single-allocator
+    premise this sentence rests on is now enforced mechanically by
+    scripts/check-tvar-id-allocator.sh, because a premise stated only here is
+    exactly what failed. *)
 
 (** IDs of tvars that originate from bare float literals. *)
 let float_literal_ids : (int, unit) Hashtbl.t = Hashtbl.create 16
@@ -95,10 +124,33 @@ let float_literal_ids : (int, unit) Hashtbl.t = Hashtbl.create 16
 (** The float-literal tvars in creation order, used for defaulting. *)
 let float_literal_tvars : typ list ref = ref []
 
+(** {2 "must never be float16" tvar registry}
+
+    f16 is a storage-only type. [Sarek_typer.check_numeric] and friends can only
+    reject it when the operand type is already resolved; their [TVar _ -> Ok ()]
+    arm let an unresolved operand through, and nothing re-checked it once
+    unification later bound it (#57 slice 1 review, MF4b). Registering the tvar
+    here turns "numeric was required at this operator" into a standing
+    constraint that {!unify} enforces, so a late binding to float16 fails
+    instead of silently producing [__half] arithmetic.
+
+    Deliberately NOT reusing the float-literal registry: that one also forbids
+    integers, and [Add] is legal on int32. This registry forbids exactly
+    float16. Same per-kernel lifetime as the float-literal registry —
+    [clear_float_literals] clears it too, so every existing reset point already
+    covers it. *)
+let numeric_required_ids : (int, unit) Hashtbl.t = Hashtbl.create 16
+
+let clear_numeric_required () = Hashtbl.clear numeric_required_ids
+
+let is_numeric_required_id (id : int) : bool =
+  Hashtbl.mem numeric_required_ids id
+
 (** Clear the float-literal registry (called per kernel). *)
 let clear_float_literals () =
   Hashtbl.clear float_literal_ids ;
-  float_literal_tvars := []
+  float_literal_tvars := [] ;
+  clear_numeric_required ()
 
 (** Is [id] the id of a float-literal-origin tvar? *)
 let is_float_literal_id (id : int) : bool = Hashtbl.mem float_literal_ids id
@@ -121,6 +173,14 @@ let register_float_literal (t : typ) : unit =
       float_literal_tvars := t :: !float_literal_tvars
   | _ -> ()
 
+(** Record that a tvar stood where a numeric type was required, so it can never
+    later link to float16. See the registry section above. *)
+let register_numeric_required (t : typ) : unit =
+  match repr t with
+  | TVar {contents = Unbound (id, _)} ->
+      Hashtbl.replace numeric_required_ids id ()
+  | _ -> ()
+
 (** Check if a type variable occurs in a type (for occurs check) *)
 let rec occurs (id : int) (t : typ) : bool =
   match repr t with
@@ -140,7 +200,14 @@ let rec occurs (id : int) (t : typ) : bool =
   | TTuple ts -> List.exists (occurs id) ts
 
 (** Unification error *)
-type unify_error = Cannot_unify of typ * typ | Occurs_check of int * typ
+type unify_error =
+  | Cannot_unify of typ * typ
+  | Occurs_check of int * typ
+  | Float16_where_numeric_required
+      (** A tvar that stood where a numeric type was required was about to be
+          bound to float16. Distinguished from {!Cannot_unify} so the typer can
+          report the actionable f16 message instead of leaking the variable
+          ("Cannot unify types: 't3[0] and float16"). *)
 
 (** A float-literal tvar may only link to a floating-point type or to another
     type variable (which will itself carry the constraint). Linking it to any
@@ -148,6 +215,10 @@ type unify_error = Cannot_unify of typ * typ | Occurs_check of int * typ
     bare float literal is never an integer. *)
 let float_literal_can_link (t : typ) : bool =
   match repr t with TReg (Float32 | Float64) | TVar _ -> true | _ -> false
+
+(** Is [t] (after [repr]) the f16 storage type? *)
+let is_float16_repr (t : typ) : bool =
+  match repr t with TReg Float16 -> true | _ -> false
 
 (** Unify two types *)
 let rec unify (t1 : typ) (t2 : typ) : (unit, unify_error) result =
@@ -164,6 +235,13 @@ let rec unify (t1 : typ) (t2 : typ) : (unit, unify_error) result =
         else if is_float_literal_id id && not (float_literal_can_link t) then
           (* L17b: a bare-float-literal tvar cannot become a non-float type. *)
           Error (Cannot_unify (TVar r, t))
+        else if is_numeric_required_id id && is_float16_repr t then
+          (* #57 MF4b: a tvar that stood in an arithmetic/comparison operand
+             position can never resolve to the storage-only f16 type. Reached
+             both directly and — since Sarek_scheme propagates the constraint
+             across generalization — from a polymorphic helper instantiated at
+             f16. *)
+          Error Float16_where_numeric_required
         else begin
           (* Update level for let-polymorphism *)
           (match t with
@@ -171,7 +249,9 @@ let rec unify (t1 : typ) (t2 : typ) : (unit, unify_error) result =
               r := Unbound (id, min level1 level2) ;
               (* Propagate the float-literal constraint onto the tvar that
                  becomes the representative after linking. *)
-              if is_float_literal_id id then register_float_literal t
+              if is_float_literal_id id then register_float_literal t ;
+              (* Same for the "never f16" constraint. *)
+              if is_numeric_required_id id then register_numeric_required t
           | _ -> ()) ;
           r := Link t ;
           Ok ()
@@ -239,6 +319,7 @@ let pp_prim fmt = function
 let pp_registered fmt = function
   | Int -> Format.fprintf fmt "int"
   | Int64 -> Format.fprintf fmt "int64"
+  | Float16 -> Format.fprintf fmt "float16"
   | Float32 -> Format.fprintf fmt "float32"
   | Float64 -> Format.fprintf fmt "float64"
   | Char -> Format.fprintf fmt "char"
@@ -315,6 +396,10 @@ let t_float32 = TReg Float32
 
 let t_float64 = TReg Float64
 
+(** Half float. Intentionally absent from {!is_numeric} / {!is_float} and from
+    {!float_literal_can_link}: see {!Float16}. *)
+let t_float16 = TReg Float16
+
 let t_int64 = TReg Int64
 
 let t_int = TReg Int
@@ -389,6 +474,11 @@ let rec type_of_type_expr (te : Sarek_ast.type_expr) : typ =
   | Sarek_ast.TEConstr ("int64", []) -> t_int64
   | Sarek_ast.TEConstr ("float32", []) -> t_float32
   | Sarek_ast.TEConstr ("float64", []) -> t_float64
+  | Sarek_ast.TEConstr ("float16", []) ->
+      (* Only `float16` is accepted, not the also-reserved `half`: one spelling
+         keeps the public surface and the diagnostics single-valued, and `half`
+         stays reserved so it can be added later without breaking anything. *)
+      t_float16
   | Sarek_ast.TEConstr ("float", []) ->
       t_float32
       (* Bare `float` defaults to float32 in GPGPU kernels (human decision

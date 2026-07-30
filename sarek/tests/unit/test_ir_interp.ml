@@ -17,6 +17,7 @@ let make_env () =
     arrays = Hashtbl.create 8;
     shared = Hashtbl.create 8;
     funcs = Hashtbl.create 8;
+    coopmats = Hashtbl.create 4;
   }
 
 (** Helper to create a test thread state *)
@@ -321,6 +322,55 @@ let test_binop_float_mod_is_fmod () =
   | VFloat64 f -> check (float 0.0) "-7.5 fmod 2 keeps dividend sign" (-1.5) f
   | _ -> fail "expected VFloat64"
 
+let test_fmod_intrinsic () =
+  (* Float32.fmod / Float64.fmod (float-mod-intrinsic): the explicit function
+     form reaches the eval_float{32,64}_math_intrinsic "fmod" arms and returns
+     C fmod (Float.rem) — sign of the dividend, magnitude < |divisor|. Probes
+     all four sign quadrants and a large-|x| case. *)
+  let env = make_env () in
+  let state = make_state () in
+  let f64 x y =
+    EIntrinsic (["Float64"], "fmod", [EConst (CFloat64 x); EConst (CFloat64 y)])
+  in
+  let f32 x y =
+    EIntrinsic (["Float32"], "fmod", [EConst (CFloat32 x); EConst (CFloat32 y)])
+  in
+  let ck64 name x y expected =
+    match eval_expr state env (f64 x y) with
+    | VFloat64 f -> check (float 0.0) name expected f
+    | _ -> fail "expected VFloat64"
+  in
+  let ck32 name x y expected =
+    match eval_expr state env (f32 x y) with
+    | VFloat32 f -> check (float 1e-6) name expected f
+    | _ -> fail "expected VFloat32"
+  in
+  (* Four sign quadrants: result sign follows the dividend, not the divisor. *)
+  ck64 "f64 +7.5 % +2" 7.5 2.0 1.5 ;
+  ck64 "f64 -7.5 % +2" (-7.5) 2.0 (-1.5) ;
+  ck64 "f64 +7.5 % -2" 7.5 (-2.0) 1.5 ;
+  ck64 "f64 -7.5 % -2" (-7.5) (-2.0) (-1.5) ;
+  (* |x| >> |y|: exact for this magnitude. *)
+  ck64 "f64 1e17 % 3" 1e17 3.0 1.0 ;
+  ck32 "f32 +7.5 % +2" 7.5 2.0 1.5 ;
+  ck32 "f32 -7.5 % -2" (-7.5) (-2.0) (-1.5) ;
+  (* Review-raised edge cases (the GLSL/WGSL single-pass form got these wrong;
+     the interpreter's Float.rem is C-conformant and is the golden reference). *)
+  (* Infinite divisor: C fmod(x, +/-inf) = x for finite x. *)
+  ck64 "f64 5 % +inf" 5.0 Float.infinity 5.0 ;
+  ck64 "f64 -5 % -inf" (-5.0) Float.neg_infinity (-5.0) ;
+  (* Huge |x/y| ratio (>> 2^53): the truncated-quotient single pass fails; the
+     exact remainder is well-defined. *)
+  ck64 "f64 1e30 % 3" 1e30 3.0 (Float.rem 1e30 3.0) ;
+  (* NaN domain: y = 0 and |x| = inf both yield NaN per C. *)
+  let is_nan64 name x y =
+    match eval_expr state env (f64 x y) with
+    | VFloat64 f -> check bool name true (Float.is_nan f)
+    | _ -> fail "expected VFloat64"
+  in
+  is_nan64 "f64 1 % 0 = nan" 1.0 0.0 ;
+  is_nan64 "f64 inf % 3 = nan" Float.infinity 3.0
+
 let test_binop_eq () =
   let env = make_env () in
   let state = make_state () in
@@ -365,6 +415,60 @@ let test_stmt_assign () =
   match arr.(2) with
   | VInt32 n -> check int32 "assign" 99l n
   | _ -> fail "expected VInt32"
+
+(* An out-of-range store through LArrayElem must be the INTERPRETER's error, not
+   OCaml's. Both arms of assign_lvalue reject it — OCaml bounds-checks arrays, so
+   nothing was ever corrupted and the backlog entry claiming memory unsafety was
+   wrong — but LArrayElem raised a bare Invalid_argument naming neither the
+   array, the index nor the length, while the LArrayElemExpr arm beside it
+   raised Array_bounds_error naming all three. Matching the CONSTRUCTOR rather
+   than the rendered message: a reworded error_to_string must not silently
+   reclassify this. *)
+let test_stmt_assign_out_of_bounds () =
+  let env = make_env () in
+  let state = make_state () in
+  Hashtbl.add env.arrays "output" (Array.make 5 (VInt32 0l)) ;
+  let stmt =
+    SAssign (LArrayElem ("output", EConst (CInt32 7l)), EConst (CInt32 99l))
+  in
+  match exec_stmt state env stmt with
+  | () -> fail "expected an out-of-bounds store to raise"
+  | exception
+      Sarek.Interp_error.Interpreter_error
+        (Sarek.Interp_error.Array_bounds_error {array_name; index; length}) ->
+      check string "names the array" "output" array_name ;
+      check int "names the index" 7 index ;
+      check int "names the length" 5 length
+  | exception Invalid_argument _ ->
+      fail
+        "raised OCaml's Invalid_argument: the store is caught, but the \
+         diagnostic names neither array, index nor length"
+
+(* Uncaught, an interpreter error used to print as an opaque constructor with
+   none of error_to_string's detail, so every test reporting one carried its own
+   `describe` wrapper. The three sibling error modules register a printer; this
+   one did not. Asserts the printer is REACHED (the message is the detailed one)
+   rather than that some string is non-empty — Printexc always returns
+   something, so a length check would pass without the printer. *)
+let test_interp_error_has_printer () =
+  let e =
+    Sarek.Interp_error.Interpreter_error
+      (Sarek.Interp_error.Array_bounds_error
+         {array_name = "buf"; index = 9; length = 4})
+  in
+  let s = Printexc.to_string e in
+  let contains hay needle =
+    let nh = String.length hay and nn = String.length needle in
+    let rec go i =
+      i + nn <= nh && (String.sub hay i nn = needle || go (i + 1))
+    in
+    nn > 0 && go 0
+  in
+  check
+    bool
+    "printer reached (not the opaque constructor)"
+    true
+    (contains s "buf" && contains s "9" && contains s "4")
 
 let test_stmt_let () =
   let env = make_env () in
@@ -483,6 +587,7 @@ let () =
             test_binop_int64_bitwise_and_shift;
           test_case "equals" `Quick test_binop_eq;
           test_case "float_mod_is_fmod" `Quick test_binop_float_mod_is_fmod;
+          test_case "fmod_intrinsic" `Quick test_fmod_intrinsic;
           test_case
             "shr_negative_is_arithmetic"
             `Quick
@@ -496,6 +601,8 @@ let () =
       ( "statements",
         [
           test_case "assign" `Quick test_stmt_assign;
+          test_case "assign_out_of_bounds" `Quick test_stmt_assign_out_of_bounds;
+          test_case "error_has_printer" `Quick test_interp_error_has_printer;
           test_case "let_binding" `Quick test_stmt_let;
           test_case "if_stmt" `Quick test_stmt_if;
           test_case "while_loop" `Quick test_stmt_while;

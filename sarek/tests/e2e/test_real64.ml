@@ -119,25 +119,27 @@ let rel_error got expected =
   if expected = 0.0 then Stdlib.abs_float got
   else Stdlib.abs_float ((got -. expected) /. expected)
 
-(* Per-op relative tolerance for a (substrate, framework). Native f64 gets the
-   full binary64 contract; df64 follows Sarek_df64's per-backend table (Native
-   and Vulkan mul/div collapse to f32 storage precision - a documented,
-   inherited deviation, not a silent widening). *)
-let f32_tol = 0x1p-22
+(* Per-op tolerance and per-op classification both live in [Test_helpers] now,
+   as [real64_tol_for] / [classify_real64_result]. They used to be a
+   byte-identical copy in this file and in test_real64_single_source.ml — the
+   same duplication-drift risk that produced the f32-grade df64 tolerances this
+   PR removes. See those functions for the substrate split (the rusticl fp64
+   KNOWN-ISSUE applies only to Native_f64, never to the df64 fallback) and for
+   the task #118 rationale (no per-backend widening; deviations are strict
+   expected failures keyed on driver identity). *)
+let native_f64 substrate = substrate = Real64.Native_f64
 
-let tol_for ~(substrate : Real64.substrate) ~framework ~op =
-  match substrate with
-  | Real64.Native_f64 -> 1e-12
-  | Real64.Fallback_df64 -> (
-      let base =
-        match op with
-        | "add" | "sub" -> 0x1p-47
-        | _ -> 0x1p-46 (* mul / div / sqrt *)
-      in
-      match (framework, op) with
-      | "Native", _ -> f32_tol
-      | "Vulkan", ("mul" | "div") -> f32_tol
-      | _ -> base)
+let tol_for ~(substrate : Real64.substrate) ~framework:_ ~op =
+  Test_helpers.real64_tol_for ~native_f64:(native_f64 substrate) ~op
+
+let op_status ~(substrate : Real64.substrate) ~framework ~device ~op ~err ~tol:_
+    =
+  Test_helpers.classify_real64_result
+    ~native_f64:(native_f64 substrate)
+    ~framework
+    ~device
+    ~op
+    ~err
 
 (* ========== One pass on one device with one substrate ========== *)
 
@@ -184,6 +186,7 @@ let run_pass (dev : Device.t) ~(substrate : Real64.substrate) =
     () ;
   Transfer.flush dev ;
   let framework = dev.Device.framework in
+  let device = dev.Device.name in
   let worst = Hashtbl.create 8 in
   let check op got expected =
     let err =
@@ -211,14 +214,19 @@ let run_pass (dev : Device.t) ~(substrate : Real64.substrate) =
     (fun op ->
       let err = try Hashtbl.find worst op with Not_found -> 0.0 in
       let tol = tol_for ~substrate ~framework ~op in
-      let ok = err <= tol in
-      if not ok then incr failures ;
+      let status = op_status ~substrate ~framework ~device ~op ~err ~tol in
+      (* [`Xpass] counts as a failure: see the "WHY [`Xpass] IS HARD" note on
+         Test_helpers.classify_df64_result. Suppressed statuses also raise a
+         GitHub Actions annotation, so a deviation is visible on the checks page
+         and not only in the raw log. *)
+      if Test_helpers.df64_status_is_failure status then incr failures ;
+      Test_helpers.annotate_df64_status ~framework ~device ~op ~err ~tol status ;
       Printf.printf
         "    %-5s max rel err %.3g (tol %.3g) %s\n%!"
         op
         err
         tol
-        (if ok then "PASS" else "FAIL"))
+        (Test_helpers.string_of_df64_status status))
     ["add"; "sub"; "mul"; "div"; "sqrt"]
 
 (* ========== Main ========== *)

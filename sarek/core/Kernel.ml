@@ -154,11 +154,30 @@ let launch (Kernel (module K)) ~(args : args) ~(grid : Framework_sig.dims)
 
 (** {1 Cache Management} *)
 
-(** Clear all kernel caches *)
+(** Clear all kernel caches.
+
+    The layers ABOVE this one are dropped first: [B.Kernel.clear_cache] releases
+    the backend handles (clReleaseKernel / cuModuleUnload / ...), and any outer
+    memo — notably [Runtime.kernel_cache] — holds [Kernel.t] closures over
+    exactly those handles. Leaving them in place means the next lookup hits the
+    outer memo and launches through a released handle (segfault).
+
+    The notification is fired on BOTH sides of the backend clear, and both are
+    load-bearing — see {!Spoc_framework.Cache_hooks.around_clear}, which owns
+    that discipline and the listener-isolation that goes with it.
+
+    [B.Kernel.clear_cache] is itself wrapped in [around_clear], so a caller that
+    resolves the backend through [Framework_registry] and calls it directly is
+    equally covered; [around_clear] collapses the nesting so this path still
+    notifies exactly twice. The wrapper here is not therefore redundant: it is
+    what covers the [None] branch, where no backend resolves and there is no
+    inner [around_clear] to fire. The outer memos are cross-backend, so they
+    must be dropped even when the framework name resolves to nothing. *)
 let clear_cache (device : Device.t) : unit =
-  match Framework_registry.find_backend device.framework with
-  | None -> ()
-  | Some (module B : Framework_sig.BACKEND) -> B.Kernel.clear_cache ()
+  Cache_hooks.around_clear (fun () ->
+      match Framework_registry.find_backend device.framework with
+      | None -> ()
+      | Some (module B : Framework_sig.BACKEND) -> B.Kernel.clear_cache ())
 
 (** {1 Accessors} *)
 

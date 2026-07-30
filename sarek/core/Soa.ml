@@ -24,6 +24,31 @@ let reject_non_flat name fields =
     (fun (fname, ty) ->
       match (ty : Sarek_ir_types.elttype) with
       | TInt32 | TInt64 | TFloat32 | TFloat64 | TBool | TUnit -> ()
+      | TFloat16 ->
+          (* Consistent with Sarek_ir_layout.flatten_field: f16 aggregate
+             fields are out of scope for #57 slice 1 (the host PPX has no
+             read_float16/write_float16 marshaller), so an f16 field cannot be
+             SoA-split either. *)
+          raise
+            (Unsupported
+               (Printf.sprintf
+                  "float16 field %S in %S: f16 record fields unsupported (#57 \
+                   slice 1 supports f16 vectors, not aggregate fields)"
+                  fname
+                  name))
+      | TUint8 ->
+          (* Not a missing marshaller like the f16 case above: a uint8 field is
+             a cooperative-matrix operand element, which no host record can hold
+             because nothing outside CM_load/CM_store ever reads or writes one.
+             A field of this type in a [@@sarek.type] record means the type
+             escaped the Vulkan coopmat path, not that SoA needs extending. *)
+          raise
+            (Unsupported
+               (Printf.sprintf
+                  "uint8 field %S in %S: uint8 is a cooperative-matrix operand \
+                   element type (Vulkan only), not a record field type"
+                  fname
+                  name))
       | TRecord _ ->
           raise
             (Unsupported

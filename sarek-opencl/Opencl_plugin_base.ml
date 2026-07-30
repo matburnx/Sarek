@@ -73,7 +73,23 @@ module Opencl : Framework_sig.PLUGIN_BASE = struct
         total_global_mem = d.global_mem_size;
         compute_capability = (0, 0);
         (* OpenCL doesn't have this concept *)
-        supports_fp64 = d.supports_fp64;
+        (* BOTH entries are probed (Opencl_api reads CL_DEVICE_EXTENSIONS and
+           CL_DEVICE_PROFILE): fp64 from [cl_khr_fp64]/[cl_amd_fp64], int64
+           from the FULL profile or [cles_khr_int64].
+
+           int64 was unconditional here in the first version of this change,
+           on the reasoning that [long] is a core OpenCL C type. It is core
+           only in the FULL profile, so that was the #142 defect reappearing
+           inside its own fix — confidence about an API guarantee standing in
+           for a device probe. Neither arm asserts anything the device did not
+           report. *)
+        device_features =
+          ((if d.supports_fp64 then [Sarek_ir_analysis.Float64] else [])
+          @ if d.supports_int64 then [Sarek_ir_analysis.Int64] else []);
+        (* backlog-62: no cooperative-matrix probe on this backend. [None] is
+           "not probed", which Sarek_coopmat.verdict maps to Unknown and therefore
+           refuses; an empty list would be a positive claim nobody measured. *)
+        coopmat = None;
         supports_atomics = true;
         (* Most OpenCL devices support atomics *)
         warp_size = 32;
@@ -109,7 +125,11 @@ module Opencl : Framework_sig.PLUGIN_BASE = struct
       else begin
         let state = get_state device.Opencl_api.Device.id in
         let size = Bigarray.Array1.dim ba in
-        let host_ptr = Ctypes.(to_voidp (bigarray_start array1 ba)) in
+        (* Not Ctypes.bigarray_start: no Float16 arm (#57 slice 1 review MF2).
+           CL_MEM_USE_HOST_PTR keeps this address for the buffer's whole
+           lifetime, so the OWNING Vector.t (which holds [ba]) is what roots it
+           — the managed pointer only covers this call. *)
+        let host_ptr = Spoc_core.Memory.bigarray_void_ptr ba in
         let buf =
           Opencl_api.Memory.alloc_with_host_ptr state.context size kind host_ptr
         in
@@ -214,8 +234,28 @@ module Opencl : Framework_sig.PLUGIN_BASE = struct
        see Spoc_framework.Kernel_args. *)
     type args = arg Spoc_framework.Kernel_args.t
 
-    (* Cache: key -> compiled kernel *)
-    let cache : (string, t) Hashtbl.t = Hashtbl.create 16
+    (* Cache: key -> compiled kernel. Guarded against concurrent multi-domain
+       access by [Spoc_framework.Guarded_cache]: lookup/insert and clearing are
+       atomic critical sections, while clBuildProgram runs outside the lock. *)
+    let cache : (string, t) Spoc_framework.Guarded_cache.t =
+      Spoc_framework.Guarded_cache.create
+        ~destroy:(fun k ->
+          Opencl_api.Kernel.release k.kernel ;
+          Opencl_api.Program.release k.program)
+        ()
+
+    (* Per-device eviction, the model every backend cache follows (see
+       Cache_hooks.mli). OpenCL exposes no device-destroy entry point, so
+       nothing in this backend fires the notification today; registering anyway
+       is what keeps the model uniform rather than "per-device on CUDA/HIP,
+       global everywhere else", and it means the day an OpenCL teardown path
+       appears the eviction is already wired. Match on the family name this
+       backend would fire under, never on the index alone: backend-local
+       indices collide across backends. *)
+    let () =
+      Spoc_framework.Cache_hooks.on_device_destroy (fun ~backend index ->
+          if String.equal backend "OpenCL" then
+            Spoc_framework.Guarded_cache.evict_device cache index)
 
     let compile device ~name ~source =
       let state = get_state device.Opencl_api.Device.id in
@@ -238,20 +278,18 @@ module Opencl : Framework_sig.PLUGIN_BASE = struct
           ~source
           ()
       in
-      match Hashtbl.find_opt cache key with
-      | Some k -> k
-      | None ->
-          let k = compile device ~name ~source in
-          Hashtbl.add cache key k ;
-          k
+      (* [~device_id] is the same backend-local index the key already carries;
+         without it the entry is not grouped by device and [evict_device] can
+         never reach it. *)
+      Spoc_framework.Guarded_cache.find_or_build
+        cache
+        ~key
+        ~device_id:device.Opencl_api.Device.id
+        (fun () -> compile device ~name ~source)
 
     let clear_cache () =
-      Hashtbl.iter
-        (fun _ k ->
-          Opencl_api.Kernel.release k.kernel ;
-          Opencl_api.Program.release k.program)
-        cache ;
-      Hashtbl.clear cache
+      Spoc_framework.Cache_hooks.around_clear (fun () ->
+          Spoc_framework.Guarded_cache.clear cache)
 
     let load_from_ptx ~name:_ ~ptx:_ =
       Opencl_error.raise_error

@@ -38,6 +38,7 @@ let make_vector_add_kernel () : kernel =
             None ) )
   in
   {
+    default_kernel with
     kern_name = "vector_add";
     kern_params =
       [
@@ -46,12 +47,7 @@ let make_vector_add_kernel () : kernel =
         DParam (c, Some {arr_elttype = TFloat32; arr_memspace = Global});
         DParam (n, None);
       ];
-    kern_locals = [];
     kern_body = body;
-    kern_types = [];
-    kern_variants = [];
-    kern_funcs = [];
-    kern_native_fn = None;
   }
 
 (** Check that [ptx] contains [marker]; fail with a readable message if not. *)
@@ -81,6 +77,37 @@ let contains ptx marker =
   done ;
   !found
 
+(** First index of [marker] in [ptx], or [-1] if absent. *)
+let index_of ptx marker =
+  let mlen = String.length marker and plen = String.length ptx in
+  let rec loop i =
+    if i > plen - mlen then -1
+    else if String.sub ptx i mlen = marker then i
+    else loop (i + 1)
+  in
+  loop 0
+
+(** Assert the first occurrence of [a] strictly precedes the first occurrence of
+    [b] in [ptx] (both must be present). Pins textual/emission order. *)
+let assert_before ptx a b =
+  let ia = index_of ptx a and ib = index_of ptx b in
+  if ia < 0 then
+    Alcotest.fail (Printf.sprintf "marker %S absent\nPTX:\n%s" a ptx) ;
+  if ib < 0 then
+    Alcotest.fail (Printf.sprintf "marker %S absent\nPTX:\n%s" b ptx) ;
+  if not (ia < ib) then
+    Alcotest.fail
+      (Printf.sprintf
+         "expected %S (index %d) to precede %S (index %d) — operand emission \
+          order reversed\n\
+          PTX:\n\
+          %s"
+         a
+         ia
+         b
+         ib
+         ptx)
+
 let test_vector_add_markers () =
   let k = make_vector_add_kernel () in
   let ptx = Sarek_ir_ptx.generate k in
@@ -96,14 +123,11 @@ let make_var name ty =
 
 let base_kernel name params body funcs =
   {
+    default_kernel with
     kern_name = name;
     kern_params = params;
-    kern_locals = [];
     kern_body = body;
-    kern_types = [];
-    kern_variants = [];
     kern_funcs = funcs;
-    kern_native_fn = None;
   }
 
 (** Shared-array reduction shape: let%shared sdata = 256 lowers to SLet (sdata,
@@ -444,6 +468,50 @@ let test_f32_transcendental_markers () =
   assert_contains ptx "ex2.approx.f32" ;
   assert_contains ptx "div.approx.f32"
 
+(** Regression (#279 CodeRabbit "Major"): every multi-operand PTX intrinsic must
+    emit its operand sub-expressions in LEFT-TO-RIGHT source order.
+
+    [emit_expr] is side-effecting (it appends instructions to the buffer and
+    allocates fresh registers), so binding the two operands of a binary
+    intrinsic through a tuple — [(emit_expr a, emit_expr b)], as
+    [intr_binary_args] did — leaves component evaluation order UNSPECIFIED, and
+    ocamlopt evaluates tuple components right-to-left: it emitted operand [b]'s
+    instructions before operand [a]'s, reversing register numbering and the
+    order of observable side effects (array reads, atomics) relative to source.
+
+    The pre-existing goldens exercised binary intrinsics only with simple
+    register-only operands (e.g. [fmod av av]), which emit no operand
+    instructions and are therefore order-insensitive — the golden gap that let
+    the reversal slip through. Here the two [fmod] operands are DISTINGUISHABLE
+    nested intrinsics ([sin] vs [cos]): with correct left-to-right emission the
+    first operand's [sin.approx.f32] precedes the second operand's
+    [cos.approx.f32]. A tuple / right-to-left regression flips that order and
+    fails [assert_before]. *)
+let test_binary_intrinsic_operand_order () =
+  let out = make_var "out" (TVec TFloat32) in
+  let a = make_var "a" (TVec TFloat32) in
+  let tid = make_var "tid" TInt32 in
+  let path name args = EIntrinsic (["Sarek_stdlib"; "Float32"], name, args) in
+  let av = EArrayRead ("a", EVar tid) in
+  (* out.[i] <- fmod (sin a.[i]) (cos a.[i]) — a binary intrinsic
+     ([intr_binary_args]) whose two operands are distinct side-effecting
+     sub-expressions. *)
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign
+          ( LArrayElem ("out", EVar tid),
+            path "fmod" [path "sin" [av]; path "cos" [av]] ) )
+  in
+  let mk v = DParam (v, Some {arr_elttype = TFloat32; arr_memspace = Global}) in
+  let k = base_kernel "binop_operand_order" [mk out; mk a] body [] in
+  let ptx = Sarek_ir_ptx.generate k in
+  assert_contains ptx "sin.approx.f32" ;
+  assert_contains ptx "cos.approx.f32" ;
+  (* First operand ([sin]) emitted before the second ([cos]). *)
+  assert_before ptx "sin.approx.f32" "cos.approx.f32"
+
 (** Extended atomics emit atom.{shared,global}.<op>.<ty>; sub lowers to
     neg + add. *)
 let test_atomic_family_markers () =
@@ -600,6 +668,57 @@ let test_float_mod_fmod_markers () =
   assert_contains ptx "selp.f64" ;
   assert_contains ptx "selp.f32"
 
+(** Float32.fmod / Float64.fmod (the explicit intrinsic, EIntrinsic path) reach
+    the SAME emit_float_fmod lowering as the [Mod] binop — the exact-C-fmod
+    iterative reduction. Guards the intrinsic-dispatch wiring added by
+    float-mod-intrinsic. *)
+let test_fmod_intrinsic_markers () =
+  let fa = make_var "fa" (TVec TFloat32) in
+  let da = make_var "da" (TVec TFloat64) in
+  let tid = make_var "tid" TInt32 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SSeq
+          [
+            SAssign
+              ( LArrayElem ("fa", EVar tid),
+                EIntrinsic
+                  ( ["Float32"],
+                    "fmod",
+                    [EArrayRead ("fa", EVar tid); EConst (CFloat32 3.0)] ) );
+            SAssign
+              ( LArrayElem ("da", EVar tid),
+                EIntrinsic
+                  ( ["Float64"],
+                    "fmod",
+                    [EArrayRead ("da", EVar tid); EConst (CFloat64 3.0)] ) );
+          ] )
+  in
+  let k =
+    base_kernel
+      "fmod_intrinsic"
+      [
+        DParam (fa, Some {arr_elttype = TFloat32; arr_memspace = Global});
+        DParam (da, Some {arr_elttype = TFloat64; arr_memspace = Global});
+      ]
+      body
+      []
+  in
+  let ptx = Sarek_ir_ptx.generate k in
+  (* Same emit_float_fmod signature as the Mod binop test above. *)
+  assert_contains ptx "div.rn.f32" ;
+  assert_contains ptx "cvt.rzi.f32.f32" ;
+  assert_contains ptx "fma.rn.f32" ;
+  assert_contains ptx "copysign.f32" ;
+  assert_contains ptx "div.rn.f64" ;
+  assert_contains ptx "cvt.rzi.f64.f64" ;
+  assert_contains ptx "fma.rn.f64" ;
+  assert_contains ptx "copysign.f64" ;
+  assert_contains ptx "selp.f64" ;
+  assert_contains ptx "selp.f32"
+
 (** Integer Div/Mod are SIGNED (audit finding H1): Sarek int32/int64 are signed
     everywhere (interpreter uses Int32.div/Int64.div, C backends emit / and % on
     signed types), so PTX must emit div.s32/s64 and rem.s32/s64. The old
@@ -673,6 +792,35 @@ let test_f32_div_correctly_rounded () =
   assert_contains ptx "div.rn.f32" ;
   if contains ptx "div.approx.f32" then
     Alcotest.fail "plain f32 division must not use div.approx.f32"
+
+(** Plain f32 [sqrt] is correctly rounded, for the same reason division is: the
+    sqrt intrinsic must emit sqrt.rn.f32, not the ~1-ulp sqrt.approx.f32 (which
+    remains reserved for already-approximate intrinsics like rsqrt).
+
+    This lives here, next to the div case, rather than only in the df64 guard:
+    the df64 guard reaches this lowering through a df64_sqrt kernel, so
+    rewriting df64_sqrt would silently un-assert it. sqrt.approx.f32 shipped for
+    years because NOTHING asserted the f32 sqrt lowering anywhere. *)
+let test_f32_sqrt_correctly_rounded () =
+  let out = make_var "out" (TVec TFloat32) in
+  let a = make_var "a" (TVec TFloat32) in
+  let tid = make_var "tid" TInt32 in
+  let av = EArrayRead ("a", EVar tid) in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign
+          ( LArrayElem ("out", EVar tid),
+            EIntrinsic (["Sarek_stdlib"; "Gpu"], "sqrt", [av]) ) )
+  in
+  let mk v = DParam (v, Some {arr_elttype = TFloat32; arr_memspace = Global}) in
+  let k = base_kernel "f32_sqrt" [mk out; mk a] body [] in
+  let ptx = Sarek_ir_ptx.generate k in
+  assert_contains ptx "sqrt.rn.f32" ;
+  (* Anchored: "sqrt.approx.f32" is a substring of "rsqrt.approx.f32". *)
+  if contains ptx " sqrt.approx.f32 " then
+    Alcotest.fail "plain f32 sqrt must not use sqrt.approx.f32"
 
 (** Int64 comparison family, Not/BitNot and min/max must be class-aware (audit
     finding H2): the old code emitted setp.*.s32 / not.b32 / min.s32 on %rd
@@ -852,6 +1000,120 @@ let test_atomic_stride_and_space_rejected () =
   | _ -> Alcotest.fail "global-form atomic on shared array should be rejected"
   | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()
 
+(** #70(a): the index register class was never checked. Every address
+    computation — [Sarek_ir_ptx_mem.emit_elt_addr] for ordinary indexing and
+    [intr_atomic_addr] for atomics — treats the index register as 32-bit
+    ([shl.b32] on the shared path, [cvt.u64.u32] on the global one). An index
+    expression that evaluates to a [%rd] (u64) or [%f]/[%fd] (float) register
+    therefore produced text like
+
+    cvt.u64.u32 %rd4, %rd3;
+
+    which is invalid PTX. It failed at ptxas or module load with no Sarek-level
+    message, while the VALUE operand of the very same atomic was already
+    class-checked one line earlier ([intr_check_atom_operand]).
+
+    Both call sites are covered here: a fix in only one of them leaves the same
+    hole in the other. *)
+let test_int64_index_rejected () =
+  let idx64 = make_var "idx64" TInt64 in
+  let a = make_var "a" (TVec TFloat32) in
+  let out = make_var "out" (TVec TFloat32) in
+  let params =
+    [
+      DParam (a, Some {arr_elttype = TFloat32; arr_memspace = Global});
+      DParam (out, Some {arr_elttype = TFloat32; arr_memspace = Global});
+    ]
+  in
+  (* Ordinary array read through an int64 index. *)
+  let read_body =
+    SLet
+      ( idx64,
+        EConst (CInt64 3L),
+        SAssign
+          (LArrayElem ("out", EConst (CInt32 0l)), EArrayRead ("a", EVar idx64))
+      )
+  in
+  (match
+     base_kernel "i64_index_read" params read_body [] |> Sarek_ir_ptx.generate
+   with
+  | ptx ->
+      Alcotest.fail
+        (Printf.sprintf
+           "an int64 array index should be rejected, but PTX was emitted:\n%s"
+           ptx)
+  | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()) ;
+  (* Array write through an int64 index. *)
+  let write_body =
+    SLet
+      ( idx64,
+        EConst (CInt64 3L),
+        SAssign (LArrayElem ("out", EVar idx64), EConst (CFloat32 1.0)) )
+  in
+  (match
+     base_kernel "i64_index_write" params write_body [] |> Sarek_ir_ptx.generate
+   with
+  | ptx ->
+      Alcotest.fail
+        (Printf.sprintf
+           "an int64 array-write index should be rejected, but PTX was emitted:\n\
+            %s"
+           ptx)
+  | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()) ;
+  (* Atomic through an int64 index. *)
+  let acc = make_var "acc" (TVec TInt32) in
+  let atomic_body =
+    SLet
+      ( idx64,
+        EConst (CInt64 3L),
+        SExpr
+          (EIntrinsic
+             ( ["Sarek_stdlib"; "Gpu"],
+               "atomic_add_int32",
+               [EVar acc; EVar idx64; EConst (CInt32 1l)] )) )
+  in
+  match
+    base_kernel
+      "i64_index_atomic"
+      [DParam (acc, Some {arr_elttype = TInt32; arr_memspace = Global})]
+      atomic_body
+      []
+    |> Sarek_ir_ptx.generate
+  with
+  | ptx ->
+      Alcotest.fail
+        (Printf.sprintf
+           "an int64 atomic index should be rejected, but PTX was emitted:\n%s"
+           ptx)
+  | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()
+
+(** Positive control for the check above: an ordinary int32 index must still
+    generate, or the rejection would be indistinguishable from "indexing is
+    broken". *)
+let test_int32_index_still_generates () =
+  let tid = make_var "tid" TInt32 in
+  let a = make_var "a" (TVec TFloat32) in
+  let out = make_var "out" (TVec TFloat32) in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SAssign (LArrayElem ("out", EVar tid), EArrayRead ("a", EVar tid)) )
+  in
+  let ptx =
+    base_kernel
+      "i32_index"
+      [
+        DParam (a, Some {arr_elttype = TFloat32; arr_memspace = Global});
+        DParam (out, Some {arr_elttype = TFloat32; arr_memspace = Global});
+      ]
+      body
+      []
+    |> Sarek_ir_ptx.generate
+  in
+  assert_contains ptx "cvt.u64.u32" ;
+  assert_contains ptx "ld.global.f32"
+
 (** Check that [ptx] does NOT contain [marker]. *)
 let assert_absent ptx marker ~why =
   let mlen = String.length marker in
@@ -866,6 +1128,92 @@ let assert_absent ptx marker ~why =
          marker
          why
          ptx)
+
+(** backlog-167: the Float64 scalar conversions must EMIT on PTX.
+
+    [Float64.of_int32] raised "unsupported construct: intrinsic: of_int32" on
+    CUDA/PTX while passing on OpenCL, Vulkan, Native and the Interpreter —
+    measured on a GTX 1070 Max-Q (sm_61, CUDA 12.9). The CPU-passes/device-fails
+    shape: the only coverage these intrinsics had was device-EXECUTION tests,
+    and those skip on a host with no CUDA device, so the suite was green here
+    and red on real hardware. test_f64_scalar_conversions and
+    test_tailrec_vector_param both hit it.
+
+    THIS IS THE TEST THAT WOULD HAVE CAUGHT IT WITHOUT NVIDIA HARDWARE, which is
+    the whole point of putting it here — PTX text generation needs no device.
+
+    Each conversion is asserted on its own emitted instruction, individually, so
+    dropping one name from the dispatch table fails on that name rather than
+    somewhere vague. [of_int] and [to_int] were already routed before
+    backlog-167 and are covered here too, so a regression in the shared arms is
+    caught. *)
+let test_f64_conversions_emit () =
+  let check_one name arg_ty out_elt want_instr =
+    let x = make_var "x" arg_ty in
+    let out = make_var "out" (TVec out_elt) in
+    let ptx =
+      base_kernel
+        ("f64_conv_" ^ name)
+        [
+          DParam (x, None);
+          DParam (out, Some {arr_elttype = out_elt; arr_memspace = Global});
+        ]
+        (SAssign
+           ( LArrayElem ("out", EConst (CInt32 0l)),
+             EIntrinsic (["Float64"], name, [EVar x]) ))
+        []
+      |> Sarek_ir_ptx.generate
+    in
+    assert_contains ptx want_instr ;
+    ptx
+  in
+  ignore (check_one "of_int32" TInt32 TFloat64 "cvt.rn.f64.s32") ;
+  ignore (check_one "of_int" TInt32 TFloat64 "cvt.rn.f64.s32") ;
+  ignore (check_one "to_int32" TFloat64 TInt32 "cvt.rzi.s32.f64") ;
+  (* Exact widening, so NO rounding modifier: ptxas rejects [cvt.rn.f64.f32]
+     outright ("Illegal modifier"). Assert both polarities on the same emitted
+     text — the instruction is present AND the illegal spelling is not — because
+     the presence check alone is satisfied by a string that CONTAINS it. *)
+  let widen = check_one "of_float32" TFloat32 TFloat64 "cvt.f64.f32" in
+  assert_absent
+    widen
+    "cvt.rn.f64.f32"
+    ~why:"f32 -> f64 is exact; ptxas rejects a rounding modifier on it"
+
+(** [to_float32] is the one conversion PTX still refuses, and this pins that the
+    backlog-167 fix did not quietly widen the set.
+
+    Sarek_ir_glsl's [glsl_conversions] omits BOTH [to_int] and [to_float32]
+    because their device templates round/truncate while the [ocaml] field Native
+    mirrors is [Stdlib.int_of_float] (63-bit) and the IDENTITY respectively —
+    three implementations already disagree. PTX is NOT symmetric with GLSL here:
+    it has accepted [to_int] since its conversion table existed (asserted
+    above), so that half of the disagreement is already reachable on this
+    backend. Only [to_float32] is genuinely unrouted, and it stays that way
+    until the semantics are settled rather than acquiring a third implementation
+    by accident. *)
+let test_f64_to_float32_still_refused () =
+  let x = make_var "x" TFloat64 in
+  let out = make_var "out" (TVec TFloat32) in
+  let k =
+    base_kernel
+      "f64_to_float32"
+      [
+        DParam (x, None);
+        DParam (out, Some {arr_elttype = TFloat32; arr_memspace = Global});
+      ]
+      (SAssign
+         ( LArrayElem ("out", EConst (CInt32 0l)),
+           EIntrinsic (["Float64"], "to_float32", [EVar x]) ))
+      []
+  in
+  match Sarek_ir_ptx.generate k with
+  | _ ->
+      Alcotest.fail
+        "Float64.to_float32 emitted PTX. Its semantics disagree across Native \
+         (identity), the device templates (narrowing) and GLSL (refused); it \
+         must stay refused until that is decided, not routed in passing."
+  | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()
 
 let point_ty = TRecord ("point", [("x", TFloat32); ("y", TFloat32)])
 
@@ -1753,9 +2101,9 @@ let make_math_kernel elt path name =
   let mk v = DParam (v, Some {arr_elttype = elt; arr_memspace = Global}) in
   base_kernel ("math_" ^ name) [mk out; mk a] body []
 
-(** Float64 sin lowers to the software implementation (inlined
-    Sarek_ir_ptx_softmath helper): Cody-Waite reduction + fma polynomial on f64
-    registers, never the f32 [.approx] instruction. *)
+(** Float64 sin lowers to the software implementation (inlined Sarek_ir_softmath
+    helper): Cody-Waite reduction + fma polynomial on f64 registers, never the
+    f32 [.approx] instruction. *)
 let test_f64_sin_softmath () =
   let k = make_math_kernel TFloat64 ["Float64"] "sin" in
   let ptx = Sarek_ir_ptx.generate k in
@@ -1787,12 +2135,21 @@ let test_f64_exp_log_softmath () =
     Alcotest.fail "f64 log must not emit the f32 .approx instruction"
 
 (** f32 asin has no native PTX op and no accurate composition; it lowers via the
-    f64 softmath helper: widen (cvt.rn.f64.f32), inline the fdlibm-style f64
-    body (fma.rn.f64 + sqrt.rn.f64), round back (cvt.rn.f32.f64). *)
+    f64 softmath helper: widen (cvt.f64.f32 — an EXACT conversion, on which PTX
+    forbids a rounding modifier: [cvt.rn.f64.f32] is rejected by ptxas), inline
+    the fdlibm-style f64 body (fma.rn.f64 + sqrt.rn.f64), round back
+    (cvt.rn.f32.f64 — inexact, so that one requires .rn). The kernel is
+    assembled by the sweep gate in test_ptx_intrinsic_sweep.ml. *)
 let test_f32_asin_via_f64 () =
   let k = make_math_kernel TFloat32 ["Sarek_stdlib"; "Float32"] "asin" in
   let ptx = Sarek_ir_ptx.generate k in
-  assert_contains ptx "cvt.rn.f64.f32" ;
+  assert_contains ptx "cvt.f64.f32" ;
+  assert_absent
+    ptx
+    "cvt.rn.f64.f32"
+    ~why:
+      "a rounding modifier on the exact f32->f64 widening is illegal PTX \
+       (ptxas: Illegal rounding modifier for instruction 'cvt')" ;
   assert_contains ptx "fma.rn.f64" ;
   assert_contains ptx "sqrt.rn.f64" ;
   assert_contains ptx "cvt.rn.f32.f64"
@@ -2205,14 +2562,41 @@ let soa_field_sum_kernel () =
     []
 
 let test_ptxas_assembles () =
-  if not (Lazy.force ptxas_available) then
-    Printf.printf "  SKIP: ptxas not on PATH (CPU-only environment)\n%!"
+  if not (Lazy.force ptxas_available) then begin
+    Printf.printf "  SKIP: ptxas not on PATH (CPU-only environment)\n%!" ;
+    Alcotest.skip ()
+  end
   else begin
     let ia = make_var "ia" (TVec TInt32) in
     let la = make_var "la" (TVec TInt64) in
     let out = make_var "out" (TVec TInt32) in
+    let fa = make_var "fa" (TVec TFloat32) in
+    let da = make_var "da" (TVec TFloat64) in
     let tid = make_var "tid" TInt32 in
     let x = make_var "x" TInt64 in
+    (* Float32/64.fmod intrinsic reaches emit_float_fmod's iterative reduction;
+       assemble it so ptxas proves the reduction (div.rn/cvt.rzi/fma/selp/
+       copysign, both widths) is valid PTX, not only that the markers appear. *)
+    let fmod_body =
+      SLet
+        ( tid,
+          EIntrinsic ([], "global_thread_id", []),
+          SSeq
+            [
+              SAssign
+                ( LArrayElem ("fa", EVar tid),
+                  EIntrinsic
+                    ( ["Float32"],
+                      "fmod",
+                      [EArrayRead ("fa", EVar tid); EConst (CFloat32 3.0)] ) );
+              SAssign
+                ( LArrayElem ("da", EVar tid),
+                  EIntrinsic
+                    ( ["Float64"],
+                      "fmod",
+                      [EArrayRead ("da", EVar tid); EConst (CFloat64 3.0)] ) );
+            ] )
+    in
     let div_body =
       SLet
         ( tid,
@@ -2267,6 +2651,34 @@ let test_ptxas_assembles () =
             ]
             cmp_body
             [] );
+        ( "fmod_intrinsic",
+          base_kernel
+            "fmod_intrinsic"
+            [
+              DParam (fa, Some {arr_elttype = TFloat32; arr_memspace = Global});
+              DParam (da, Some {arr_elttype = TFloat64; arr_memspace = Global});
+            ]
+            fmod_body
+            [] );
+        (* #279 operand-order regression: a binary intrinsic ([fmod]) whose two
+           operands are distinct side-effecting sub-expressions ([sin]/[cos]).
+           Beyond the marker order-check above, prove the left-to-right emission
+           still assembles. *)
+        ( "binop_operand_order",
+          base_kernel
+            "binop_operand_order"
+            [DParam (fa, Some {arr_elttype = TFloat32; arr_memspace = Global})]
+            (let f name args =
+               EIntrinsic (["Sarek_stdlib"; "Float32"], name, args)
+             in
+             let av = EArrayRead ("fa", EVar tid) in
+             SLet
+               ( tid,
+                 EIntrinsic ([], "global_thread_id", []),
+                 SAssign
+                   ( LArrayElem ("fa", EVar tid),
+                     f "fmod" [f "sin" [av]; f "cos" [av]] ) ))
+            [] );
       ]
     in
     List.iter
@@ -2302,9 +2714,9 @@ let test_ptxas_assembles () =
 let test_soa_field_read_markers () =
   let k = soa_field_sum_kernel () in
   let soa = Sarek_ir_ptx.generate ~soa_params:["pts"] k in
-  assert_contains soa ".param .u64 param_pts_soa_x" ;
-  assert_contains soa ".param .u64 param_pts_soa_y" ;
-  assert_contains soa ".param .u64 param_pts_soa_z" ;
+  assert_contains soa ".param .u64 param_sarek_soa_pts_x" ;
+  assert_contains soa ".param .u64 param_sarek_soa_pts_y" ;
+  assert_contains soa ".param .u64 param_sarek_soa_pts_z" ;
   assert_contains soa ".param .u32 param_sarek_pts_length" ;
   if count_substr soa "ld.global.f32" < 3 then
     Alcotest.fail (Printf.sprintf "expected >=3 coalesced leaf loads:\n%s" soa) ;
@@ -2325,7 +2737,7 @@ let test_soa_field_read_markers () =
   assert_contains aos "mul.wide.u32" ;
   assert_absent
     aos
-    "param_pts_soa_x"
+    "param_sarek_soa_pts_x"
     ~why:"AoS compilation must not emit SoA per-leaf pointers"
 
 (** Whole-element copy between two SoA vectors: per-leaf coalesced loads from
@@ -2357,8 +2769,8 @@ let test_soa_whole_copy_markers () =
       []
   in
   let soa = Sarek_ir_ptx.generate ~soa_params:["src"; "dst"] k in
-  assert_contains soa ".param .u64 param_src_soa_x" ;
-  assert_contains soa ".param .u64 param_dst_soa_z" ;
+  assert_contains soa ".param .u64 param_sarek_soa_src_x" ;
+  assert_contains soa ".param .u64 param_sarek_soa_dst_z" ;
   if count_substr soa "ld.global.f32" < 3 then
     Alcotest.fail (Printf.sprintf "expected >=3 leaf loads:\n%s" soa) ;
   if count_substr soa "st.global.f32" < 3 then
@@ -2442,8 +2854,8 @@ let test_soa_mixed_width_markers () =
       []
   in
   let soa = Sarek_ir_ptx.generate ~soa_params:["v"] k in
-  assert_contains soa ".param .u64 param_v_soa_i" ;
-  assert_contains soa ".param .u64 param_v_soa_d" ;
+  assert_contains soa ".param .u64 param_sarek_soa_v_i" ;
+  assert_contains soa ".param .u64 param_sarek_soa_v_d" ;
   assert_contains soa "ld.global.s32" ;
   assert_contains soa "ld.global.f64" ;
   assert_absent
@@ -2455,8 +2867,8 @@ let test_soa_mixed_width_markers () =
     load, each from its own base (the remaining two leaf widths). *)
 let test_soa_int64_markers () =
   let soa = Sarek_ir_ptx.generate ~soa_params:["v"] (soa_long_kernel ()) in
-  assert_contains soa ".param .u64 param_v_soa_p" ;
-  assert_contains soa ".param .u64 param_v_soa_q" ;
+  assert_contains soa ".param .u64 param_sarek_soa_v_p" ;
+  assert_contains soa ".param .u64 param_sarek_soa_v_q" ;
   assert_contains soa "ld.global.s64" ;
   assert_contains soa "ld.global.s32" ;
   assert_absent
@@ -2501,6 +2913,62 @@ let test_soa_nested_record_rejected () =
   | _ -> Alcotest.fail "SoA on a nested-record vector should be rejected"
   | exception Sarek_codegen.Sarek_ir_ptx_types.Ptx_codegen_error _ -> ()
 
+(** PRECONDITION regression (Tier 1c namespace fix): a SoA vector [x] with field
+    [y] alongside a distinct scalar param literally named [x_soa_y] must compile
+    to two DISTINCT PTX operands. The generated SoA leaf now lives in the
+    reserved [sarek_] namespace ([param_sarek_soa_x_y]), so it cannot alias the
+    user param's generated name ([param_x_soa_y]). Before the fix both mangled
+    to [param_x_soa_y] — silently-wrong PTX. (A user param cannot itself be
+    [sarek_]-prefixed — #258 reserves that — so the collision is one-directional
+    and fully closed by prefixing the generated side.) *)
+let test_soa_param_name_collision_safe () =
+  let xy_ty = TRecord ("xy", [("y", TFloat32); ("z", TFloat32)]) in
+  let x = make_var "x" (TVec xy_ty) in
+  (* User scalar param whose name collides with the OLD SoA mangle
+     [param_<vec>_soa_<field>] for vector [x], field [y]. *)
+  let x_soa_y = make_var "x_soa_y" TFloat32 in
+  let out = make_var "out" (TVec TFloat32) in
+  let n = make_var "n" TInt32 in
+  let tid = make_var "tid" TInt32 in
+  let body =
+    SLet
+      ( tid,
+        EIntrinsic ([], "global_thread_id", []),
+        SIf
+          ( EBinop (Lt, EVar tid, EVar n),
+            SAssign
+              ( LArrayElem ("out", EVar tid),
+                EBinop
+                  ( Add,
+                    ERecordField (EArrayRead ("x", EVar tid), "y"),
+                    EVar x_soa_y ) ),
+            None ) )
+  in
+  let k =
+    base_kernel
+      "collision"
+      [
+        DParam (x, Some {arr_elttype = xy_ty; arr_memspace = Global});
+        DParam (x_soa_y, None);
+        DParam (out, Some {arr_elttype = TFloat32; arr_memspace = Global});
+        DParam (n, None);
+      ]
+      body
+      []
+  in
+  let soa = Sarek_ir_ptx.generate ~soa_params:["x"] k in
+  (* Generated SoA leaf sits in the reserved namespace. *)
+  assert_contains soa ".param .u64 param_sarek_soa_x_y" ;
+  (* User scalar keeps its own (non-reserved) generated name. *)
+  assert_contains soa ".param .f32 param_x_soa_y" ;
+  (* And the generated leaf must NOT have taken the user's name. *)
+  assert_absent
+    soa
+    ".param .u64 param_x_soa_y"
+    ~why:
+      "the generated SoA leaf must not alias the user scalar param's name — it \
+       is prefixed into the reserved sarek_ namespace"
+
 let () =
   Alcotest.run
     "ptx_snapshot"
@@ -2527,6 +2995,11 @@ let () =
             "f32 transcendentals compose sin/cos/lg2/ex2/div .approx"
             `Quick
             test_f32_transcendental_markers;
+          Alcotest.test_case
+            "binary intrinsic emits operands left-to-right (#279 tuple-order \
+             regression)"
+            `Quick
+            test_binary_intrinsic_operand_order;
           Alcotest.test_case
             "f64 sin lowers to softmath (fma/floor/selp .f64, no .approx)"
             `Quick
@@ -2560,6 +3033,10 @@ let () =
             `Quick
             test_float_mod_fmod_markers;
           Alcotest.test_case
+            "Float32/64.fmod intrinsic reaches emit_float_fmod"
+            `Quick
+            test_fmod_intrinsic_markers;
+          Alcotest.test_case
             "integer Div/Mod emit signed div.s32/s64 rem.s32/s64"
             `Quick
             test_int_div_rem_signed_markers;
@@ -2571,6 +3048,10 @@ let () =
             "plain f32 division emits div.rn.f32"
             `Quick
             test_f32_div_correctly_rounded;
+          Alcotest.test_case
+            "plain f32 sqrt emits sqrt.rn.f32"
+            `Quick
+            test_f32_sqrt_correctly_rounded;
           Alcotest.test_case
             "ECast matrix: bool setp/selp + i32<->i64 cvt pairs"
             `Quick
@@ -2744,5 +3225,26 @@ let () =
             "SoA on a nested-record vector is rejected"
             `Quick
             test_soa_nested_record_rejected;
+          Alcotest.test_case
+            "SoA leaf name cannot alias a user param named <vec>_soa_<field>"
+            `Quick
+            test_soa_param_name_collision_safe;
+          Alcotest.test_case
+            "non-u32 array/atomic index is rejected, not emitted as invalid PTX"
+            `Quick
+            test_int64_index_rejected;
+          Alcotest.test_case
+            "int32 index still generates (positive control)"
+            `Quick
+            test_int32_index_still_generates;
+          Alcotest.test_case
+            "Float64 scalar conversions EMIT on PTX (backlog-167)"
+            `Quick
+            test_f64_conversions_emit;
+          Alcotest.test_case
+            "Float64.to_float32 stays refused: semantics undecided \
+             (backlog-167)"
+            `Quick
+            test_f64_to_float32_still_refused;
         ] );
     ]

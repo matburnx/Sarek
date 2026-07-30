@@ -260,7 +260,151 @@ let mtl_buffer_length buf =
 
 (** {1 Library API} *)
 
-let mtl_device_new_library_with_source dev source _options =
+(** {2 MTLMathMode / MTLMathFloatingPointFunctions}
+
+    READ FROM THE SDK, not guessed: [MTLLibrary.h:241-246] and [258-262] on
+    macOS 15.6.1 (Command Line Tools SDK). The previous revision of this file
+    declined to use [setMathMode:] precisely because these values could not be
+    checked; they can now. *)
+
+let mtl_math_mode_safe = 0L
+
+let mtl_math_floating_point_functions_precise = 1L
+
+(** Build an [MTLCompileOptions] configured for Sarek's float semantics, or
+    [None] if that cannot be done on this host.
+
+    WHY (backlog #125). Metal's defaults trade accuracy for speed, and until
+    this change {!mtl_device_new_library_with_source} took an [_options]
+    argument and IGNORED it while [Metal_api] passed null anyway. So every Sarek
+    Metal kernel took those defaults and there was no route to change them — not
+    "no policy", but an UNSETTABLE wrong default.
+
+    MEASURED on Apple M4 / macOS 15.6.1 (24G90) / Apple clang 17.0.0. A freshly
+    constructed [MTLCompileOptions] reports [mathMode = 2] ([MTLMathModeFast])
+    and [mathFloatingPointFunctions = 0] ([...Fast]). BOTH defaults are the fast
+    one, which is why both are set here — setting [mathMode] alone still leaves
+    single-precision math functions resolving to [metal::fast].
+
+    THE OPTIONS ARE HONOURED, and that had to be established rather than
+    assumed: a compile that succeeds proves plumbing, not semantics. Over 65536
+    inputs on [sqrt(a) + 1/a], against the default:
+
+    - [mathMode=Safe] alone changes 16017 results;
+    - [mathMode=Safe] + [fpFunctions=Precise] changes 22135.
+
+    So Metal is NOT in the class of rusticl's OpenCL FP options, which are
+    accepted and discarded (docs/fp-contraction-policy.md §9.2).
+
+    WHAT THESE OPTIONS DO NOT BUY: CONTRACTION. Measured on the same device,
+    [a*b+c] is contracted into an fma on all 8773 observable elements under
+    EVERY setting tried, including [mathMode=Safe]. Contraction is defeated in
+    the generated source instead, by [#pragma METAL fp contract(off)]
+    ([Sarek_ir_metal.metal_fp_contract_pragma], measured 0/8773). Do not read
+    this function as a contraction defence; it is not one.
+
+    WHY BOTH SPELLINGS. [fastMathEnabled] is deprecated since macOS 15.0 in
+    favour of [mathMode], but [mathMode] does not exist before macOS 15.0 / iOS
+    18.0, so the deprecated property is the only route on older systems. The
+    modern pair is preferred when present and the boolean is the fallback. They
+    are EQUIVALENT, measured: [fastMathEnabled = NO] and
+    [mathMode=Safe + fpFunctions=Precise] are BIT-IDENTICAL over 65536 elements
+    of [sqrt + reciprocal + sin + log + exp]. The fallback is therefore not a
+    degraded path, and that is measured rather than believed.
+
+    FAIL-SOFT BY CONSTRUCTION. Every failure path returns [None], and [None]
+    makes the caller pass null, which is EXACTLY the behaviour that shipped
+    before this change: a missing libobjc, a missing class, an OS responding to
+    neither selector, or a null allocation all degrade to the old behaviour
+    rather than propagating. *)
+let mtl_compile_options_conformant () : mtl_compile_options option =
+  try
+    let cls = objc_getClass "MTLCompileOptions" in
+    if is_null cls then None
+    else
+      let allocated = objc_msgSend cls (sel_registerName "alloc") in
+      if is_null allocated then None
+      else
+        let obj = objc_msgSend allocated (sel_registerName "init") in
+        if is_null obj then None
+        else begin
+          (* From here on [obj] is owned by us (+1 from [alloc]), so every exit
+             that does not hand it to the caller must release it. *)
+          let responds_to sel =
+            let f =
+              foreign
+                ~from:(get_objc_lib ())
+                "objc_msgSend"
+                (ptr void @-> ptr void @-> ptr void @-> returning uchar)
+            in
+            Unsigned.UChar.to_int
+              (f obj (sel_registerName "respondsToSelector:") sel)
+            <> 0
+          in
+          (* [MTLMathMode] and [MTLMathFloatingPointFunctions] are [NS_ENUM(
+             NSInteger, ...)], i.e. [long] on every Apple 64-bit platform. *)
+          let set_long sel v =
+            let f =
+              foreign
+                ~from:(get_objc_lib ())
+                "objc_msgSend"
+                (ptr void @-> ptr void @-> long @-> returning void)
+            in
+            f obj sel (Signed.Long.of_int64 v)
+          in
+          let sel_math_mode = sel_registerName "setMathMode:" in
+          let sel_fp_funcs =
+            sel_registerName "setMathFloatingPointFunctions:"
+          in
+          let sel_fast_math = sel_registerName "setFastMathEnabled:" in
+          if responds_to sel_math_mode then begin
+            set_long sel_math_mode mtl_math_mode_safe ;
+            (* Independent of mathMode: without it, single-precision math
+               functions still resolve to [metal::fast]. Measured: 16017 vs
+               22135 changed results out of 65536. *)
+            if responds_to sel_fp_funcs then
+              set_long sel_fp_funcs mtl_math_floating_point_functions_precise ;
+            Some obj
+          end
+          else if responds_to sel_fast_math then begin
+            (* Pre-macOS-15 fallback. BOOL is [signed char] on x86_64 macOS and
+               [_Bool] on arm64; both are one byte passed in the low byte of the
+               argument register, so [uchar] is correct on both and ctypes'
+               [bool] would not be. *)
+            let set_bool =
+              foreign
+                ~from:(get_objc_lib ())
+                "objc_msgSend"
+                (ptr void @-> ptr void @-> uchar @-> returning void)
+            in
+            set_bool obj sel_fast_math (Unsigned.UChar.of_int 0) ;
+            Some obj
+          end
+          else begin
+            (* Neither spelling available: release rather than leak, and fall
+               back to null options (the pre-change behaviour). Spelled out
+               rather than calling {!release}, which is defined further down
+               this file. *)
+            let f =
+              foreign
+                ~from:(get_objc_lib ())
+                "objc_msgSend"
+                (ptr void @-> ptr void @-> returning void)
+            in
+            f obj (sel_registerName "release") ;
+            None
+          end
+        end
+  with _ -> None
+
+(** Compile MSL source into an [MTLLibrary].
+
+    [options] is now HONOURED. Before backlog #125 this function's parameter was
+    named [_options] and dropped on the floor, so the only thing it could ever
+    pass was null — see {!mtl_compile_options_conformant} for what that meant.
+*)
+let mtl_device_new_library_with_source dev source
+    (options : mtl_compile_options option) =
   let sel = sel_registerName "newLibraryWithSource:options:error:" in
   let source_ns = nsstring_from_cstring source in
   let error_ptr = allocate (ptr void) null in
@@ -268,11 +412,12 @@ let mtl_device_new_library_with_source dev source _options =
     foreign
       ~from:(get_objc_lib ())
       "objc_msgSend"
-      (ptr void @-> ptr void @-> ns_string @-> ptr void
+      (ptr void @-> ptr void @-> ns_string @-> mtl_compile_options
       @-> ptr (ptr void)
       @-> returning mtl_library)
   in
-  let lib = fn dev sel source_ns null error_ptr in
+  let opts = match options with Some o -> o | None -> null in
+  let lib = fn dev sel source_ns opts error_ptr in
   if is_null lib then begin
     let err = !@error_ptr in
     Error (nserror_description err)

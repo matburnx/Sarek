@@ -6,8 +6,10 @@
 (******************************************************************************
  * Sarek PPX - GPU kernel DSL for OCaml
  *
- * This module quotes Kirc_Ast values back to OCaml AST, so the IR can be
- * embedded in the generated code.
+ * Quotes kernel metadata back to OCaml AST so it can be embedded in the
+ * generated code. The IR itself is quoted by Sarek_quote_ir; this module
+ * builds the surrounding kernel value, its type constraints and the CPU
+ * native wrapper.
  ******************************************************************************)
 
 open Ppxlib
@@ -35,28 +37,14 @@ let quote_int32 ~loc i =
   [%expr [%e Ast_builder.Default.eint ~loc (Int32.to_int i)]]
 
 (** Quote a float as OCaml expression *)
-let quote_float ~loc f = Ast_builder.Default.efloat ~loc (string_of_float f)
+let quote_float ~loc f =
+  Ast_builder.Default.efloat ~loc (Sarek_float_literal.to_source f)
 
 (** Quote a string as OCaml expression *)
 let quote_string ~loc s = Ast_builder.Default.estring ~loc s
 
 (** Quote a bool as OCaml expression *)
 let quote_bool ~loc b = if b then [%expr true] else [%expr false]
-
-(** Quote an elttype *)
-let quote_elttype ~loc (e : Kirc_Ast.elttype) : expression =
-  match e with
-  | Kirc_Ast.EInt32 -> [%expr Sarek.Kirc_Ast.EInt32]
-  | Kirc_Ast.EInt64 -> [%expr Sarek.Kirc_Ast.EInt64]
-  | Kirc_Ast.EFloat32 -> [%expr Sarek.Kirc_Ast.EFloat32]
-  | Kirc_Ast.EFloat64 -> [%expr Sarek.Kirc_Ast.EFloat64]
-
-(** Quote a memspace *)
-let quote_memspace ~loc (m : Kirc_Ast.memspace) : expression =
-  match m with
-  | Kirc_Ast.LocalSpace -> [%expr Sarek.Kirc_Ast.LocalSpace]
-  | Kirc_Ast.Global -> [%expr Sarek.Kirc_Ast.Global]
-  | Kirc_Ast.Shared -> [%expr Sarek.Kirc_Ast.Shared]
 
 (** Quote a list *)
 let quote_list ~loc quote_elem elems =
@@ -65,300 +53,24 @@ let quote_list ~loc quote_elem elems =
     elems
     [%expr []]
 
-(** Quote an array *)
-let quote_array ~loc quote_elem elems =
-  [%expr Array.of_list [%e quote_list ~loc quote_elem (Array.to_list elems)]]
-
 (** Quote an option *)
 let quote_option ~loc quote_elem = function
   | None -> [%expr None]
   | Some x -> [%expr Some [%e quote_elem ~loc x]]
 
-(** Quote a case *)
-let rec quote_case ~loc ((i, opt, body) : Kirc_Ast.case) : expression =
-  let opt_expr =
-    match opt with
-    | None -> [%expr None]
-    | Some (s1, s2, id, s3) ->
-        [%expr
-          Some
-            ( [%e quote_string ~loc s1],
-              [%e quote_string ~loc s2],
-              [%e quote_int ~loc id],
-              [%e quote_string ~loc s3] )]
-  in
-  [%expr [%e quote_int ~loc i], [%e opt_expr], [%e quote_k_ext ~loc body]]
+(** Optional OCaml type constraint for a kernel parameter.
 
-(** Quote a Kirc_Ast.k_ext value to OCaml expression *)
-and quote_k_ext ~loc (k : Kirc_Ast.k_ext) : expression =
-  match k with
-  | Kirc_Ast.Kern (params, body) ->
-      [%expr
-        Sarek.Kirc_Ast.Kern
-          ([%e quote_k_ext ~loc params], [%e quote_k_ext ~loc body])]
-  | Kirc_Ast.Block b -> [%expr Sarek.Kirc_Ast.Block [%e quote_k_ext ~loc b]]
-  | Kirc_Ast.Params p -> [%expr Sarek.Kirc_Ast.Params [%e quote_k_ext ~loc p]]
-  | Kirc_Ast.Plus (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Plus ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Plusf (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Plusf ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Min (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Min ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Minf (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Minf ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Mul (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Mul ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Mulf (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Mulf ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Div (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Div ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Divf (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Divf ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Mod (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Mod ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Id s -> [%expr Sarek.Kirc_Ast.Id [%e quote_string ~loc s]]
-  | Kirc_Ast.IdName s -> [%expr Sarek.Kirc_Ast.IdName [%e quote_string ~loc s]]
-  | Kirc_Ast.GlobalFun (body, ret_type, name) ->
-      [%expr
-        Sarek.Kirc_Ast.GlobalFun
-          ( [%e quote_k_ext ~loc body],
-            [%e quote_string ~loc ret_type],
-            [%e quote_string ~loc name] )]
-  | Kirc_Ast.IntVar (id, name, is_mut) ->
-      [%expr
-        Sarek.Kirc_Ast.IntVar
-          ( [%e quote_int ~loc id],
-            [%e quote_string ~loc name],
-            [%e quote_bool ~loc is_mut] )]
-  | Kirc_Ast.FloatVar (id, name, is_mut) ->
-      [%expr
-        Sarek.Kirc_Ast.FloatVar
-          ( [%e quote_int ~loc id],
-            [%e quote_string ~loc name],
-            [%e quote_bool ~loc is_mut] )]
-  | Kirc_Ast.UnitVar (id, name, is_mut) ->
-      [%expr
-        Sarek.Kirc_Ast.UnitVar
-          ( [%e quote_int ~loc id],
-            [%e quote_string ~loc name],
-            [%e quote_bool ~loc is_mut] )]
-  | Kirc_Ast.CastDoubleVar (id, name) ->
-      [%expr
-        Sarek.Kirc_Ast.CastDoubleVar
-          ([%e quote_int ~loc id], [%e quote_string ~loc name])]
-  | Kirc_Ast.DoubleVar (id, name, is_mut) ->
-      [%expr
-        Sarek.Kirc_Ast.DoubleVar
-          ( [%e quote_int ~loc id],
-            [%e quote_string ~loc name],
-            [%e quote_bool ~loc is_mut] )]
-  | Kirc_Ast.BoolVar (id, name, is_mut) ->
-      [%expr
-        Sarek.Kirc_Ast.BoolVar
-          ( [%e quote_int ~loc id],
-            [%e quote_string ~loc name],
-            [%e quote_bool ~loc is_mut] )]
-  | Kirc_Ast.VecVar (elem, id, name) ->
-      [%expr
-        Sarek.Kirc_Ast.VecVar
-          ( [%e quote_k_ext ~loc elem],
-            [%e quote_int ~loc id],
-            [%e quote_string ~loc name] )]
-  | Kirc_Ast.Arr (name, size, elt, mem) ->
-      [%expr
-        Sarek.Kirc_Ast.Arr
-          ( [%e quote_string ~loc name],
-            [%e quote_k_ext ~loc size],
-            [%e quote_elttype ~loc elt],
-            [%e quote_memspace ~loc mem] )]
-  | Kirc_Ast.Concat (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Concat ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Constr (type_name, constr_name, args) ->
-      [%expr
-        Sarek.Kirc_Ast.Constr
-          ( [%e quote_string ~loc type_name],
-            [%e quote_string ~loc constr_name],
-            [%e quote_list ~loc quote_k_ext args] )]
-  | Kirc_Ast.Record (type_name, fields) ->
-      [%expr
-        Sarek.Kirc_Ast.Record
-          ( [%e quote_string ~loc type_name],
-            [%e quote_list ~loc quote_k_ext fields] )]
-  | Kirc_Ast.RecGet (record, field) ->
-      [%expr
-        Sarek.Kirc_Ast.RecGet
-          ([%e quote_k_ext ~loc record], [%e quote_string ~loc field])]
-  | Kirc_Ast.RecSet (record, value) ->
-      [%expr
-        Sarek.Kirc_Ast.RecSet
-          ([%e quote_k_ext ~loc record], [%e quote_k_ext ~loc value])]
-  | Kirc_Ast.Empty -> [%expr Sarek.Kirc_Ast.Empty]
-  | Kirc_Ast.Seq (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Seq ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Return k -> [%expr Sarek.Kirc_Ast.Return [%e quote_k_ext ~loc k]]
-  | Kirc_Ast.Set (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Set ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Decl k -> [%expr Sarek.Kirc_Ast.Decl [%e quote_k_ext ~loc k]]
-  | Kirc_Ast.SetV (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.SetV ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.SetLocalVar (a, b, c) ->
-      [%expr
-        Sarek.Kirc_Ast.SetLocalVar
-          ( [%e quote_k_ext ~loc a],
-            [%e quote_k_ext ~loc b],
-            [%e quote_k_ext ~loc c] )]
-  | Kirc_Ast.Intrinsics (cuda, opencl) ->
-      [%expr
-        Sarek.Kirc_Ast.Intrinsics
-          ([%e quote_string ~loc cuda], [%e quote_string ~loc opencl])]
-  | Kirc_Ast.IntId (name, id) ->
-      [%expr
-        Sarek.Kirc_Ast.IntId
-          ([%e quote_string ~loc name], [%e quote_int ~loc id])]
-  | Kirc_Ast.Int i -> [%expr Sarek.Kirc_Ast.Int [%e quote_int ~loc i]]
-  | Kirc_Ast.Float f -> [%expr Sarek.Kirc_Ast.Float [%e quote_float ~loc f]]
-  | Kirc_Ast.Double f -> [%expr Sarek.Kirc_Ast.Double [%e quote_float ~loc f]]
-  | Kirc_Ast.Custom (type_name, id, name) ->
-      [%expr
-        Sarek.Kirc_Ast.Custom
-          ( [%e quote_string ~loc type_name],
-            [%e quote_int ~loc id],
-            [%e quote_string ~loc name] )]
-  | Kirc_Ast.CustomVar (type_name, constr_name, var_name) ->
-      [%expr
-        Sarek.Kirc_Ast.CustomVar
-          ( [%e quote_string ~loc type_name],
-            [%e quote_string ~loc constr_name],
-            [%e quote_string ~loc var_name] )]
-  | Kirc_Ast.IntVecAcc (vec, idx) ->
-      [%expr
-        Sarek.Kirc_Ast.IntVecAcc
-          ([%e quote_k_ext ~loc vec], [%e quote_k_ext ~loc idx])]
-  | Kirc_Ast.Local (decl, body) ->
-      [%expr
-        Sarek.Kirc_Ast.Local
-          ([%e quote_k_ext ~loc decl], [%e quote_k_ext ~loc body])]
-  | Kirc_Ast.Acc (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Acc ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Ife (cond, then_e, else_e) ->
-      [%expr
-        Sarek.Kirc_Ast.Ife
-          ( [%e quote_k_ext ~loc cond],
-            [%e quote_k_ext ~loc then_e],
-            [%e quote_k_ext ~loc else_e] )]
-  | Kirc_Ast.If (cond, then_e) ->
-      [%expr
-        Sarek.Kirc_Ast.If
-          ([%e quote_k_ext ~loc cond], [%e quote_k_ext ~loc then_e])]
-  | Kirc_Ast.Match (type_name, scrutinee, cases) ->
-      [%expr
-        Sarek.Kirc_Ast.Match
-          ( [%e quote_string ~loc type_name],
-            [%e quote_k_ext ~loc scrutinee],
-            [%e quote_array ~loc quote_case cases] )]
-  | Kirc_Ast.Or (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Or ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.And (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.And ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.Not k -> [%expr Sarek.Kirc_Ast.Not [%e quote_k_ext ~loc k]]
-  | Kirc_Ast.EqCustom (type_name, a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.EqCustom
-          ( [%e quote_string ~loc type_name],
-            [%e quote_k_ext ~loc a],
-            [%e quote_k_ext ~loc b] )]
-  | Kirc_Ast.EqBool (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.EqBool ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.LtBool (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.LtBool ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.GtBool (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.GtBool ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.LtEBool (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.LtEBool ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.GtEBool (a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.GtEBool ([%e quote_k_ext ~loc a], [%e quote_k_ext ~loc b])]
-  | Kirc_Ast.DoLoop (var, lo, hi, body) ->
-      [%expr
-        Sarek.Kirc_Ast.DoLoop
-          ( [%e quote_k_ext ~loc var],
-            [%e quote_k_ext ~loc lo],
-            [%e quote_k_ext ~loc hi],
-            [%e quote_k_ext ~loc body] )]
-  | Kirc_Ast.While (cond, body) ->
-      [%expr
-        Sarek.Kirc_Ast.While
-          ([%e quote_k_ext ~loc cond], [%e quote_k_ext ~loc body])]
-  | Kirc_Ast.App (fn, args) ->
-      [%expr
-        Sarek.Kirc_Ast.App
-          ([%e quote_k_ext ~loc fn], [%e quote_array ~loc quote_k_ext args])]
-  | Kirc_Ast.GInt _ ->
-      (* This shouldn't be reached in PPX - we use GIntVar instead *)
-      [%expr Sarek.Kirc_Ast.GInt (fun () -> 0l)]
-  | Kirc_Ast.GFloat _ -> [%expr Sarek.Kirc_Ast.GFloat (fun () -> 0.0)]
-  | Kirc_Ast.GFloat64 _ -> [%expr Sarek.Kirc_Ast.GFloat64 (fun () -> 0.0)]
-  (* GIntVar, GFloatVar, GFloat64Var - generate closures that capture the variable *)
-  (* These variables are refs, so we dereference them with ! *)
-  | Kirc_Ast.GIntVar name ->
-      let var_expr = evar ~loc name in
-      [%expr Sarek.Kirc_Ast.GInt (fun () -> ![%e var_expr])]
-  | Kirc_Ast.GFloatVar name ->
-      let var_expr = evar ~loc name in
-      [%expr Sarek.Kirc_Ast.GFloat (fun () -> ![%e var_expr])]
-  | Kirc_Ast.GFloat64Var name ->
-      let var_expr = evar ~loc name in
-      [%expr Sarek.Kirc_Ast.GFloat64 (fun () -> ![%e var_expr])]
-  | Kirc_Ast.Native _ ->
-      (* This shouldn't be reached in PPX - we use NativeWithFallback instead *)
-      [%expr Sarek.Kirc_Ast.Native (fun _framework -> "")]
-  | Kirc_Ast.NativeWithFallback {gpu; ocaml} ->
-      (* Native code with GPU expression and OCaml fallback function.
-         The GPU expression is (fun dev -> "code").
-         The ocaml expression is a function that will be applied to args.
-         We now store it as a typed function (block/grid/native_args). *)
-      [%expr
-        Sarek.Kirc_Ast.NativeWithFallback {gpu = [%e gpu]; ocaml = [%e ocaml]}]
-  | Kirc_Ast.Pragma (opts, body) ->
-      [%expr
-        Sarek.Kirc_Ast.Pragma
-          ([%e quote_list ~loc quote_string opts], [%e quote_k_ext ~loc body])]
-  | Kirc_Ast.Map (f, a, b) ->
-      [%expr
-        Sarek.Kirc_Ast.Map
-          ( [%e quote_k_ext ~loc f],
-            [%e quote_k_ext ~loc a],
-            [%e quote_k_ext ~loc b] )]
-  | Kirc_Ast.IntrinsicRef (path, name) ->
-      let path_expr =
-        Ast_builder.Default.elist
-          ~loc
-          (List.map (Ast_builder.Default.estring ~loc) path)
-      in
-      let name_expr = Ast_builder.Default.estring ~loc name in
-      [%expr Sarek.Kirc_Ast.IntrinsicRef ([%e path_expr], [%e name_expr])]
-  | Kirc_Ast.Unit -> [%expr Sarek.Kirc_Ast.Unit]
+    NOT ON THE LIVE PATH. The parameter constraints the PPX actually emits come
+    from [Sarek_native_intrinsics.core_type_of_typ], which
+    [Sarek_native_gen.ml:305] uses and which returns [[%type: _]] for EVERY
+    [TVec]; this option-returning variant is referenced only by
+    [sarek/tests/unit/test_quote.ml]. It is kept (and kept correct) because it
+    encodes the intended mapping, but changing it changes no generated code.
 
+    In particular: an OCaml constraint cannot police vector element types at all
+    on the real launch path, because [Execute.vector_arg]'s [Vec] constructor is
+    existential and erases them. That check lives at
+    [Execute.check_launch_args]. *)
 let core_type_of_typ ~loc (t : typ) : core_type option =
   match repr t with
   | TPrim TUnit -> Some [%type: unit]
@@ -373,6 +85,14 @@ let core_type_of_typ ~loc (t : typ) : core_type option =
       | TReg Float32 -> Some [%type: (float, _) Spoc_core.Vector.t]
       | TReg Float64 -> Some [%type: (float, _) Spoc_core.Vector.t]
       | TPrim TBool -> Some [%type: (bool, _) Spoc_core.Vector.t]
+      | TReg Float16 ->
+          (* f16 is the one element type whose constraint CAN be made fully
+             tight, because its Bigarray element type is nominal:
+             [(float, float16_elt) Vector.t] vs [(float, float32_elt) Vector.t].
+             The other float arms cannot — [(float, _) Vector.t] accepts f32 and
+             f64 alike. Recorded here for that reason; see the note above for why
+             it does not, on its own, protect anything today. *)
+          Some [%type: (float, Bigarray.float16_elt) Spoc_core.Vector.t]
       | TRecord _ | TVariant _ ->
           (* Don't add type constraint for custom vectors - let OCaml infer *)
           None
@@ -476,10 +196,44 @@ end)
     define their own intrinsics and the PPX will reference them correctly.
 
     Examples:
-    - IntrinsicRef (["Float32"], "sin") -> Float32.sin
-    - IntrinsicRef (["Gpu"], "block_barrier") -> Gpu.block_barrier
-    - CorePrimitiveRef "thread_idx_x" -> Gpu.thread_idx_x *)
-let expr_of_intrinsic_ref ~loc (ref : Sarek_env.intrinsic_ref) : expression =
+    - IntrinsicRef (["Sarek_stdlib"; "Float32"], "sin") ->
+      Sarek_stdlib.Float32.sin
+    - IntrinsicRef (["Sarek_stdlib"; "Gpu"], "block_barrier") ->
+      Sarek_stdlib.Gpu.block_barrier
+
+    CORE primitives get NO witness ([None]). They are not stdlib symbols: they
+    live in [Sarek_core_primitives.all], a table compiled into the PPX itself,
+    so their existence is already established before any OCaml code is emitted —
+    there is nothing for a witness to check. The previous behaviour emitted an
+    UNQUALIFIED [Gpu.<name>], naming a module that is not in scope at a user's
+    expansion site, and that broke the f16 feature's documented usage: the
+    mandated shape
+
+    {[
+      let x = float32_of_float16 a.(tid) in ...
+    ]}
+
+    failed with [Unbound module "Gpu"] (#57 slice 1 review, MF4c). It only
+    appeared to work when the conversion sat directly inside a vector store,
+    because [collect_intrinsic_refs] did not descend into [TEVecSet]'s value —
+    the accident that hid this.
+
+    BLAST RADIUS of returning [None] for every [CorePrimitiveRef], not just the
+    f16 pair: none, because no such witness could ever resolve. When a name is
+    registered BOTH as a core primitive and as a [%sarek_intrinsic] the stdlib
+    registration wins and the ref is an [IntrinsicRef] with a fully-qualified
+    path — verified on the emitted AST, where [global_thread_id] (present in
+    both [Sarek_core_primitives.all] and [Gpu.ml]) comes out as
+    [Sarek_stdlib.Gpu.global_thread_id]. A [CorePrimitiveRef] therefore only
+    ever names a primitive with NO stdlib counterpart, for which the emitted
+    [Gpu.<name>] was unresolvable in every context. Their existence is checked
+    by the typer against [Sarek_core_primitives.all] regardless.
+    [float16_of_float32] / [float32_of_float16] have no [Gpu] counterpart at all
+    and could never have resolved: they are deliberately core primitives rather
+    than [%sarek_intrinsic]s because a stdlib type registration needs a [ctype]
+    and Ctypes has no half type. *)
+let expr_of_intrinsic_ref_opt ~loc (ref : Sarek_env.intrinsic_ref) :
+    expression option =
   match ref with
   | Sarek_env.IntrinsicRef (module_path, name) ->
       (* Build longident from module path: ["A"; "B"] + "f" -> A.B.f *)
@@ -489,11 +243,8 @@ let expr_of_intrinsic_ref ~loc (ref : Sarek_env.intrinsic_ref) : expression =
           (Lident (List.hd module_path))
           (List.tl module_path @ [name])
       in
-      Ast_builder.Default.pexp_ident ~loc {txt = lid; loc}
-  | Sarek_env.CorePrimitiveRef name ->
-      (* Core primitives are accessed via Gpu module *)
-      let lid = Ldot (Lident "Gpu", name) in
-      Ast_builder.Default.pexp_ident ~loc {txt = lid; loc}
+      Some (Ast_builder.Default.pexp_ident ~loc {txt = lid; loc})
+  | Sarek_env.CorePrimitiveRef _ -> None
 
 (** Collect all intrinsic function refs from a typed expression *)
 let rec collect_intrinsic_refs (te : texpr) : IntrinsicRefSet.t =
@@ -501,10 +252,20 @@ let rec collect_intrinsic_refs (te : texpr) : IntrinsicRefSet.t =
   | TEUnit | TEBool _ | TEInt _ | TEInt32 _ | TEInt64 _ | TEFloat _ | TEDouble _
   | TEVar _ | TENative _ | TEGlobalRef _ ->
       IntrinsicRefSet.empty
-  | TEVecGet (v, i) | TEVecSet (v, i, _) | TEArrGet (v, i) ->
+  | TEVecGet (v, i) | TEArrGet (v, i) ->
       IntrinsicRefSet.union
         (collect_intrinsic_refs v)
         (collect_intrinsic_refs i)
+  | TEVecSet (v, i, x) ->
+      (* The stored VALUE used to be dropped (it shared the [TEVecGet] arm with
+         a wildcard), so any intrinsic appearing only inside a vector store was
+         never witnessed. That gap is what hid MF4c: the same f16 conversion
+         compiled inside `out.(tid) <- ...` and failed inside `let x = ...`. *)
+      IntrinsicRefSet.union
+        (collect_intrinsic_refs v)
+        (IntrinsicRefSet.union
+           (collect_intrinsic_refs i)
+           (collect_intrinsic_refs x))
   | TEArrSet (a, i, x) ->
       IntrinsicRefSet.union
         (collect_intrinsic_refs a)
@@ -621,7 +382,7 @@ let generate_intrinsic_check ~loc (kernel : tkernel) : expression =
   let refs_from_items = collect_from_module_items kernel.tkern_module_items in
   let all_refs = IntrinsicRefSet.union refs_from_body refs_from_items in
   let ref_list = IntrinsicRefSet.elements all_refs in
-  let fn_exprs = List.map (expr_of_intrinsic_ref ~loc) ref_list in
+  let fn_exprs = List.filter_map (expr_of_intrinsic_ref_opt ~loc) ref_list in
   match fn_exprs with
   | [] -> [%expr ()]
   | exprs ->
@@ -637,8 +398,7 @@ let generate_intrinsic_check ~loc (kernel : tkernel) : expression =
 
 (** Quote a kernel to create a sarek_kernel expression *)
 let quote_kernel ~loc ?(native_kernel : tkernel option)
-    ~(ir_opt : Sarek_ir_ppx.kernel) ~(constructors : string list)
-    (kernel : tkernel) : expression =
+    ~(ir_opt : Sarek_ir_ppx.kernel) (kernel : tkernel) : expression =
   (* Use native_kernel for CPU code generation if provided, otherwise use kernel.
      This allows passing the original kernel (before tailrec transformation)
      for native OCaml, since OCaml handles recursion natively. *)
@@ -649,14 +409,6 @@ let quote_kernel ~loc ?(native_kernel : tkernel option)
   (* Suppress unused variable warnings for legacy args handling *)
   let _ = (args_pat, args_array_expr, list_to_args_pat, list_to_args_expr) in
   [%expr
-    let () =
-      List.iter
-        Sarek.Kirc_types.register_constructor_string
-        [%e
-          Ast_builder.Default.elist
-            ~loc
-            (List.map (Ast_builder.Default.estring ~loc) constructors)]
-    in
     let open Sarek.Kirc_types in
     let _intrinsic_check = [%e generate_intrinsic_check ~loc kernel] in
     (* Native function for host execution (uses Spoc_core.Vector) *)
@@ -700,6 +452,8 @@ let quote_sarek_loc ~loc (l : Sarek_ast.loc) : expression =
       loc_col = [%e quote_int ~loc l.loc_col];
       loc_end_line = [%e quote_int ~loc l.loc_end_line];
       loc_end_col = [%e quote_int ~loc l.loc_end_col];
+      loc_bol = [%e quote_int ~loc l.loc_bol];
+      loc_end_bol = [%e quote_int ~loc l.loc_end_bol];
     }]
 
 (** Quote a Sarek_ast.memspace *)

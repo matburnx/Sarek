@@ -1,6 +1,5 @@
 (******************************************************************************)
 (* SPDX-License-Identifier: CECILL-B                                          *)
-(* SPDX-FileCopyrightText: 2026 mathias <mathias@ladon.local> *)
 (* SPDX-FileCopyrightText: 2026 Mathias Bourgoin <mathias.bourgoin@gmail.com> *)
 (******************************************************************************)
 
@@ -54,7 +53,20 @@ module Device = struct
     name : string;
     max_threads_per_threadgroup : mtl_size structure;
     max_threadgroup_memory : int;
-    supports_fp64 : bool; (* Metal always supports FP64 on macOS *)
+    (* Always [false]. The Metal Shading Language has no `double` type on any
+       Apple GPU, so this is a property of MSL rather than of the device, and
+       [get] below sets it unconditionally.
+
+       This field carried the comment "Metal always supports FP64 on macOS"
+       until #141 — the exact opposite of the value set eleven lines below it,
+       and of the truth. Sarek_real64 reads this field and selects
+       [Fallback_df64] (double-float: an unevaluated pair of binary32, ~2^-46,
+       needing no hardware fp64), which is the supported route to extra
+       precision on Metal and is measured coherent on an Apple M4. The Metal
+       codegen refuses [TFloat64] outright — see
+       [Sarek_capability.float64_absent_metal], the [Backend_structural] entry
+       this fact is now stated in exactly once. *)
+    supports_fp64 : bool;
     is_cpu : bool; (* Metal doesn't distinguish CPU/GPU - always false *)
   }
 
@@ -206,20 +218,25 @@ module Memory = struct
       let contents = mtl_buffer_contents buf in
       {handle = buf; size; elem_size; device; contents}
 
+  (* [Spoc_core.Memory.bigarray_void_ptr] rather than [Ctypes.bigarray_start]:
+     ctypes' kind GADT has no Float16 arm (#57 slice 1 review, MF2), and the
+     helper returns a MANAGED pointer that keeps the array rooted (MF3). *)
   let alloc_bigarray device ba elem_size =
     let size = Bigarray.Array1.dim ba in
     let buf = alloc device size elem_size in
     (* Copy data to GPU *)
-    let ba_ptr = bigarray_start array1 ba in
+    let ba_ptr = Spoc_core.Memory.bigarray_void_ptr ba in
     let byte_size = size * elem_size in
-    memcpy ~dst:buf.contents ~src:(to_voidp ba_ptr) ~size:byte_size ;
+    memcpy ~dst:buf.contents ~src:ba_ptr ~size:byte_size ;
+    ignore (Sys.opaque_identity ba) ;
     buf
 
   let to_bigarray (type a b) buf (kind : (a, b) Bigarray.kind) =
     let ba = Bigarray.Array1.create kind Bigarray.c_layout buf.size in
-    let ba_ptr = bigarray_start array1 ba in
+    let ba_ptr = Spoc_core.Memory.bigarray_void_ptr ba in
     let byte_size = buf.size * buf.elem_size in
-    memcpy ~dst:(to_voidp ba_ptr) ~src:buf.contents ~size:byte_size ;
+    memcpy ~dst:ba_ptr ~src:buf.contents ~size:byte_size ;
+    ignore (Sys.opaque_identity ba) ;
     ba
 
   let release buf = release buf.handle
@@ -236,10 +253,50 @@ end
 module Library = struct
   type t = {handle : mtl_library; device : Device.t}
 
+  (** Compile MSL source.
+
+      Requests Metal's non-fast-math mode (backlog #125). Until this change the
+      options argument was hardcoded [None] AND the binding ignored it
+      regardless, so every Sarek Metal kernel compiled under Metal's fast-math
+      default with no way to turn it off.
+
+      These options are NOT a contraction defence — measured on an Apple M4,
+      [a*b+c] is contracted under every setting of them, and only
+      [Sarek_ir_metal.metal_fp_contract_pragma] in the generated source stops
+      it. What they buy is math-function accuracy, and that much is measured
+      (22135 of 65536 results change on [sqrt(a) + 1/a]).
+
+      If [mtl_compile_options_conformant] returns [None] (older OS, missing
+      selector, allocation failure) this falls back to null options, i.e.
+      exactly the behaviour before backlog #125, and says so in the log rather
+      than silently.
+
+      Metal float results are STILL outside the guarantee: [test_df64] and
+      [test_real64] have never been run on a Mac, so agreement with the
+      interpreter is not established. See docs/fp-contraction-policy.md §10. *)
   let create_from_source device source =
-    match
-      mtl_device_new_library_with_source device.Device.handle source None
-    with
+    let options = mtl_compile_options_conformant () in
+    (match options with
+    | Some _ ->
+        Spoc_core.Log.debugf
+          Spoc_core.Log.Kernel
+          "Metal: compiling with safe math mode (mathMode=Safe + \
+           mathFloatingPointFunctions=Precise, or fastMathEnabled=NO on macOS \
+           < 15). Contraction is handled separately, by the #pragma METAL fp \
+           contract(off) in the generated source."
+    | None ->
+        Spoc_core.Log.warnf
+          Spoc_core.Log.Kernel
+          "Metal: could not build MTLCompileOptions, falling back to Metal's \
+           DEFAULT compile options, whose math mode is FAST on both knobs \
+           (measured on Apple M4). Single-precision math functions will \
+           resolve to metal::fast and may disagree with the Sarek interpreter. \
+           See docs/fp-contraction-policy.md §10.") ;
+    let result =
+      mtl_device_new_library_with_source device.Device.handle source options
+    in
+    (match options with Some o -> release o | None -> ()) ;
+    match result with
     | Ok lib -> {handle = lib; device}
     | Error msg ->
         Metal_error.raise_error (Metal_error.compilation_failed source msg)

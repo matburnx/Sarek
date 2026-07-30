@@ -683,6 +683,80 @@ let field_element_count (ct : core_type) : int =
 (** Get field size in bytes for V2 custom types *)
 let field_byte_size (ct : core_type) : int = get_type_size_from_core_type ct
 
+(* IR element type of a record field, for [custom_type.ir_fields].
+
+   This mapping is the SoA wrong-data hazard, so it is deliberately narrow: it
+   answers [Some] for exactly the six field types [gen_field_read] /
+   [gen_field_write] can marshal, and [None] for everything else. Anything
+   [None] makes the WHOLE record's [ir_fields] [None] (see
+   [ir_fields_of_labels]), because a partial field list would describe a
+   different type than the one [get]/[set] actually read.
+
+   The widths must agree with BOTH neighbours or SoA transposes the wrong bytes:
+
+     field type | get_type_size_from_core_type | accessor          | elttype  | scalar_size
+     -----------+-----------------------------+-------------------+----------+------------
+     int32      | 4                           | read_int32        | TInt32   | 4
+     int        | 4                           | read_int (int32!) | TInt32   | 4
+     int64      | 8                           | read_int64        | TInt64   | 8
+     float32    | 4                           | read_float32      | TFloat32 | 4
+     float      | 4  (* GPU float32 *)        | read_float32      | TFloat32 | 4
+     float64    | 8                           | read_float64      | TFloat64 | 8
+
+   Two arms are traps and are the reason this table is written out. OCaml
+   [float] is 8 bytes in OCaml but this framework marshals it as a 32-bit GPU
+   float (Sarek_ppx.get_type_size_from_core_type = 4, accessor = read_float32),
+   so it maps to [TFloat32]; mapping it to [TFloat64] on the strength of the
+   OCaml type would double every stride below it. [int] likewise marshals
+   through [read_int], which is [Int32.to_int (read_int32 ...)] — 4 bytes, not
+   an OCaml 63-bit int — so it maps to [TInt32].
+
+   [bool] and [unit] are NOT here on purpose. [get_type_size_from_core_type]
+   gives them 4 bytes, but [gen_field_read] has no arm for either: they fall to
+   its nested-custom-type branch and emit [bool_custom.get], which does not
+   compile. They are unusable as record fields today, so claiming a layout for
+   them would be describing a type that cannot exist. If they are ever given
+   accessors, add them here as TBool/TUnit (scalar_size 4) at the same time.
+
+   test_ir_fields.ml pins every row of this table against the bytes [set]
+   actually writes, so a wrong arm is a red test rather than silent bad data. *)
+let ir_elttype_of_core_type ~loc (ct : core_type) : expression option =
+  let ident name =
+    Some
+      (Ast_builder.Default.pexp_construct
+         ~loc
+         {txt = Ldot (Lident "Sarek_ir_types", name); loc}
+         None)
+  in
+  match ct.ptyp_desc with
+  | Ptyp_constr ({txt = Lident "int32"; _}, _) -> ident "TInt32"
+  | Ptyp_constr ({txt = Lident "int"; _}, _) -> ident "TInt32"
+  | Ptyp_constr ({txt = Lident "int64"; _}, _) -> ident "TInt64"
+  | Ptyp_constr ({txt = Lident "float32"; _}, _) -> ident "TFloat32"
+  | Ptyp_constr ({txt = Lident "float"; _}, _) -> ident "TFloat32"
+  | Ptyp_constr ({txt = Lident "float64"; _}, _) -> ident "TFloat64"
+  | _ -> None
+
+(* [Some fields] when every field maps, [None] otherwise — all-or-nothing, see
+   above. Field order is declaration order, which is what
+   Sarek_ir_layout.record_layout consumes. *)
+let ir_fields_of_labels ~loc (labels : label_declaration list) : expression =
+  let mapped =
+    List.map
+      (fun ld ->
+        Option.map
+          (fun ty ->
+            Ast_builder.Default.pexp_tuple
+              ~loc
+              [Ast_builder.Default.estring ~loc ld.pld_name.txt; ty])
+          (ir_elttype_of_core_type ~loc ld.pld_type))
+      labels
+  in
+  if List.exists Option.is_none mapped then [%expr None]
+  else
+    let items = List.filter_map Fun.id mapped in
+    [%expr Some [%e Ast_builder.Default.elist ~loc items]]
+
 (** Generate a <name>_custom value for Vector.Custom. For a record type like
     float4 with float32 fields, generates get/set functions using
     Spoc.Tools.float32get/set *)
@@ -929,6 +1003,10 @@ let generate_custom_value ~loc (td : type_declaration) : structure_item list =
                name = [%e name_expr];
                get = [%e get_fn];
                set = [%e set_fn];
+               (* Same [labels] the offsets, [size_expr] and [get]/[set] above
+                  are derived from — one source, per the [ir_fields] trust
+                  contract in Spoc_core_base.mli. *)
+               ir_fields = [%e ir_fields_of_labels ~loc labels];
              }
               : [%t type_annot])];
         (* Generate: let point_custom = point_make_custom () *)
@@ -1242,6 +1320,11 @@ let generate_custom_value ~loc (td : type_declaration) : structure_item list =
                name = [%e name_expr];
                get = [%e get_fn];
                set = [%e set_fn];
+               (* Variant deriver: a variant is a tagged union, not a flat
+                  scalar record, so it has no SoA field list.
+                  Sarek_ir_layout.flatten_field rejects it below top level
+                  anyway. *)
+               ir_fields = None;
              }
               : [%t type_annot])];
         [%stri let [%p custom_pat] = [%e make_fn_call]];
@@ -1872,7 +1955,7 @@ let expand_kernel ~ctxt payload : expression =
               (Printf.sprintf "[%s] step 7: IR lowering start" kern_name) ;
             Sarek_debug.log_enter "lower_kernel" ;
             let t0 = Unix.gettimeofday () in
-            let kernel, constructors =
+            let kernel =
               try Sarek_lower_ir.lower_kernel tkernel
               with e ->
                 Sarek_debug.log_to_file
@@ -1903,7 +1986,6 @@ let expand_kernel ~ctxt payload : expression =
                 ~loc
                 ~native_kernel
                 ~ir_opt:kernel
-                ~constructors
                 tkernel
             in
             let t1 = Unix.gettimeofday () in
@@ -1919,6 +2001,23 @@ let expand_kernel ~ctxt payload : expression =
   | Sarek_error.Sarek_error e ->
       let eloc = Sarek_ast.loc_to_ppxlib (Sarek_error.error_loc e) in
       Location.raise_errorf ~loc:eloc "%a" Sarek_error.pp_error e
+  | Location.Error err as e
+    when (Location.Error.get_location err).loc_start.pos_cnum >= 0
+         && Location.Error.get_location err <> Location.none ->
+      (* An already-located diagnostic (this is how [Sarek_error.report_errors]
+         surfaces typer errors). The catch-all below used to swallow it and
+         re-report it as "Sarek internal error: <text>" pinned to the WHOLE
+         [%kernel] payload, discarding the sub-expression location the typer had
+         computed. Re-raise it untouched so the caret lands on the offending
+         operator.
+
+         GUARDED on the location being real: several lowering-time raisers
+         (lower_param's parameter-shape gate, for one) use
+         [~loc:Location.none] because the node they reject carries no location.
+         Re-raising those untouched would point the caret at line 1 — worse than
+         the kernel's own location. Those fall through to the catch-all below,
+         which is exactly what they got before. *)
+      raise e
   | e ->
       Location.raise_errorf
         ~loc
@@ -2179,27 +2278,6 @@ let kernel_real64_extension =
     Extension.Context.expression
     Ast_pattern.(single_expr_payload __)
     expand_kernel_real64
-
-(* Register top-level Sarek type declarations *)
-let expand_sarek_type ~ctxt payload =
-  let loc = Expansion_context.Extension.extension_point_loc ctxt in
-  match payload with
-  | PStr ([{pstr_desc = Pstr_type (_rf, [tdecl]); _}] as items) ->
-      let ctors =
-        Sarek_lower.constructor_strings_of_core_type_decl ~loc tdecl
-      in
-      let register =
-        [%stri
-          let () =
-            List.iter Sarek.Kirc_types.register_constructor_string [%e ctors]]
-      in
-      items @ [register]
-  | _ ->
-      Location.raise_errorf
-        ~loc
-        "%%sarek.type expects a single type declaration"
-
-let sarek_type_extension = ()
 
 (** Register sarek.module bindings on any structure we process, so libraries can
     publish module items for use in kernels.

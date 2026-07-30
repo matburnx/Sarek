@@ -25,6 +25,13 @@ module Codegen_error = Sarek_backend_error.Backend_error.Make (struct
   let name = "Vulkan"
 end)
 
+module Dispatch = Sarek_ir_intrinsic_dispatch
+
+(** Raise a located invalid-argument-count error (atomic-arity helper for the
+    shared {!Dispatch.emit_atomic}). *)
+let bad_arity n e g =
+  Codegen_error.raise_error (Codegen_error.invalid_arg_count n e g)
+
 (** Current kernel's variant definitions (set during generate) *)
 let current_variants : (string * (string * elttype list) list) list ref = ref []
 
@@ -43,10 +50,43 @@ let current_smod_name = ref "sarek_smod"
     arm) read this, guaranteeing they agree. Mirrors {!current_smod_name}. *)
 let current_copysign_name = ref "sarek_copysign"
 
+(** Name of the C-[fmod] helper ([sarek_fmod] by default) for the current
+    kernel, set per-kernel during generate by {!compute_fmod_name} so it cannot
+    collide with a user identifier. GLSL's [mod()] builtin is floor-based
+    (divisor-signed remainder), NOT the truncated C [fmod] the
+    [Float32.fmod]/[Float64.fmod] intrinsics contract for, and GLSL has no
+    [fmod] builtin — so both spellings lower to this helper. Both the
+    declaration ({!gen_fmod_helper}) and the call site ({!gen_intrinsic}'s
+    [fmod] arm) read this ref, guaranteeing they agree. Mirrors
+    {!current_copysign_name}. *)
+let current_fmod_name = ref "sarek_fmod"
+
 (** Helper function vector parameter indices - maps function name to set of
     parameter indices that are vectors. In GLSL, vectors cannot be passed as
     function parameters, so these must be filtered out at call sites. *)
 let helper_vec_param_indices : (string, int list) Hashtbl.t = Hashtbl.create 16
+
+(** The software f64-transcendental helper family ({!Sarek_ir_softmath}) this
+    kernel needs, transitively closed over cross-calls, set per-kernel by
+    {!compute_f64_softmath}. GLSL core has no double-precision overload for
+    sin/cos/exp/log/pow/… so [Float64] transcendentals are lowered to calls into
+    this family, emitted as forward-declared top-level functions in the preamble
+    (mirroring {!current_smod_name}/{!current_copysign_name}). Empty for kernels
+    with no f64 transcendental. *)
+let current_f64_helpers : Sarek_ir_types.helper_func list ref = ref []
+
+(** Whether {!current_f64_helpers} needs 64-bit integers (exp/log/… manipulate
+    the exponent/mantissa fields via [f64_bits]/[bits_f64] and int64 ops). Gates
+    the [GL_ARB_gpu_shader_int64] extension. The pure-polynomial members (sin,
+    cos, tan, atan, atan2) need none. *)
+let current_needs_int64 = ref false
+
+(** Whether any member of {!current_f64_helpers} calls [copysign]
+    (sinh/tanh/atan/atan2/asin/acos). The original kernel IR carries no
+    [copysign] node in that case, so {!Sarek_ir_analysis.kernel_uses_copysign}
+    would miss it; this forces the [sarek_copysign] helper to be emitted so the
+    softmath bodies find it. *)
+let current_f64_needs_copysign = ref false
 
 (** {1 Type Mapping} *)
 
@@ -157,15 +197,128 @@ let glsl_reserved_keywords =
     "main";
   ]
 
+(** The software f64-transcendental helpers ({!Sarek_ir_softmath}) are named
+    [__sarek_f64_<fn>] — a valid PTX identifier, but GLSL reserves identifiers
+    containing consecutive underscores (GLSL 4.5 §3.7), so glslang warns and a
+    stricter compiler may reject them. Re-spell the leading [__] as a single
+    [sarek_f64_] prefix for GLSL emission only; the shared IR (and thus PTX
+    output) keeps the [__sarek_f64_*] names unchanged. Applied at every point
+    GLSL emits such a name — the [EVar] cross-calls and call sites (via
+    {!escape_glsl_name}) and the function definitions/prototypes. Lookup keys
+    (helper_by_name, the vec-param table) stay on the raw name. *)
+let softmath_glsl_prefix = "__sarek_f64_"
+
+let mangle_softmath_ident name =
+  let p = softmath_glsl_prefix in
+  let pl = String.length p in
+  if String.length name >= pl && String.sub name 0 pl = p then
+    "sarek_f64_" ^ String.sub name pl (String.length name - pl)
+  else name
+
 (** Escape reserved GLSL keywords by adding 'v' suffix (avoids double underscore
-    with _len) *)
+    with the [_length] suffix of {!glsl_array_length_name}), and re-spell
+    software-transcendental helper names ({!mangle_softmath_ident}). *)
 let escape_glsl_name name =
+  let name = mangle_softmath_ident name in
   if List.mem name glsl_reserved_keywords then name ^ "v" else name
+
+(** The GLSL identifier carrying the length of vector parameter [name].
+
+    {b One definition, deliberately.} This name has two halves that must agree:
+    {!gen_push_constants} {e declares} it (a push-constant field plus a
+    [#define] alias), and {!gen_expr} {e uses} it for [EArrayLen]. Before
+    backlog-156 those were two separate string constructions in this same file —
+    [<name>_len] on the declaring side, [sarek_<name>_length] on the using side
+    — and nothing compared them, so every kernel taking a length emitted GLSL
+    naming an identifier the shader never declared. Both halves go through here
+    so the disagreement is not expressible.
+
+    The shadowing sets that {!rename_pc_shadowing_locals} matches against are
+    the same name and would be a third place to spell it, so they do not spell
+    it either: {!param_macro_names} calls this, and {!generate} and
+    {!generate_with_types} both call {!param_macro_names}.
+
+    The spelling is the cross-backend one: CUDA, OpenCL, Metal and WGSL all call
+    this [sarek_<name>_length], and so does PTX, via
+    {!Sarek_ir_ptx_types.length_param_name} — five of the six emitters, with
+    GLSL the odd one out until now. The [sarek_] prefix also keeps the
+    identifier out of the user namespace, unlike the old bare [<name>_len]. *)
+let glsl_array_length_name name = "sarek_" ^ escape_glsl_name name ^ "_length"
 
 (** Map Sarek IR element type to GLSL type string *)
 let rec glsl_type_of_elttype = function
   | TInt32 -> "int"
   | TInt64 -> "int64_t" (* Requires GL_ARB_gpu_shader_int64 *)
+  | TFloat16 ->
+      (* Still rejected after #57 slice 2b, and — as with OpenCL in slice 2a —
+         NOT for the reason originally recorded here. The old comment said the
+         arm was "deferred" and named
+         GL_EXT_shader_explicit_arithmetic_types_float16 as what was missing.
+         Measured false: that extension compiles through this backend's own
+         glslang/shaderc path and runs on both local RADV devices. The codegen
+         is small ("float16_t" here, a narrowing arm, and two #extension lines).
+
+         What blocks it is that RADV cannot hold Sarek's f16 contract. Slice 1
+         defines f16 as "store f16, compute f32, round on every narrowing", and
+         gates it on BIT-EXACT agreement with the interpreter. RADV's ACO
+         backend absorbs the f32->f16 narrowing into whatever arithmetic feeds
+         it, via v_fma_mixlo_f16 — one rounding where the DSL mandates two.
+
+         This is the SAME backend compiler as the rusticl defect (ACO, Mesa's
+         shader compiler), reached through a second front end — and the same
+         defect CLASS as HIP, which reaches it through a different compiler
+         entirely (LLVM's AMDGPU backend; see docs/fp-contraction-policy.md §2,
+         "Two AMD compilers"). It is NOT the same
+         severity. On HIP/OpenCL the fusion swallows the multiply only. Here it
+         also swallows the f32 add, and — when an f32 barrier is placed around
+         the multiply — it drops the intermediate narrowing altogether rather
+         than materialising a binary16 value. Measured, both local devices,
+         exhaustive over all 63488 finite binary16 inputs:
+
+           kernel shape / source-level defence   disagreements with interpreter
+           f16(x*1.1), plain                                     2912/63488
+           f16(x*1.1), `precise` on the f32 local                2912/63488
+           f16(f16(x*1.1) + 1000), plain                         5075/63488
+           f16(f16(x*1.1) + 1000), `precise` (what this
+             backend already emits on every float local)         4776/63488
+           ... with an f16 bitcast round-trip                    5075/63488
+           ... with a volatile SSBO round-trip on the f32s       4774/63488
+           ... volatile SSBO round-trip incl. the f16 bits          0/63488
+
+         The `precise` row is the load-bearing one. This backend already
+         prefixes every float local with `precise`, which glslang lowers to
+         SPIR-V NoContraction — and that IS honoured: the f32 multiply survives
+         as its own rounding. It simply does not reach the narrowing, because
+         absorbing a conversion is a different combine from contracting a*b+c.
+         So "we already emit precise" is not an argument for enabling f16, and
+         the #106/#126 f32 result (0 of 7 contraction shapes on RADV) does not
+         transfer either — it measured the combine that `precise` does stop.
+
+         The only defence measured to work costs a global-memory round-trip per
+         narrowing, of the f16 bit pattern itself, which this backend cannot
+         emit without a scratch buffer it does not control.
+
+         Measured 2026-07-26 on RX 7900 XTX (RADV NAVI31) AND the integrated
+         Raphael iGPU (RADV RAPHAEL_MENDOCINO), Mesa 26.1.4-arch3.1, Vulkan
+         1.4.354; both devices report identical counts. Gate:
+         sarek-vulkan/test/test_vulkan_f16_tripwire.ml. Full table, ISA and
+         method: docs/fp-contraction-policy.md, "Vulkan / RADV (f16
+         narrowing)". *)
+      Codegen_error.raise_error
+        (Codegen_error.unsupported_construct
+           "f16"
+           Sarek_ir_codegen.glsl_float16_refusal)
+  | TUint8 ->
+      (* Spelled under GL_EXT_shader_explicit_arithmetic_types_int8, which
+         {!glsl_header} emits whenever the kernel mentions this type at all. The
+         extension is not optional in the way the fp64 one is: [uint8_t] does
+         not parse under plain [#version 450].
+
+         Unlike every other arm of this function, nothing arithmetic is ever
+         generated at this type — see {!Sarek_ir_types.TUint8}. It appears in
+         exactly two positions: the element type of a storage buffer, and the
+         component type of a cooperative-matrix fragment. *)
+      "uint8_t"
   | TFloat32 -> "float"
   | TFloat64 -> "double" (* Requires GL_ARB_gpu_shader_fp64 *)
   | TBool -> "bool"
@@ -197,7 +350,72 @@ let glsl_thread_intrinsic = function
   | "global_size" -> "int(gl_WorkGroupSize.x * gl_NumWorkGroups.x)"
   | name -> Codegen_error.raise_error (Codegen_error.unknown_intrinsic name)
 
+(** Format an f64 literal exactly as [gen_expr]'s [EConst (CFloat64 _)] arm does
+    (the GLSL lowercase [lf] double suffix), for the composition constants used
+    by the exp2/log2/cbrt lowerings below. *)
+let f64_lit v =
+  let s = Printf.sprintf "%.17g" v in
+  let s =
+    if String.contains s '.' || String.contains s 'e' then s else s ^ ".0"
+  in
+  s ^ "lf"
+
+(** Root {!Sarek_ir_softmath} helpers a [Float64] transcendental [name] needs,
+    or [None] if [name] has a native GLSL f64 builtin (sqrt/floor/…/fma/min/max)
+    or is not a transcendental. The direct cases resolve through
+    [Sarek_ir_softmath.helper_name]; exp2/log2/cbrt have no dedicated helper and
+    are lowered by composition over exp/log/pow, so their roots are those. This
+    is the single source of truth shared by the call-site emission
+    ({!gen_f64_transcendental}) and the per-kernel family closure
+    ({!compute_f64_softmath}) — they must agree on which names are routed. *)
+let f64_root_helpers name =
+  match Sarek_ir_softmath.helper_name name with
+  | Some h -> Some [h]
+  | None -> (
+      match name with
+      | "exp2" -> Some ["__sarek_f64_exp"]
+      | "log2" -> Some ["__sarek_f64_log"]
+      | "cbrt" -> Some ["__sarek_f64_pow"]
+      | _ -> None)
+
 (** {1 Expression Generation} *)
+
+(** The [Float64] scalar conversion intrinsics that every implementation agrees
+    on: [of_int], [of_int32], [of_float32], [to_int32].
+
+    They are declared in Sarek_float64/Float64.ml and type-check in the DSL, but
+    had no GLSL arm at all, so any kernel using one died with "Unknown
+    intrinsic" — notably [Float64.of_int32], which is the conversion user code
+    reaches for first since int32 is the DSL's integer type.
+
+    Two are DELIBERATELY ABSENT. [to_int] and [to_float32] are declared with
+    device templates that round/truncate while their [ocaml] field — which is
+    what Sarek_float64_native.ml mirrors and executes — is [Stdlib.int_of_float]
+    (63-bit) and the IDENTITY respectively. So three implementations already
+    answer differently, and adding GLSL arms would make that disagreement
+    reachable on another backend rather than resolve it. Deciding those two
+    semantics is tracked separately.
+
+    This lives in [pre_hook] rather than [arm] because the module path is needed
+    to scope it, and only [pre_hook] receives it. The scoping is deliberate: the
+    match is on bare NAME, and [pre_hook] runs BEFORE the path-qualified pure
+    registry, so without the [is_f64] guard any module declaring [of_int] or
+    [to_int32] would be silently captured here and lowered as a GLSL constructor
+    cast, shadowing its own device template. Float32 declares both names today.
+*)
+let glsl_conversions = ["of_int"; "of_int32"; "of_float32"; "to_int32"]
+
+let gen_glsl_conversion buf ~gen_expr name args =
+  let target = match name with "to_int32" -> "int" | _ -> "double" in
+  match args with
+  | [e] ->
+      Buffer.add_string buf target ;
+      Buffer.add_char buf '(' ;
+      gen_expr buf e ;
+      Buffer.add_char buf ')'
+  | _ ->
+      Codegen_error.raise_error
+        (Codegen_error.invalid_arg_count name 1 (List.length args))
 
 let rec gen_expr buf = function
   | EConst (CInt32 n) -> Buffer.add_string buf (Int32.to_string n)
@@ -208,6 +426,20 @@ let rec gen_expr buf = function
         if String.contains s '.' || String.contains s 'e' then s else s ^ ".0"
       in
       Buffer.add_string buf s
+  | EConst (CFloat64 f) when not (Float.is_finite f) ->
+      (* GLSL has no [inf]/[nan] literal, so [%.17g]'s "inf"/"nan" spelling is
+         invalid source. Reconstruct the exact IEEE-754 value from its bit
+         pattern via [int64BitsToDouble], which needs GL_ARB_gpu_shader_int64 —
+         emitted by [glsl_header] whenever the kernel contains such a constant
+         ([compute_f64_softmath] ORs [kernel_uses_nonfinite_float64] into
+         [current_needs_int64], so this is covered even for a user-written
+         non-finite literal with no transcendental, not only the software f64
+         helpers). The decimal (possibly negative) bit literal avoids the
+         >int64-max hex forms glslang rejects. Finite doubles keep the plain
+         [%.17g … lf] form below, so no existing golden moves. *)
+      Buffer.add_string
+        buf
+        (Printf.sprintf "int64BitsToDouble(%LdL)" (Int64.bits_of_float f))
   | EConst (CFloat64 f) ->
       let s = Printf.sprintf "%.17g" f in
       let s =
@@ -263,7 +495,8 @@ let rec gen_expr buf = function
       gen_expr buf e ;
       Buffer.add_char buf '.' ;
       Buffer.add_string buf field
-  | EIntrinsic (path, name, args) -> gen_intrinsic buf path name args
+  | EIntrinsic (path, name, args) ->
+      Dispatch.gen_intrinsic glsl_backend buf path name args
   | ECast (ty, e) ->
       Buffer.add_string buf (glsl_type_of_elttype ty) ;
       Buffer.add_char buf '(' ;
@@ -321,8 +554,7 @@ let rec gen_expr buf = function
           gen_expr buf e)
         args ;
       Buffer.add_char buf ')'
-  | EArrayLen arr ->
-      Buffer.add_string buf ("sarek_" ^ escape_glsl_name arr ^ "_length")
+  | EArrayLen arr -> Buffer.add_string buf (glsl_array_length_name arr)
   | EArrayCreate _ ->
       Codegen_error.raise_error
         (Codegen_error.unsupported_construct
@@ -336,6 +568,25 @@ let rec gen_expr buf = function
       Buffer.add_string buf " : " ;
       gen_expr buf else_ ;
       Buffer.add_char buf ')'
+  | EMatch (scrut, cases) when Sarek_ir_codegen.ematch_binds_payload cases ->
+      (* #75: a match EXPRESSION lowers to a nested ternary, which has nowhere to
+         declare a payload binder — bind it by substituting the same payload
+         read the [SMatch] arm declares (GLSL payloads are struct fields), then emit the
+         (now binder-free) match. One shared, capture-avoiding pass for every
+         backend; see {!Sarek_ir_codegen.subst_ematch_payloads}. *)
+      gen_expr
+        buf
+        (EMatch
+           ( scrut,
+             Sarek_ir_codegen.subst_ematch_payloads
+               ~layout:Sarek_ir_codegen.glsl_payload_layout
+               ~raise_:(fun msg ->
+                 Codegen_error.raise_error
+                   (Codegen_error.unsupported_construct
+                      "match-expression payload binding"
+                      msg))
+               scrut
+               cases ))
   | EMatch (_, []) ->
       Codegen_error.raise_error
         (Codegen_error.unsupported_construct "match" "empty match expression")
@@ -462,227 +713,194 @@ and gen_glsl_polyfill buf ~is_f64 name args =
       Codegen_error.raise_error
         (Codegen_error.invalid_arg_count name expected (List.length args))
 
-and gen_intrinsic buf path name args =
-  let full_name =
-    match path with [] -> name | _ -> String.concat "." path ^ "." ^ name
-  in
-  if List.mem name ["cbrt"; "hypot"; "expm1"; "log1p"; "log10"] then
-    (* A [Float64] path component marks the double-precision route; the plain
-       [Float32]/[Math.Float32] and unqualified (core-primitive, f32-typed)
-       spellings stay single-precision. This mirrors how the pure registry keys
-       the same intrinsics by their [Float64] vs [Float32] module path. *)
-    let is_f64 = List.mem "Float64" path in
-    gen_glsl_polyfill buf ~is_f64 name args
-  else if name = "copysign" then (
-    (* GLSL has no [copysign] builtin under any name, and [abs(x)*sign(y)] is
-       wrong for [y=0] (GLSL [sign(0)=0]) and the [x=0]/NaN sign-transfer edge
-       cases. Lower to the bit-level [sarek_copysign] helper emitted in the
-       preamble by [gen_copysign_helper], ahead of both the pure registry
-       (which would emit the raw un-suffixed [copysign(...)] for
-       [Float32.copysign]) and the unqualified match arms (where
-       [Float64.copysign] would fall through to the raw-name fallback and emit
-       the swizzle-parsed [Float64.copysign(...)] that glslang rejects).
-       Routing through a function (not inlining the bit twiddling) evaluates
-       each argument exactly once — the same single-eval guarantee as the
-       [sarek_smod] helper. *)
-    Buffer.add_string buf !current_copysign_name ;
+(** Lower a [Float64] transcendental (identified by {!f64_root_helpers}) to the
+    software {!Sarek_ir_softmath} family. The direct cases emit a call to the
+    reserved [__sarek_f64_<name>] helper; exp2/log2/cbrt have no dedicated
+    helper and are composed over exp/log/pow (matching PTX's own exp2/log2
+    handling and the f32 [cbrt] polyfill shape, but with the f64 [pow]). The
+    helper bodies themselves are emitted, forward-declared, in the preamble by
+    {!gen_f64_softmath_helpers}, gated on {!current_f64_helpers}. *)
+and gen_f64_transcendental buf name args =
+  let emit_call fn =
+    Buffer.add_string buf (mangle_softmath_ident fn) ;
     Buffer.add_char buf '(' ;
     List.iteri
       (fun i e ->
         if i > 0 then Buffer.add_string buf ", " ;
         gen_expr buf e)
       args ;
-    Buffer.add_char buf ')')
-  else
-    (* For path-qualified intrinsics, query the pure registry first.
-     Float32.sin -> sin on GLSL (GLSL uses un-suffixed names). *)
-    let pure_registry_hit =
-      match path with
-      | [] -> None
-      | _ -> (
-          match
-            Sarek_pure_registry.fun_device_template ~module_path:path name
-          with
-          | Some f -> Some (f ~framework:"GLSL")
-          | None -> None)
-    in
-    match pure_registry_hit with
-    | Some device_name ->
-        Buffer.add_string buf device_name ;
-        Buffer.add_char buf '(' ;
-        List.iteri
-          (fun i e ->
-            if i > 0 then Buffer.add_string buf ", " ;
-            gen_expr buf e)
-          args ;
-        Buffer.add_char buf ')'
-    | None -> (
-        if
-          (* Try thread intrinsics *)
-          List.mem
-            name
-            [
-              "thread_id_x";
-              "thread_idx_x";
-              "thread_id_y";
-              "thread_idx_y";
-              "thread_id_z";
-              "thread_idx_z";
-              "block_id_x";
-              "block_idx_x";
-              "block_id_y";
-              "block_idx_y";
-              "block_id_z";
-              "block_idx_z";
-              "block_dim_x";
-              "block_dim_y";
-              "block_dim_z";
-              "grid_dim_x";
-              "grid_dim_y";
-              "grid_dim_z";
-              "global_thread_id";
-              "global_idx";
-              "global_idx_x";
-              "global_idx_y";
-              "global_idx_z";
-              "global_size";
-            ]
-        then Buffer.add_string buf (glsl_thread_intrinsic name)
-        else
-          (* Standard math intrinsics - GLSL versions *)
-          match name with
-          | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh"
-          | "tanh" | "exp" | "exp2" | "log" | "log2" | "sqrt" | "floor" | "ceil"
-          | "round" | "trunc" | "abs" ->
-              Buffer.add_string buf name ;
-              Buffer.add_char buf '(' ;
-              List.iteri
-                (fun i e ->
-                  if i > 0 then Buffer.add_string buf ", " ;
-                  gen_expr buf e)
-                args ;
-              Buffer.add_char buf ')'
-          | "fabs" | "abs_float" ->
-              (* GLSL has no [fabs]; its abs() has an fp64 overload under
-                 GL_ARB_gpu_shader_fp64 (enabled on the f64 path). [abs_float]
-                 (Float64.abs_float) reaches here rather than via the pure
-                 registry — it is absent from [float64_list] because that list's
-                 generic template would emit the raw name on CUDA/OpenCL, which
-                 need [fabs]. See spoc/ir/Sarek_pure_registry.ml. *)
-              Buffer.add_string buf "abs" ;
-              Buffer.add_char buf '(' ;
-              List.iteri
-                (fun i e ->
-                  if i > 0 then Buffer.add_string buf ", " ;
-                  gen_expr buf e)
-                args ;
-              Buffer.add_char buf ')'
-          | "rsqrt" ->
-              Buffer.add_string buf "inversesqrt" ;
-              Buffer.add_char buf '(' ;
-              List.iteri
-                (fun i e ->
-                  if i > 0 then Buffer.add_string buf ", " ;
-                  gen_expr buf e)
-                args ;
-              Buffer.add_char buf ')'
-          | "atan2" | "pow" | "min" | "max" ->
-              Buffer.add_string buf name ;
-              Buffer.add_char buf '(' ;
-              List.iteri
-                (fun i e ->
-                  if i > 0 then Buffer.add_string buf ", " ;
-                  gen_expr buf e)
-                args ;
-              Buffer.add_char buf ')'
-          | "fma" ->
-              Buffer.add_string buf "fma" ;
-              Buffer.add_char buf '(' ;
-              List.iteri
-                (fun i e ->
-                  if i > 0 then Buffer.add_string buf ", " ;
-                  gen_expr buf e)
-                args ;
-              Buffer.add_char buf ')'
-          (* Barrier synchronization *)
-          | "block_barrier" -> Buffer.add_string buf "barrier()"
-          (* Atomic operations - GLSL uses atomicAdd etc. *)
-          | "atomic_add" | "atomic_add_int32" | "atomic_add_global_int32" ->
-              Buffer.add_string buf "atomicAdd(" ;
-              (match args with
-              | [addr; value] ->
-                  gen_expr buf addr ;
-                  Buffer.add_string buf ", " ;
-                  gen_expr buf value
-              | [arr; idx; value] ->
-                  gen_expr buf arr ;
-                  Buffer.add_char buf '[' ;
-                  gen_expr buf idx ;
-                  Buffer.add_string buf "], " ;
-                  gen_expr buf value
-              | args ->
-                  Codegen_error.raise_error
-                    (Codegen_error.invalid_arg_count
-                       "atomic_add"
-                       2
-                       (List.length args))) ;
-              Buffer.add_char buf ')'
-          | "atomic_min" ->
-              Buffer.add_string buf "atomicMin(" ;
-              (match args with
-              | [addr; value] ->
-                  gen_expr buf addr ;
-                  Buffer.add_string buf ", " ;
-                  gen_expr buf value
-              | args ->
-                  Codegen_error.raise_error
-                    (Codegen_error.invalid_arg_count
-                       "atomic_min"
-                       2
-                       (List.length args))) ;
-              Buffer.add_char buf ')'
-          | "atomic_max" ->
-              Buffer.add_string buf "atomicMax(" ;
-              (match args with
-              | [addr; value] ->
-                  gen_expr buf addr ;
-                  Buffer.add_string buf ", " ;
-                  gen_expr buf value
-              | args ->
-                  Codegen_error.raise_error
-                    (Codegen_error.invalid_arg_count
-                       "atomic_max"
-                       2
-                       (List.length args))) ;
-              Buffer.add_char buf ')'
-          | "float" ->
-              Buffer.add_string buf "float(" ;
-              (match args with [e] -> gen_expr buf e | _ -> ()) ;
-              Buffer.add_char buf ')'
-          | "int_of_float" ->
-              Buffer.add_string buf "int(" ;
-              (match args with [e] -> gen_expr buf e | _ -> ()) ;
-              Buffer.add_char buf ')'
-          | _ ->
-              (* No GLSL lowering for this intrinsic. Unlike CUDA/OpenCL/Metal,
-                 GLSL does NOT fall back to [Sarek_registry] (the FFI registry):
-                 its device closures only branch CUDA-vs-OpenCL and have no GLSL
-                 arm, so consulting it would splice OpenCL C — [get_global_id],
-                 [barrier(CLK_LOCAL_MEM_FENCE)], [(float)] casts — into GLSL,
-                 which glslang rejects just as cryptically as the old behaviour
-                 of emitting the raw OCaml path [full_name(...)] ("vector
-                 swizzle too long"). Raise a located error naming the intrinsic
-                 and backend instead — strictly better than emitting garbage.
+    Buffer.add_char buf ')'
+  in
+  match Sarek_ir_softmath.helper_name name with
+  | Some hname -> emit_call hname
+  | None -> (
+      match (name, args) with
+      | "exp2", [x] ->
+          (* 2^x = exp(x·ln2) *)
+          Buffer.add_string buf "sarek_f64_exp((" ;
+          gen_expr buf x ;
+          Buffer.add_string
+            buf
+            (Printf.sprintf ") * %s)" (f64_lit 0.6931471805599453))
+      | "log2", [x] ->
+          (* log2(x) = log(x)·log2(e) *)
+          Buffer.add_string buf "(sarek_f64_log(" ;
+          gen_expr buf x ;
+          Buffer.add_string
+            buf
+            (Printf.sprintf ") * %s)" (f64_lit 1.4426950408889634))
+      | "cbrt", [x] ->
+          (* sign(x)·pow(|x|, 1/3): GLSL [pow] is undefined for a negative base,
+             and here [pow] is the software f64 helper. *)
+          Buffer.add_string buf "(sign(" ;
+          gen_expr buf x ;
+          Buffer.add_string buf ") * sarek_f64_pow(abs(" ;
+          gen_expr buf x ;
+          Buffer.add_string
+            buf
+            (Printf.sprintf "), %s / %s))" (f64_lit 1.0) (f64_lit 3.0))
+      | _ ->
+          Codegen_error.raise_error
+            (Codegen_error.unknown_intrinsic
+               (Printf.sprintf "%s (wrong arity for f64 transcendental)" name)))
 
-                 To give a future intrinsic a real GLSL lowering, extend one of
-                 (a) [Sarek_pure_registry.glsl_override_name] for a plain rename,
-                 (b) [gen_glsl_polyfill] above for a multi-token expression, or
-                 (c) an explicit match arm here. The pure registry is already
-                 GLSL-parameterised (it receives [~framework:"GLSL"]), so no
-                 registry-type change is needed and existing registrations are
-                 untouched. *)
-              Codegen_error.raise_error
-                (Codegen_error.unknown_intrinsic full_name))
+and glsl_backend =
+  {
+    Dispatch.framework = (fun () -> "GLSL");
+    gen_expr;
+    thread_intrinsic = glsl_thread_intrinsic;
+    pre_hook =
+      (fun buf ~full_name:_ path name args ->
+        let is_f64 = List.mem "Float64" path in
+        if is_f64 && f64_root_helpers name <> None then (
+          gen_f64_transcendental buf name args ;
+          true)
+        else if List.mem name ["cbrt"; "hypot"; "expm1"; "log1p"; "log10"] then (
+          gen_glsl_polyfill buf ~is_f64 name args ;
+          true)
+        else if name = "copysign" then (
+          Dispatch.emit_call ~gen_expr buf !current_copysign_name args ;
+          true)
+        else if name = "fmod" then (
+          Dispatch.emit_call ~gen_expr buf !current_fmod_name args ;
+          true)
+        else if is_f64 && List.mem name glsl_conversions then (
+          gen_glsl_conversion buf ~gen_expr name args ;
+          true)
+        else false);
+    (* INERT ON PURPOSE (backlog-159), not an unfinished symmetry. The three
+       C-family backends wire [Dispatch.emit_registry_template] here; doing the
+       same for GLSL would route intrinsics through
+       [Sarek_registry.cuda_or_opencl], a TWO-WAY C-family dispatch whose
+       wildcard is the CUDA branch — so all 133 stdlib intrinsics registered
+       through it would hand GLSL `sinf`/`fabsf`/`powf`, names no shader
+       compiler declares. Returning [false] means fall-through raises
+       [unknown_intrinsic] instead: loud, and correct. That registry now REFUSES
+       GLSL rather than guessing, so wiring this fails by name. *)
+    post_hook = (fun _ _ _ _ -> false);
+    invalid_arg_count = bad_arity;
+    on_unknown =
+      (fun full ->
+        Codegen_error.raise_error (Codegen_error.unknown_intrinsic full));
+    arm =
+      (fun name ->
+        match name with
+        | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh"
+        | "tanh" | "exp" | "exp2" | "log" | "log2" | "sqrt" | "floor" | "ceil"
+        | "round" | "trunc" | "abs" | "atan2" | "pow" | "min" | "max" | "fma" ->
+            Some (fun buf args -> Dispatch.emit_call ~gen_expr buf name args)
+        | "fabs" | "abs_float" ->
+            Some (fun buf args -> Dispatch.emit_call ~gen_expr buf "abs" args)
+        | "rsqrt" ->
+            Some
+              (fun buf args ->
+                Dispatch.emit_call ~gen_expr buf "inversesqrt" args)
+        | "f64_bits" | "bits_f64" ->
+            Some
+              (fun buf args ->
+                let fn =
+                  if name = "f64_bits" then "doubleBitsToInt64"
+                  else "int64BitsToDouble"
+                in
+                Buffer.add_string buf fn ;
+                Buffer.add_char buf '(' ;
+                (match args with
+                | [e] -> gen_expr buf e
+                | _ ->
+                    Codegen_error.raise_error
+                      (Codegen_error.invalid_arg_count
+                         name
+                         1
+                         (List.length args))) ;
+                Buffer.add_char buf ')')
+        | "block_barrier" ->
+            Some (fun buf _ -> Buffer.add_string buf "barrier()")
+        | "atomic_add" | "atomic_add_int32" | "atomic_add_global_int32" ->
+            Some
+              (fun buf args ->
+                Dispatch.emit_atomic
+                  ~gen_expr
+                  ~invalid_arg_count:bad_arity
+                  buf
+                  ~callee:"atomicAdd"
+                  ~prefix:""
+                  ~suffix:")"
+                  ~opname:"atomic_add"
+                  ~expected:2
+                  ~allow_array:true
+                  args)
+        | "atomic_min" ->
+            Some
+              (fun buf args ->
+                Dispatch.emit_atomic
+                  ~gen_expr
+                  ~invalid_arg_count:bad_arity
+                  buf
+                  ~callee:"atomicMin"
+                  ~prefix:""
+                  ~suffix:")"
+                  ~opname:"atomic_min"
+                  ~expected:2
+                  ~allow_array:false
+                  args)
+        | "atomic_max" ->
+            Some
+              (fun buf args ->
+                Dispatch.emit_atomic
+                  ~gen_expr
+                  ~invalid_arg_count:bad_arity
+                  buf
+                  ~callee:"atomicMax"
+                  ~prefix:""
+                  ~suffix:")"
+                  ~opname:"atomic_max"
+                  ~expected:2
+                  ~allow_array:false
+                  args)
+        | "float" ->
+            Some
+              (fun buf args ->
+                Dispatch.emit_unary
+                  ~gen_expr
+                  ~invalid_arg_count:bad_arity
+                  buf
+                  ~prefix:"float("
+                  ~suffix:")"
+                  ~opname:"float"
+                  args)
+        | "int_of_float" ->
+            Some
+              (fun buf args ->
+                Dispatch.emit_unary
+                  ~gen_expr
+                  ~invalid_arg_count:bad_arity
+                  buf
+                  ~prefix:"int("
+                  ~suffix:")"
+                  ~opname:"int_of_float"
+                  args)
+        | _ -> None);
+  }
 
 (** {1 L-value Generation} *)
 
@@ -722,9 +940,14 @@ and gen_match_pattern buf indent scrutinee cname bindings find_constr_types =
       Buffer.add_string buf vn ;
       Buffer.add_string buf " = " ;
       Buffer.add_string buf scrutinee ;
-      Buffer.add_char buf '.' ;
-      Buffer.add_string buf cname ;
-      Buffer.add_string buf "_v;\n"
+      Buffer.add_string
+        buf
+        (Sarek_ir_codegen.payload_suffix
+           Sarek_ir_codegen.glsl_payload_layout
+           ~cname
+           ~arity:1
+           0) ;
+      Buffer.add_string buf ";\n"
   | vars, Some types when List.length vars = List.length types ->
       List.iteri
         (fun i (var_name, ty) ->
@@ -735,9 +958,14 @@ and gen_match_pattern buf indent scrutinee cname bindings find_constr_types =
           Buffer.add_string buf vn ;
           Buffer.add_string buf " = " ;
           Buffer.add_string buf scrutinee ;
-          Buffer.add_char buf '.' ;
-          Buffer.add_string buf cname ;
-          Buffer.add_string buf (Printf.sprintf "_v._%d;\n" i))
+          Buffer.add_string
+            buf
+            (Sarek_ir_codegen.payload_suffix
+               Sarek_ir_codegen.glsl_payload_layout
+               ~cname
+               ~arity:(List.length vars)
+               i) ;
+          Buffer.add_string buf ";\n")
         (List.combine vars types)
   | [], _ | _, None | _, Some [] -> ()
   | _ ->
@@ -754,7 +982,21 @@ and gen_var_decl buf indent v_name v_type init_expr =
      NoContraction). Without it some drivers (observed: RADV via glslang)
      simplify error-free transformations like Dekker/Knuth TwoSum, breaking
      algorithms that rely on IEEE-exact rounding of each operation. This
-     matches CUDA/OpenCL codegen semantics (no fast-math contraction). *)
+     matches CUDA/OpenCL codegen semantics (no fast-math contraction).
+
+     WHAT THIS DOES AND DOES NOT BUY, precisely. The FRONT END honours it:
+     measured with glslc 2026.2 / SPIRV-Tools 1.4.350.1 on the generated
+     matrix_mul shader, the SPIR-V carries 2 NoContraction decorations with
+     [precise] and 0 without. NoContraction is then a requirement on the SPIR-V
+     CONSUMER, i.e. the driver, and whether a given driver honours it is NOT
+     established in this repository — the note above and the campaign notes
+     disagree, and neither has a reproducible in-tree measurement behind it.
+     docs/fp-contraction-policy.md section 6 records the disagreement and the
+     experiment that would settle it. Do not restate either side as fact.
+
+     Separately and independently: RADV's GLSL [fma] is not correctly rounded,
+     so Sarek_df64 mul/div sit at ~5.8e-08 there whatever this qualifier does
+     (RX 7900 XTX, Mesa 26.1.4-arch3.1). *)
   (match v_type with
   | TFloat32 | TFloat64 -> Buffer.add_string buf "precise "
   | _ -> ()) ;
@@ -775,6 +1017,147 @@ and gen_array_decl buf indent v_name elem_ty size =
   Buffer.add_char buf '[' ;
   gen_expr buf size ;
   Buffer.add_string buf "];\n"
+
+(** {1 Cooperative matrix — backlog-62 slice 3}
+
+    The GLSL surface is [GL_KHR_cooperative_matrix]: a
+    [coopmat<T, scope, rows, cols, use>] type, [coopMatLoad] / [coopMatStore]
+    against a storage buffer, and [coopMatMulAdd]. Every one of these functions
+    is total on the IR it is given and raises where the IR admits something this
+    extension cannot spell, rather than emitting text that glslang would reject
+    with a message about a line the user never wrote. *)
+
+(** The GLSL scalar type of a fragment component.
+
+    Deliberately NOT routed through {!glsl_type_of_elttype}: the IR element
+    types and the cooperative-matrix component types are different alphabets
+    that happen to overlap, and there is no [elttype] at all for [s8], [u32] or
+    [f16]-as-a-coopmat-component. Mapping them through a shared function would
+    force one of the two to grow constructors it has no other use for. *)
+let glsl_coopmat_component (c : Sarek_coopmat_types.component_type) =
+  match c with
+  | Sarek_coopmat_types.Uint8 -> "uint8_t"
+  | Sarek_coopmat_types.Sint8 -> "int8_t"
+  | Sarek_coopmat_types.Uint32 -> "uint32_t"
+  | Sarek_coopmat_types.Sint32 -> "int32_t"
+  | Sarek_coopmat_types.Float16 ->
+      (* The f16 REFUSAL is not lifted by this slice, and this is where it is
+         enforced for the coopmat path specifically. Slice 4a's numeric contract
+         — the gamma_16 bound of docs/design/f16-relaxed-accuracy.md §5.2 and
+         its two positive controls — is entirely unmeasured, and §7 is explicit
+         that slice 3 must not lift a refusal past what a model has been
+         measured for. The integer configurations need none of it:
+         SPV_KHR_cooperative_matrix states integer accumulation is exact, so
+         they land under the EXISTING strict contract. *)
+      Codegen_error.raise_error
+        (Codegen_error.unsupported_construct
+           "f16 cooperative matrix"
+           "the numeric contract for float cooperative-matrix accumulation is \
+            unmeasured (docs/design/f16-relaxed-accuracy.md §5, slice 4a). The \
+            INTEGER configurations are available and are under the strict \
+            contract.")
+  | Sarek_coopmat_types.Float32 ->
+      Codegen_error.raise_error
+        (Codegen_error.unsupported_construct
+           "f32 cooperative matrix"
+           "the numeric contract for float cooperative-matrix accumulation is \
+            unmeasured (docs/design/f16-relaxed-accuracy.md §5, slice 4a). The \
+            INTEGER configurations are available and are under the strict \
+            contract.")
+
+let glsl_coopmat_scope (sc : Sarek_coopmat_types.scope) =
+  match sc with
+  | Sarek_coopmat_types.Subgroup -> "gl_ScopeSubgroup"
+  | Sarek_coopmat_types.Workgroup ->
+      (* Modelled in the IR because an unrepresentable scope must not be
+         silently rewritten to Subgroup (see Sarek_coopmat's interface), and
+         refused here because nothing has executed one: every configuration
+         measured on the local device is subgroup scope, and an emitted scope no
+         hardware has run is a claim without evidence. *)
+      Codegen_error.raise_error
+        (Codegen_error.unsupported_construct
+           "workgroup-scope cooperative matrix"
+           "no local device advertises a workgroup-scope configuration, so \
+            none has been measured")
+  | Sarek_coopmat_types.Device_scope | Sarek_coopmat_types.Queue_family ->
+      Codegen_error.raise_error
+        (Codegen_error.unsupported_construct
+           "cooperative-matrix scope"
+           "device and queue-family scopes have no GL_KHR_cooperative_matrix \
+            spelling")
+
+let glsl_coopmat_use (u : Sarek_coopmat_types.use) =
+  match u with
+  | Sarek_coopmat_types.Matrix_a -> "gl_MatrixUseA"
+  | Sarek_coopmat_types.Matrix_b -> "gl_MatrixUseB"
+  | Sarek_coopmat_types.Accumulator -> "gl_MatrixUseAccumulator"
+
+(** The full [coopmat<...>] type of a fragment.
+
+    Rows and columns come from {!Sarek_coopmat_types.fragment_dims}, which
+    DERIVES them from the use and the shape (A is m x k, B is k x n, an
+    accumulator is m x n). Emitting [m] and [n] here regardless of use — the
+    obvious wrong version — produces a shader that compiles and computes
+    nonsense on any non-square shape, which is exactly the class of defect the
+    derived dimensions exist to make unspellable. *)
+let glsl_coopmat_type (f : Sarek_coopmat_types.fragment) =
+  let rows, cols = Sarek_coopmat_types.fragment_dims f in
+  Printf.sprintf
+    "coopmat<%s, %s, %d, %d, %s>"
+    (glsl_coopmat_component f.Sarek_coopmat_types.frag_component)
+    (glsl_coopmat_scope f.Sarek_coopmat_types.frag_scope)
+    rows
+    cols
+    (glsl_coopmat_use f.Sarek_coopmat_types.frag_use)
+
+let gen_coopmat_op op =
+  let expr_str e =
+    let b = Buffer.create 32 in
+    gen_expr b e ;
+    Buffer.contents b
+  in
+  match op with
+  | CM_decl {name; frag} ->
+      Printf.sprintf "%s %s;" (glsl_coopmat_type frag) (escape_glsl_name name)
+  | CM_load {dst; frag; src; index; stride} ->
+      (* Row-major only, and only because that is the layout this slice
+         executed. gl_CooperativeMatrixLayoutColumnMajor is one more enumerant
+         and a second layout to verify on hardware. *)
+      ignore frag ;
+      Printf.sprintf
+        "coopMatLoad(%s, %s, %s, %s, gl_CooperativeMatrixLayoutRowMajor);"
+        (escape_glsl_name dst)
+        (escape_glsl_name src)
+        (expr_str index)
+        (expr_str stride)
+  | CM_store {src; frag; dst; index; stride} ->
+      ignore frag ;
+      Printf.sprintf
+        "coopMatStore(%s, %s, %s, %s, gl_CooperativeMatrixLayoutRowMajor);"
+        (escape_glsl_name src)
+        (escape_glsl_name dst)
+        (expr_str index)
+        (expr_str stride)
+  | CM_muladd {dst; a; b; c; cfg} ->
+      (* [coopMatMulAdd]'s optional fourth argument is the operand-saturation
+         flag. It is emitted from the CONFIGURATION rather than left to a
+         default because saturating and non-saturating are two distinct
+         advertised configurations computing two different functions, and the
+         device gate is keyed on which one the kernel asked for — a codegen that
+         dropped the flag would run the wrong one of the two while the gate
+         reported the right one available. *)
+      let sat =
+        if cfg.Sarek_coopmat_types.cfg_saturating then
+          ", gl_CooperativeMatrixOperandsSaturatingAccumulationKHR"
+        else ""
+      in
+      Printf.sprintf
+        "%s = coopMatMulAdd(%s, %s, %s%s);"
+        (escape_glsl_name dst)
+        (escape_glsl_name a)
+        (escape_glsl_name b)
+        (escape_glsl_name c)
+        sat
 
 let rec gen_stmt buf indent = function
   | SEmpty -> ()
@@ -908,15 +1291,69 @@ let rec gen_stmt buf indent = function
       gen_stmt buf (indent_nested indent) body ;
       Buffer.add_string buf indent ;
       Buffer.add_string buf "}\n"
+  | SCoopmat op ->
+      Buffer.add_string buf indent ;
+      Buffer.add_string buf (gen_coopmat_op op) ;
+      Buffer.add_char buf '\n'
 
 (** {1 Helper Function Generation} *)
+
+(** Alpha-rename kernel-body binders whose name collides with a push-constant
+    macro.
+
+    Scalar params are exposed to the body as preprocessor macros
+    ([#define width pc.width]), and each vector param exposes a length macro
+    ([#define sarek_v_length pc.sarek_v_length]); a macro rewrites {e every}
+    matching token in [main] — including the declared name of a local. A helper
+    inlined at its call site (e.g. a [[@sarek.module]] function whose formal is
+    named like a kernel scalar) emits a self-binding [int width = width;], which
+    the macro turns into [int pc.width = pc.width;] — a syntax error
+    ("unexpected DOT"). Helper {e functions} are guarded too, but only partly by
+    the [#undef]/[#define] dance in {!gen_helper_func}: that dance is computed
+    from PARAMETER names alone, so a helper whose BODY declares a local named
+    like a scalar kernel param was never covered. That is why {!gen_helper_func}
+    now runs this pass over every helper body it emits — on GLSL the symptom is
+    a hard glslang rejection, and on the WGSL twin (which has no macros but does
+    substitute) it is a silently wrong value.
+
+    Both scalar-param macros ([pc_names]) and vector-length macros ([len_names])
+    are treated as collisions; a colliding binder is rewritten to a fresh
+    [sarek_pc_shadow_*] name that no macro touches, so semantics are preserved
+    and the declaration is valid. Delegates the shared traversal to
+    {!Sarek_ir_codegen.rename_shadowing_locals}, supplying only the GLSL
+    collision set (escaped-name membership in [pc_names]/[len_names]) and
+    fresh-name scheme. GLSL-only: no other backend uses macros for params. *)
+let rename_pc_shadowing_locals ~pc_names ~len_names body =
+  Sarek_ir_codegen.rename_shadowing_locals
+    ~collides:(fun name ->
+      (* A local collides if its escaped name matches a scalar-param macro
+         ([#define name pc.name]) or a vector-length macro
+         ([#define sarek_vec_length pc.sarek_vec_length]); either would rewrite
+         the declared identifier to [pc....]. *)
+      let n = escape_glsl_name name in
+      List.mem n pc_names || List.mem n len_names)
+    ~fresh_name:(fun orig n ->
+      Printf.sprintf "sarek_pc_shadow_%s_%d" (escape_glsl_name orig) n)
+    body
 
 (** Generate helper function with #undef/#define guards to avoid macro
     collisions. Push constant macros (e.g., #define max_iter pc.max_iter) would
     otherwise expand function parameters with the same name, causing syntax
     errors.
     @param pc_names Set of push constant names that have macros defined *)
-let gen_helper_func ~pc_names buf (hf : helper_func) =
+let gen_helper_func ~pc_names ~len_names buf (hf : helper_func) =
+  (* Body locals, not just parameters. [colliding_names] below is computed from
+     parameter names, so before this a helper whose body declared a local named
+     like a scalar kernel param emitted [int pc.n = ...] and glslang rejected
+     the shader. Renaming here covers user helpers AND the generated softmath
+     family in one place, keyed on the ACTUAL macro set rather than on a naming
+     convention. *)
+  let hf =
+    {
+      hf with
+      hf_body = rename_pc_shadowing_locals ~pc_names ~len_names hf.hf_body;
+    }
+  in
   (* Filter out vector parameters - in GLSL, buffer arrays can't be passed as
      function parameters. They are accessed directly via global buffer names. *)
   let vec_indices =
@@ -935,17 +1372,24 @@ let gen_helper_func ~pc_names buf (hf : helper_func) =
   let param_names =
     List.map (fun (v : var) -> escape_glsl_name v.var_name) non_vec_params
   in
+  (* [len_names] as well as [pc_names]: a vector-length macro
+     ([#define sarek_v_length pc.sarek_v_length]) rewrites a colliding parameter
+     name exactly as a scalar-param macro does. Checking only [pc_names] left
+     that half unguarded. *)
   let colliding_names =
-    List.filter (fun name -> List.mem name pc_names) param_names
+    List.filter
+      (fun name -> List.mem name pc_names || List.mem name len_names)
+      param_names
   in
   (* #undef colliding names before the function *)
   List.iter
     (fun name -> Buffer.add_string buf (Printf.sprintf "#undef %s\n" name))
     colliding_names ;
-  (* Generate function *)
+  (* Generate function (softmath helper names are re-spelled for GLSL; user
+     helper names pass through unchanged — see {!mangle_softmath_ident}). *)
   Buffer.add_string buf (glsl_type_of_elttype hf.hf_ret_type) ;
   Buffer.add_char buf ' ' ;
-  Buffer.add_string buf hf.hf_name ;
+  Buffer.add_string buf (mangle_softmath_ident hf.hf_name) ;
   Buffer.add_char buf '(' ;
   List.iteri
     (fun i (v : var) ->
@@ -966,16 +1410,6 @@ let gen_helper_func ~pc_names buf (hf : helper_func) =
 
 (** {1 Kernel Generation} *)
 
-(** Count vector parameters for binding assignment *)
-let count_vec_params params =
-  List.fold_left
-    (fun acc decl ->
-      match decl with
-      | DParam (v, _) -> ( match v.var_type with TVec _ -> acc + 1 | _ -> acc)
-      | _ -> acc)
-    0
-    params
-
 (** Generate GLSL compute shader header.
     @param block Optional workgroup dimensions (x, y, z). Defaults to 256x1x1.
     @param uses_float64
@@ -986,20 +1420,80 @@ let count_vec_params params =
       declaring it explicitly keeps the generated source correct against
       stricter/non-glslang GLSL compilers and documents the requirement in the
       emitted shader. Defaults to [false] so kernels that do not use float64
-      never carry the extension. *)
-let glsl_header ~kernel_name ?(block = (256, 1, 1)) ?(uses_float64 = false) () =
+      never carry the extension.
+    @param uses_int64
+      Whether the kernel needs [int64_t] — either as a user element type, or for
+      the bit manipulation the software f64 transcendentals and the non-finite
+      f64 literal path perform. When [true], emits
+      [#extension GL_ARB_gpu_shader_int64 : require]. Unlike the fp64 line this
+      one is NOT optional: [int64_t] does not parse under plain [#version 450]
+      without it (glslangValidator: "syntax error, unexpected IDENTIFIER").
+      Defaults to [false] on the same byte-identity grounds as [uses_float64].
+*)
+let glsl_header ~kernel_name ?(block = (256, 1, 1)) ?(uses_float64 = false)
+    ?(uses_int64 = false) ?(uses_coopmat = false) ?(uses_uint8 = false) () =
   let bx, by, bz = block in
   let fp64_extension =
     if uses_float64 then "#extension GL_ARB_gpu_shader_fp64 : require\n" else ""
   in
+  (* [GL_ARB_gpu_shader_int64] has THREE triggers, and this comment used to name
+     only the first two — which is precisely how #141's defect survived:
+
+       1. the software f64 transcendentals, which reinterpret a double's bits as
+          an [int64_t] to extract its exponent/mantissa;
+       2. a non-finite f64 constant, spelled via [int64BitsToDouble];
+       3. the user's own [int64] — a plain [int64 vector] kernel, no float64
+          anywhere.
+
+     The old comment also asserted that "a kernel that needs int64 necessarily
+     uses fp64". That was false, and it was load-bearing: it is the reason the
+     extension was gated on the two float64 conditions alone, so trigger 3
+     emitted [int64_t] with no [#extension] line and glslang rejected the
+     shader. Both claims are corrected here rather than deleted, because the
+     ORDERING below still depends on one of them being read correctly: the int64
+     line is emitted after the fp64 line so that a kernel using neither, or only
+     fp64, stays byte-identical to its committed golden. That is a statement
+     about the ORDER of two independent lines, not about one implying the
+     other. *)
+  let int64_extension =
+    if uses_int64 then "#extension GL_ARB_gpu_shader_int64 : require\n" else ""
+  in
+  (* backlog-62 slice 3. Each of these is REQUIRED rather than declared for
+     tidiness, and the set was read off the SPIR-V rather than guessed: glslc on
+     a 16x16x16 u8 coopMatMulAdd emits OpCapability Int8,
+     StorageBuffer8BitAccess, VulkanMemoryModel and CooperativeMatrixKHR.
+     GL_KHR_memory_scope_semantics is what produces the third, and glslang makes
+     it a prerequisite of GL_KHR_cooperative_matrix — so it belongs to the
+     coopmat line and not to the int8 one, and a float coopmat kernel would need
+     it too.
+
+     The two are separate conditions rather than one, because they are separate
+     facts: a kernel may declare a uint8 buffer without reaching a multiply-add.
+     Emitting the coopmat extension for such a kernel would put a requirement in
+     the shader that the device gate was never asked about. *)
+  let coopmat_extension =
+    if uses_coopmat then
+      "#extension GL_KHR_cooperative_matrix : require\n\
+       #extension GL_KHR_memory_scope_semantics : require\n"
+    else ""
+  in
+  let uint8_extension =
+    if uses_uint8 then
+      "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n\
+       #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n"
+    else ""
+  in
   Printf.sprintf
     {|#version 450
-%s
+%s%s%s%s
 // Sarek-generated compute shader: %s
 layout(local_size_x = %d, local_size_y = %d, local_size_z = %d) in;
 
 |}
     fp64_extension
+    int64_extension
+    coopmat_extension
+    uint8_extension
     kernel_name
     bx
     by
@@ -1039,8 +1533,8 @@ let gen_push_constants buf params =
     (* Add length parameter for each vector *)
     List.iter
       (fun v ->
-        let name = escape_glsl_name v.var_name in
-        Buffer.add_string buf (Printf.sprintf "  int %s_len;\n" name))
+        let name = glsl_array_length_name v.var_name in
+        Buffer.add_string buf (Printf.sprintf "  int %s;\n" name))
       vectors ;
     (* Add user-defined scalar parameters *)
     List.iter
@@ -1054,10 +1548,8 @@ let gen_push_constants buf params =
     (* Define convenience aliases for push constants *)
     List.iter
       (fun v ->
-        let name = escape_glsl_name v.var_name in
-        Buffer.add_string
-          buf
-          (Printf.sprintf "#define %s_len pc.%s_len\n" name name))
+        let name = glsl_array_length_name v.var_name in
+        Buffer.add_string buf (Printf.sprintf "#define %s pc.%s\n" name name))
       vectors ;
     List.iter
       (fun v ->
@@ -1088,6 +1580,12 @@ let rec collect_shared_decls (s : stmt) : (string * elttype * expr) list =
       List.concat_map (fun (_, body) -> collect_shared_decls body) cases
   | SEmpty | SBarrier | SWarpBarrier | SMemFence | SNative _ | SExpr _
   | SAssign _ | SReturn _ ->
+      []
+  | SCoopmat _ ->
+      (* A cooperative-matrix statement never introduces a shared array: a
+         fragment is a subgroup-cooperative value with no storage this pass can
+         hoist, and the buffers it loads from are parameters, already declared.
+         This is the final answer, not a slice-3 placeholder. *)
       []
 
 (** Generate shared declarations at module scope *)
@@ -1185,6 +1683,13 @@ let compute_smod_name (k : kernel) : string =
 let compute_copysign_name (k : kernel) : string =
   compute_collision_safe_name k ~base:"sarek_copysign"
 
+(** Choose a collision-safe name for the C-[fmod] helper of kernel [k]. Same
+    scope and collision rules as {!compute_smod_name}; the distinct base
+    ([sarek_fmod]) keeps it from colliding with the other helpers, only with
+    user param/helper identifiers. *)
+let compute_fmod_name (k : kernel) : string =
+  compute_collision_safe_name k ~base:"sarek_fmod"
+
 (** Emit the [sarek_copysign] sign-copy helper when the kernel uses [copysign].
 
     GLSL has no [copysign] builtin. The exact, branch-free lowering transfers
@@ -1208,7 +1713,13 @@ let compute_copysign_name (k : kernel) : string =
     not a literal, so it cannot collide with a user param or helper identifier.
 *)
 let gen_copysign_helper buf (k : kernel) =
-  if Sarek_ir_analysis.kernel_uses_copysign k then begin
+  (* Emitted when the kernel uses [copysign] directly, OR when a needed software
+     f64 transcendental does (sinh/tanh/atan/atan2/asin/acos): those helpers call
+     [copysign] internally, but the original kernel IR carries no [copysign]
+     node, so [kernel_uses_copysign] alone would miss it and leave the softmath
+     body referencing an undeclared [sarek_copysign]. *)
+  if Sarek_ir_analysis.kernel_uses_copysign k || !current_f64_needs_copysign
+  then begin
     Buffer.add_string
       buf
       (Printf.sprintf
@@ -1226,78 +1737,247 @@ let gen_copysign_helper buf (k : kernel) =
            !current_copysign_name)
   end
 
-(** Generate complete GLSL source for a kernel.
-    @param block Optional workgroup dimensions (x, y, z). Defaults to 256x1x1.
+(** Emit the [sarek_fmod] C-conformant [fmod] helper when the kernel uses
+    [fmod].
+
+    GLSL has no [fmod] builtin, and its [mod()] is floor-based (divisor-signed),
+    so it cannot implement the truncated C [fmod] the intrinsic contracts for.
+    The earlier single-pass [x - y * trunc(x / y)] was wrong two ways (both
+    caught in review): (1) for an infinite divisor it gives [x - inf*trunc(0)] =
+    [x - inf*0] = NaN, where C defines [fmod(x, ±inf) = x]; (2) for large [|x/y|]
+    the quotient [x/y] loses integer precision, so [trunc] is wrong and the
+    result can leave [0,|y|) — exactly why #252's PTX [emit_float_fmod] is an
+    ITERATIVE reduction, not a single pass.
+
+    This emits a C-conformant body instead:
+
+    - domain guards, per C: NaN operand, [|x| = inf], or [y = 0] → NaN;
+      [|y| = inf] (finite [x]) → [x]; [|x| < |y|] → [x];
+    - otherwise an exact reduction by power-of-two scaling: scale [d = |y|] up by
+      [×2] (exact) to the largest [|y|·2^k ≤ |x|], then walk it back down to
+      [|y|] subtracting whenever [r ≥ d]. Every [×2]/[×0.5] is exact, and each
+      subtraction runs with [d ≤ r < 2d] so it is exact by Sterbenz — the result
+      is therefore bit-exact vs C [fmod] (stronger than the PTX path's
+      correctly-rounded div/fma reduction). The two loops each run at most
+      [exp(|x|) − exp(|y|)] ≤ ~277 (f32) / ~2098 (f64) iterations — bounded by
+      the exponent span, so termination is guaranteed (the same bound argument as
+      the PTX reduction, which shrinks [|r|] by the mantissa width per round).
+      The dividend's sign (incl. [-0]) is restored with a bit-level copy.
+
+    Two overloads are emitted, resolved by argument type at the call site (same
+    scheme as {!gen_copysign_helper}):
+
+    - [float]: always emitted when [fmod] is used. [isnan]/[isinf]/[floatBitsTo*]
+      are core since GLSL 3.30/4.10, needing no extension.
+    - [double]: emitted only when the kernel also uses float64. It uses the
+      genDType [isnan]/[isinf] overloads and [un/packDouble2x32], all gated
+      behind [GL_ARB_gpu_shader_fp64] (already emitted under the same
+      [kernel_uses_float64] condition, as for {!gen_copysign_helper}).
+
+    The helper name is [!current_fmod_name] (see {!compute_fmod_name}), never a
+    literal, so it cannot collide with a user param or helper identifier. *)
+let gen_fmod_helper buf (k : kernel) =
+  if Sarek_ir_analysis.kernel_uses_intrinsic "fmod" k then begin
+    Buffer.add_string
+      buf
+      (Printf.sprintf
+         "float %s(float x, float y) {\n\
+         \  float ay = abs(y);\n\
+         \  if (isnan(x) || isnan(y) || isinf(x) || ay == 0.0) return \
+          uintBitsToFloat(0x7fc00000u);\n\
+         \  if (isinf(y)) return x;\n\
+         \  float ax = abs(x);\n\
+         \  if (ax < ay) return x;\n\
+         \  float r = ax; float d = ay;\n\
+         \  while (d <= 0.5 * r) d *= 2.0;\n\
+         \  while (true) { if (r >= d) r -= d; if (d == ay) break; d *= 0.5; }\n\
+         \  return uintBitsToFloat((floatBitsToUint(r) & 0x7fffffffu) | \
+          (floatBitsToUint(x) & 0x80000000u));\n\
+          }\n\n"
+         !current_fmod_name) ;
+    if Sarek_ir_analysis.kernel_uses_float64 k then
+      Buffer.add_string
+        buf
+        (Printf.sprintf
+           "double %s(double x, double y) {\n\
+           \  double ay = abs(y);\n\
+           \  if (isnan(x) || isnan(y) || isinf(x) || ay == 0.0lf) return \
+            packDouble2x32(uvec2(0u, 0x7ff80000u));\n\
+           \  if (isinf(y)) return x;\n\
+           \  double ax = abs(x);\n\
+           \  if (ax < ay) return x;\n\
+           \  double r = ax; double d = ay;\n\
+           \  while (d <= 0.5lf * r) d *= 2.0lf;\n\
+           \  while (true) { if (r >= d) r -= d; if (d == ay) break; d *= \
+            0.5lf; }\n\
+           \  uvec2 ur = unpackDouble2x32(r); uvec2 ux = unpackDouble2x32(x);\n\
+           \  ur.y = (ur.y & 0x7fffffffu) | (ux.y & 0x80000000u);\n\
+           \  return packDouble2x32(ur);\n\
+            }\n\n"
+           !current_fmod_name)
+  end
+
+(** Resolve the software f64-transcendental helper family a kernel needs and set
+    the per-kernel emitter state ({!current_f64_helpers},
+    {!current_needs_int64}, {!current_f64_needs_copysign}). Collects the
+    [Float64] transcendental intrinsics the kernel invokes
+    ({!Sarek_ir_analysis.kernel_float64_intrinsics}), maps each to its root
+    helper(s) ({!f64_root_helpers}), and closes the set over softmath
+    cross-calls (tan→sin/cos, pow→exp/log, log10→log, …). The retained order is
+    [Sarek_ir_softmath.all_helpers]'s stable family order, so the emitted
+    preamble is deterministic across runs. *)
+let compute_f64_softmath (k : kernel) =
+  let roots =
+    List.concat_map
+      (fun n -> Option.value ~default:[] (f64_root_helpers n))
+      (Sarek_ir_analysis.kernel_float64_intrinsics k)
+  in
+  let needed : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+  let rec add name =
+    if not (Hashtbl.mem needed name) then begin
+      Hashtbl.replace needed name () ;
+      match Sarek_ir_softmath.helper_by_name name with
+      | Some hf -> List.iter add (Sarek_ir_softmath.callees hf)
+      | None -> ()
+    end
+  in
+  List.iter add roots ;
+  let helpers =
+    List.filter
+      (fun (hf : helper_func) -> Hashtbl.mem needed hf.hf_name)
+      (Sarek_ir_softmath.all_helpers ())
+  in
+  current_f64_helpers := helpers ;
+  (* int64 is needed by any helper that manipulates the exponent/mantissa
+     fields AND, independently of the helpers, by any non-finite Float64
+     constant (emitted via int64BitsToDouble in gen_expr — GLSL has no inf/nan
+     literal). Gating on both keeps a user-reachable [Float64.infinity] with no
+     transcendental from emitting int64 ops without the extension. *)
+  (* AND, third, by the user's own int64: [glsl_type_of_elttype] maps [TInt64]
+     to "int64_t" at the correct width, but that spelling does not EXIST under
+     plain #version 450. Before #141 the extension was gated on the two f64
+     conditions above only, so a kernel over a plain `int64 vector` emitted
+
+       layout(std430, ...) buffer Buffer_outv { int64_t outv[]; };
+
+     with no #extension line, which glslangValidator rejects with
+     "'' : syntax error, unexpected IDENTIFIER" — reproduced, exit 2. Loud
+     rather than silent, so not the #141 narrowing class, but found by the same
+     sweep and broken all the same. [kernel_uses Int64] is the general detector
+     ([Sarek_ir_analysis.Int64], added with this fix); the two f64-specific
+     conditions stay because a kernel can need int64 OPS without an int64 TYPE
+     (the softmath helpers bit-cast a double, and int64BitsToDouble spells a
+     non-finite f64 literal). *)
+  current_needs_int64 :=
+    List.exists Sarek_ir_softmath.uses_int64 helpers
+    || Sarek_ir_analysis.kernel_uses_nonfinite_float64 k
+    || Sarek_ir_analysis.kernel_uses Sarek_ir_analysis.Int64 k ;
+  current_f64_needs_copysign :=
+    List.exists Sarek_ir_softmath.uses_copysign helpers
+
+(** Emit the needed software f64-transcendental helpers
+    ({!current_f64_helpers}). The whole family is forward-declared first, so
+    cross-calls resolve regardless of definition order, then the bodies are
+    emitted via {!gen_helper_func} (which applies the same push-constant-macro
+    [#undef]/[#define] guarding as user helpers). Emitted after [sarek_copysign]
+    (which the bodies may call) and before user helpers (which may call these).
 *)
-let generate ?block ?(log : string -> unit = fun _ -> ()) (k : kernel) : string
-    =
-  (* Inline vector-parameter helpers (buffers cannot be passed as GLSL function
-     arguments — see Sarek_ir_inline_vec). *)
-  let k = Sarek_ir_inline_vec.inline_vec_helpers ~backend:"Vulkan" k in
-  (* Clear per-kernel state *)
-  Hashtbl.clear helper_vec_param_indices ;
-  current_smod_name := compute_smod_name k ;
-  current_copysign_name := compute_copysign_name k ;
-  let buf = Buffer.create 1024 in
-  Buffer.add_string
-    buf
-    (glsl_header
-       ~kernel_name:k.kern_name
-       ?block
-       ~uses_float64:(Sarek_ir_analysis.kernel_uses_float64 k)
-       ()) ;
+let gen_f64_softmath_helpers ~pc_names ~len_names buf =
+  match !current_f64_helpers with
+  | [] -> ()
+  | helpers ->
+      List.iter
+        (fun (hf : helper_func) ->
+          Buffer.add_string buf (glsl_type_of_elttype hf.hf_ret_type) ;
+          Buffer.add_char buf ' ' ;
+          Buffer.add_string buf (mangle_softmath_ident hf.hf_name) ;
+          Buffer.add_char buf '(' ;
+          List.iteri
+            (fun i (v : var) ->
+              if i > 0 then Buffer.add_string buf ", " ;
+              Buffer.add_string buf (glsl_type_of_elttype v.var_type))
+            hf.hf_params ;
+          Buffer.add_string buf ");\n")
+        helpers ;
+      Buffer.add_char buf '\n' ;
+      List.iter (gen_helper_func ~pc_names ~len_names buf) helpers
 
-  (* Generate buffer bindings *)
-  let binding_idx = ref 0 in
-  List.iter
-    (fun decl ->
-      match decl with
-      | DParam (v, _) -> (
-          match v.var_type with
-          | TVec elem_type ->
-              gen_buffer_binding buf !binding_idx v elem_type ;
-              incr binding_idx
-          | _ -> ())
-      | _ -> ())
-    k.kern_params ;
+(** The two macro-name sets a kernel's parameter list induces, as one value:
+    [(pc_names, len_names)].
 
-  (* Generate push constants and collect scalar names for macro collision handling *)
-  gen_push_constants buf k.kern_params ;
+    {b One construction, deliberately.} {!gen_push_constants} emits a
+    [#define <s> pc.<s>] for every scalar parameter and a
+    [#define sarek_<v>_length pc.sarek_<v>_length] for every vector parameter;
+    {!rename_pc_shadowing_locals} needs both sets to know which body locals
+    those macros would rewrite. Both {!generate} and {!generate_with_types} need
+    them, and until backlog-156's close-out each built them by its own copy of
+    this [filter_map] pair. That is the same two-halves-one-concept shape
+    {!glsl_array_length_name} exists to close, one level up: reverting either
+    copy alone left the whole tree green while the other entry point emitted
+    GLSL glslangValidator rejects with "unexpected DOT". So there is one
+    construction and both entry points call it — the copies cannot drift because
+    there are no copies.
+
+    Note which entry point production uses: [Vulkan_plugin] calls
+    {!generate_with_types}; {!generate} is reached only from the transpiler and
+    the benchmark generator. A check that exercises only one of them is checking
+    the other one's twin. *)
+let param_macro_names params =
   let pc_names =
     List.filter_map
       (fun decl ->
         match decl with
         | DParam (v, _) -> (
             match v.var_type with
-            | TVec _ -> None (* vectors don't get macros, only their _len *)
+            | TVec _ -> None (* vectors don't get macros, only their length *)
             | _ -> Some (escape_glsl_name v.var_name))
         | _ -> None)
-      k.kern_params
+      params
   in
+  let len_names =
+    List.filter_map
+      (fun decl ->
+        match decl with
+        | DParam (v, _) -> (
+            match v.var_type with
+            | TVec _ -> Some (glsl_array_length_name v.var_name)
+            | _ -> None)
+        | _ -> None)
+      params
+  in
+  (pc_names, len_names)
 
-  (* Generate shared declarations at module scope (GLSL requirement) *)
-  let shared_decls = collect_shared_decls k.kern_body in
-  gen_shared_decls buf shared_decls ;
+(* GLSL f16 refusal. Like OpenCL's (#57 slice 2a) and unlike Metal's and
+   WGSL's, this deliberately does NOT go through
+   {!Sarek_ir_codegen.reject_feature}, and the divergence is the point.
 
-  (* Emit the integer-remainder helper (before user helpers, which may call
-     it) when the kernel uses [mod]. *)
-  gen_smod_helper buf k ;
+   [reject_feature] composes "<backend>: float16 not yet supported (#57 slice
+   2 — <hint>)". Both halves were false here, and #57 slice 2b measured them
+   false rather than inferring it:
 
-  (* Emit the sign-copy helper (before user helpers, which may call it) when
-     the kernel uses [copysign]. *)
-  gen_copysign_helper buf k ;
+   - "not YET supported" describes a queue position. GLSL is not in the queue.
+   - the old hint, "needs GL_EXT_shader_explicit_arithmetic_types_float16",
+     named the wrong blocker: that extension compiles and runs on both local
+     RADV devices, and enabling it changes nothing about why f16 is refused.
 
-  (* Generate helper functions *)
-  List.iter (gen_helper_func ~pc_names buf) k.kern_funcs ;
+   The actual blocker, and the reason `precise` does not rescue it, is
+   documented at length on the [TFloat16] arm of {!glsl_type_of_elttype}. The
+   whole-kernel rationale for gating here as well (rather than relying on the
+   per-element-type arm) lives once, at {!Sarek_ir_codegen.reject_feature}.
 
-  (* Generate main function *)
-  Buffer.add_string buf "void main() {\n" ;
-  gen_stmt buf "  " k.kern_body ;
-  Buffer.add_string buf "}\n" ;
+   Metal and WGSL keep the shared composer precisely so THEY still reword
+   together: those two are genuinely unimplemented, and filing a measured,
+   possibly-permanent refusal under the same heading would lose that
+   distinction.
 
-  let shader = Buffer.contents buf in
-  log (Printf.sprintf "[GLSL] Generated shader:\n%s" shader) ;
-  shader
+   Named [_kernel] to distinguish it from [Sarek_typer.reject_float16], which
+   rejects an f16 OPERAND — a different concept at a different layer. *)
+let reject_float16_kernel (k : kernel) : unit =
+  if Sarek_ir_analysis.kernel_uses Sarek_ir_analysis.Float16 k then
+    Codegen_error.raise_error
+      (Codegen_error.unsupported_construct
+         "f16"
+         Sarek_ir_codegen.glsl_float16_refusal)
 
 (** Generate GLSL record type definition - simple struct without tag *)
 let gen_record_def buf (name, fields) =
@@ -1325,6 +2005,7 @@ let gen_variant_def buf v =
 *)
 let generate_with_types ?block ?(log : string -> unit = fun _ -> ())
     ~(types : (string * (string * elttype) list) list) (k : kernel) : string =
+  reject_float16_kernel k ;
   (* Inline vector-parameter helpers (buffers cannot be passed as GLSL function
      arguments — see Sarek_ir_inline_vec). *)
   let k = Sarek_ir_inline_vec.inline_vec_helpers ~backend:"Vulkan" k in
@@ -1332,6 +2013,8 @@ let generate_with_types ?block ?(log : string -> unit = fun _ -> ())
   Hashtbl.clear helper_vec_param_indices ;
   current_smod_name := compute_smod_name k ;
   current_copysign_name := compute_copysign_name k ;
+  current_fmod_name := compute_fmod_name k ;
+  compute_f64_softmath k ;
   (* Use variant types directly from kernel IR *)
   current_variants := k.kern_variants ;
 
@@ -1342,6 +2025,9 @@ let generate_with_types ?block ?(log : string -> unit = fun _ -> ())
        ~kernel_name:k.kern_name
        ?block
        ~uses_float64:(Sarek_ir_analysis.kernel_uses_float64 k)
+       ~uses_int64:!current_needs_int64
+       ~uses_coopmat:(Sarek_ir_analysis.kernel_has_coopmat_op k)
+       ~uses_uint8:(Sarek_ir_analysis.kernel_uses Sarek_ir_analysis.Coopmat k)
        ()) ;
 
   (* Generate record type definitions (simple structs without tag) *)
@@ -1366,17 +2052,9 @@ let generate_with_types ?block ?(log : string -> unit = fun _ -> ())
 
   (* Generate push constants and collect scalar names for macro collision handling *)
   gen_push_constants buf k.kern_params ;
-  let pc_names =
-    List.filter_map
-      (fun decl ->
-        match decl with
-        | DParam (v, _) -> (
-            match v.var_type with
-            | TVec _ -> None (* vectors don't get macros, only their _len *)
-            | _ -> Some (escape_glsl_name v.var_name))
-        | _ -> None)
-      k.kern_params
-  in
+  (* Scalar-param macros and vector-length macros, from the single
+     construction both entry points share (see [param_macro_names]). *)
+  let pc_names, len_names = param_macro_names k.kern_params in
 
   (* Generate shared declarations at module scope (GLSL requirement) *)
   let shared_decls = collect_shared_decls k.kern_body in
@@ -1390,14 +2068,40 @@ let generate_with_types ?block ?(log : string -> unit = fun _ -> ())
      the kernel uses [copysign]. *)
   gen_copysign_helper buf k ;
 
-  (* Generate helper functions *)
-  List.iter (gen_helper_func ~pc_names buf) k.kern_funcs ;
+  (* Emit the C-fmod helper (before user helpers, which may call it) when the
+     kernel uses [fmod]. *)
+  gen_fmod_helper buf k ;
 
-  (* Generate main function *)
+  (* Emit the software f64-transcendental helper family (forward-declared,
+     after copysign which they may call, before user helpers which may call
+     them) when the kernel invokes a [Float64] transcendental. *)
+  gen_f64_softmath_helpers ~pc_names ~len_names buf ;
+
+  (* Generate helper functions *)
+  List.iter (gen_helper_func ~pc_names ~len_names buf) k.kern_funcs ;
+
+  (* Generate main function. Alpha-rename any body local that shadows a scalar
+     push-constant macro first (see rename_pc_shadowing_locals). *)
   Buffer.add_string buf "void main() {\n" ;
-  gen_stmt buf "  " k.kern_body ;
+  gen_stmt
+    buf
+    "  "
+    (rename_pc_shadowing_locals ~pc_names ~len_names k.kern_body) ;
   Buffer.add_string buf "}\n" ;
 
   let shader = Buffer.contents buf in
   log (Printf.sprintf "[GLSL] Generated shader:\n%s" shader) ;
   shader
+
+(** Generate complete GLSL source for a kernel.
+
+    A special case of {!generate_with_types} with the kernel's OWN type
+    declarations, which is the only thing every production caller ever passed:
+    [~types] has exactly the type of the [kern_types] field
+    ([Sarek_ir_types.kernel]), so the parameter was redundant with the record it
+    travels in. This used to be a separate 30-80 line copy of the emit sequence
+    that silently omitted record typedefs, variant typedefs and
+    [current_variants] — source referencing an undeclared struct, with no error.
+    Delegating keeps one emit path per backend. *)
+let generate ?block ?log (k : kernel) : string =
+  generate_with_types ?block ?log ~types:k.kern_types k

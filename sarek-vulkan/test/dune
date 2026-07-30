@@ -2,24 +2,51 @@
 
 (test
  (name test_vulkan_error)
+ (modules test_vulkan_error)
  (libraries sarek_vulkan alcotest str))
 
 (test
  (name test_sarek_ir_glsl)
+ (modules test_sarek_ir_glsl)
  (libraries sarek_vulkan sarek_ir alcotest str))
 
 (test
  (name test_vulkan_cache_two_kernels)
+ (modules test_vulkan_cache_two_kernels)
  (libraries sarek_vulkan alcotest))
 
 (test
  (name test_vulkan_ffi_check_funnel)
+ (modules test_vulkan_ffi_check_funnel)
  (libraries sarek_vulkan sarek_backend_error alcotest))
 
 (test
  (name test_vulkan_buffer_index_validation)
+ (modules test_vulkan_buffer_index_validation)
  (libraries sarek_vulkan spoc_framework alcotest str))
 
 (test
  (name test_vulkan_error_observability)
+ (modules test_vulkan_error_observability)
  (libraries sarek_vulkan sarek_ir sarek_backend_error alcotest))
+
+(test
+ (name test_vulkan_f16_tripwire)
+ (modules test_vulkan_f16_tripwire)
+ (libraries sarek_vulkan spoc_framework alcotest))
+
+(test
+ (name test_vulkan_coopmat_capability)
+ (modules test_vulkan_coopmat_capability)
+ (libraries sarek_vulkan spoc_framework sarek_ir alcotest str))
+
+; backlog-62 slice 3 — the integer coopmat path, executed against an exact host
+; oracle. A `test` and not a `probe` because the claim it defends (integer
+; accumulation is exact, so this path is under the STRICT contract) is a claim
+; Sarek ships, not a driver measurement: it skips where there is no coopmat
+; device and must be red where there is one and the answer is wrong.
+
+(test
+ (name test_vulkan_coopmat_integer)
+ (modules test_vulkan_coopmat_integer)
+ (libraries sarek_vulkan spoc_framework sarek_ir alcotest astring))

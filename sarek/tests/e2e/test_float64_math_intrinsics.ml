@@ -60,18 +60,14 @@ let make_unary_ir name : kernel =
             EIntrinsic (["Float64"], name, [EArrayRead ("a", EVar idx)]) ) )
   in
   {
+    default_kernel with
     kern_name = "float64_" ^ name ^ "_unary";
     kern_params =
       [
         DParam (a, Some {arr_elttype = TFloat64; arr_memspace = Global});
         DParam (b, Some {arr_elttype = TFloat64; arr_memspace = Global});
       ];
-    kern_locals = [];
     kern_body = body;
-    kern_types = [];
-    kern_variants = [];
-    kern_funcs = [];
-    kern_native_fn = None;
   }
 
 let make_binary_ir name : kernel =
@@ -99,6 +95,7 @@ let make_binary_ir name : kernel =
                 [EArrayRead ("a", EVar idx); EArrayRead ("b", EVar idx)] ) ) )
   in
   {
+    default_kernel with
     kern_name = "float64_" ^ name ^ "_binary";
     kern_params =
       [
@@ -106,12 +103,7 @@ let make_binary_ir name : kernel =
         DParam (b, Some {arr_elttype = TFloat64; arr_memspace = Global});
         DParam (c, Some {arr_elttype = TFloat64; arr_memspace = Global});
       ];
-    kern_locals = [];
     kern_body = body;
-    kern_types = [];
-    kern_variants = [];
-    kern_funcs = [];
-    kern_native_fn = None;
   }
 
 (** {1 Function specs}
@@ -252,6 +244,30 @@ let unary_specs =
       u_gen = bounded (-5.0) 5.0;
       u_tol = 0.0;
     };
+    (* exp2/log2/cbrt have no dedicated Float64 device builtin and no software
+       helper of their own: the GLSL backend composes them over exp/log/pow
+       (2^x = exp(x·ln2), log2 x = log x·log2e, cbrt x = sign x·pow(|x|,1/3)).
+       These rows give the composition numeric coverage on real fp64 devices.
+       The CPU interpreter has no eval arm for them, so it reports SKIP there —
+       expected, and harmless to this report-only test. *)
+    {
+      u_name = "exp2";
+      u_ocaml = (fun x -> Float.pow 2.0 x);
+      u_gen = bounded (-2.0) 2.0;
+      u_tol = 1e-8;
+    };
+    {
+      u_name = "log2";
+      u_ocaml = Float.log2;
+      u_gen = bounded 0.01 5.0;
+      u_tol = 1e-9;
+    };
+    {
+      u_name = "cbrt";
+      u_ocaml = Float.cbrt;
+      u_gen = bounded (-5.0) 5.0;
+      u_tol = 1e-9;
+    };
   ]
 
 let binary_specs =
@@ -304,6 +320,38 @@ let binary_specs =
           in
           (x, y));
       b_tol = 0.0;
+    };
+    {
+      (* Float64.fmod (float-mod-intrinsic): C fmod = OCaml Float.rem. Result
+         sign follows the DIVIDEND, magnitude < |divisor|. Three fixed indices
+         pin the review-raised edge cases; the rest cycle all four (sign x,
+         sign y) quadrants with fractional divisors:
+           i=0 : fmod(5, +inf) = 5   -- infinite divisor: C returns x. The old
+                 single-pass x - y*trunc(x/y) gave inf*0 = NaN here.
+           i=1 : fmod(1e30, 3)        -- |x/y| ~ 3e29 >> 2^53, so the single-pass
+           i=2 : fmod(-1e30, 3)          quotient loses all integer bits and the
+                 result could leave [0,|y|); the bounded exact reduction (GLSL)
+                 and emit_float_fmod (PTX) are correct.
+         tol 1e-9: GLSL/WGSL now use a bit-exact power-of-two reduction and
+         PTX's emit_float_fmod is bit-exact vs Float.rem, so the residual is
+         device-fp only. The [y = 0 -> NaN] / [|x| = inf -> NaN] domain is
+         exercised by the interpreter unit test instead; this report-only
+         harness compares by magnitude and would mis-handle NaN. *)
+      b_name = "fmod";
+      b_ocaml = Float.rem;
+      b_gen =
+        (fun i ->
+          match i with
+          | 0 -> (5.0, Float.infinity)
+          | 1 -> (1e30, 3.0)
+          | 2 -> (-1e30, 3.0)
+          | _ ->
+              let mag_x = bounded 0.5 900.0 i in
+              let mag_y = bounded 0.3 3.3 (i + 17) in
+              let sx = if i land 1 = 0 then 1.0 else -1.0 in
+              let sy = if i land 2 = 0 then 1.0 else -1.0 in
+              (sx *. mag_x, sy *. mag_y));
+      b_tol = 1e-9;
     };
   ]
 

@@ -22,7 +22,8 @@ let quote_int32 ~loc i =
 let quote_int64 ~loc i =
   [%expr Int64.of_int [%e Ast_builder.Default.eint ~loc (Int64.to_int i)]]
 
-let quote_float ~loc f = Ast_builder.Default.efloat ~loc (string_of_float f)
+let quote_float ~loc f =
+  Ast_builder.Default.efloat ~loc (Sarek_float_literal.to_source f)
 
 let quote_string ~loc s = Ast_builder.Default.estring ~loc s
 
@@ -50,6 +51,7 @@ let rec quote_elttype ~loc (t : Ir.elttype) : expression =
   match t with
   | Ir.TInt32 -> [%expr Sarek.Sarek_ir.TInt32]
   | Ir.TInt64 -> [%expr Sarek.Sarek_ir.TInt64]
+  | Ir.TFloat16 -> [%expr Sarek.Sarek_ir.TFloat16]
   | Ir.TFloat32 -> [%expr Sarek.Sarek_ir.TFloat32]
   | Ir.TFloat64 -> [%expr Sarek.Sarek_ir.TFloat64]
   | Ir.TBool -> [%expr Sarek.Sarek_ir.TBool]

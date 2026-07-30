@@ -74,7 +74,18 @@ module Metal : Framework_sig.PLUGIN_BASE = struct
           total_global_mem = Int64.of_int (4 * 1024 * 1024 * 1024);
           (* Estimate, Metal doesn't expose this *)
           compute_capability = (0, 0);
-          supports_fp64 = d.supports_fp64;
+          (* [d.supports_fp64] is hardcoded false in Metal_api: MSL has no
+             [double] at all, which is Backend_structural and refused at
+             codegen through Sarek_capability.float64_absent_metal. It is
+             threaded through rather than dropped so the two cannot disagree.
+             MSL does have [long], so int64 is provided. *)
+          device_features =
+            (if d.supports_fp64 then [Sarek_ir_analysis.Float64] else [])
+            @ [Sarek_ir_analysis.Int64];
+          (* backlog-62: no cooperative-matrix probe on this backend. [None] is
+             "not probed", which Sarek_coopmat.verdict maps to Unknown and therefore
+             refuses; an empty list would be a positive claim nobody measured. *)
+          coopmat = None;
           supports_atomics = true;
           warp_size = 32;
           (* SIMD width on Apple GPUs *)
@@ -103,7 +114,11 @@ module Metal : Framework_sig.PLUGIN_BASE = struct
     type 'a buffer = {buf : 'a Metal_api.Memory.buffer; device_id : int}
 
     let alloc device size kind =
-      let elem_size = Ctypes_static.sizeof (Ctypes.typ_of_bigarray_kind kind) in
+      (* NOT Ctypes_static.sizeof (Ctypes.typ_of_bigarray_kind kind): ctypes'
+         kind GADT has no Float16 arm and raises Failure "Unsupported bigarray
+         kind", so [Vector.create Vector.float16 n] died here with an opaque
+         ctypes error (#57 slice 1 review, MF2). *)
+      let elem_size = Spoc_core.Memory.bigarray_elem_size kind in
       let buf = Metal_api.Memory.alloc device size elem_size in
       {buf; device_id = device.id}
 
@@ -119,27 +134,27 @@ module Metal : Framework_sig.PLUGIN_BASE = struct
 
     let free b = Metal_api.Memory.release b.buf
 
+    (* Host pointers come from [Spoc_core.Memory.bigarray_void_ptr], not
+       [Ctypes.bigarray_start]: the latter raises Failure "Unsupported bigarray
+       kind" for Float16 (MF2), and the former is MANAGED so the bigarray stays
+       GC-rooted across the memcpy (MF3). *)
     let host_to_device ~src ~dst =
       (* Metal shared memory: just memcpy *)
-      let ba_ptr = Ctypes.(bigarray_start array1 src) in
+      let ba_ptr = Spoc_core.Memory.bigarray_void_ptr src in
       let byte_size =
         Bigarray.Array1.dim src * dst.buf.Metal_api.Memory.elem_size
       in
-      Metal_api.memcpy
-        ~dst:dst.buf.contents
-        ~src:(Ctypes.to_voidp ba_ptr)
-        ~size:byte_size
+      Metal_api.memcpy ~dst:dst.buf.contents ~src:ba_ptr ~size:byte_size ;
+      ignore (Sys.opaque_identity src)
 
     let device_to_host ~src ~dst =
       (* Metal shared memory: just memcpy *)
-      let ba_ptr = Ctypes.(bigarray_start array1 dst) in
+      let ba_ptr = Spoc_core.Memory.bigarray_void_ptr dst in
       let byte_size =
         Bigarray.Array1.dim dst * src.buf.Metal_api.Memory.elem_size
       in
-      Metal_api.memcpy
-        ~dst:(Ctypes.to_voidp ba_ptr)
-        ~src:src.buf.contents
-        ~size:byte_size
+      Metal_api.memcpy ~dst:ba_ptr ~src:src.buf.contents ~size:byte_size ;
+      ignore (Sys.opaque_identity dst)
 
     let host_ptr_to_device ~src_ptr ~byte_size ~dst =
       Metal_api.memcpy
@@ -221,8 +236,27 @@ module Metal : Framework_sig.PLUGIN_BASE = struct
        see Spoc_framework.Kernel_args. *)
     type args = arg Spoc_framework.Kernel_args.t
 
-    (* Cache: key -> compiled kernel *)
-    let cache : (string, t) Hashtbl.t = Hashtbl.create 16
+    (* Cache: key -> compiled kernel. Guarded against concurrent multi-domain
+       access by [Spoc_framework.Guarded_cache]: lookup/insert and clearing are
+       atomic critical sections, while the Metal library/pipeline compile runs
+       outside the lock. *)
+    let cache : (string, t) Spoc_framework.Guarded_cache.t =
+      Spoc_framework.Guarded_cache.create
+        ~destroy:(fun k ->
+          Metal_api.Library.release k.library ;
+          Metal_api.ComputePipeline.release k.pipeline)
+        ()
+
+    (* Per-device eviction, the model every backend cache follows (see
+       Cache_hooks.mli). Metal exposes no device-destroy entry point, so nothing
+       in this backend fires the notification today; registering anyway keeps
+       the model uniform instead of "per-device on some backends, global on
+       others". Match on the family name, never on the index alone: backend-local
+       indices collide across backends. *)
+    let () =
+      Spoc_framework.Cache_hooks.on_device_destroy (fun ~backend index ->
+          if String.equal backend "Metal" then
+            Spoc_framework.Guarded_cache.evict_device cache index)
 
     let compile device ~name ~source =
       let library = Metal_api.Library.create_from_source device source in
@@ -244,20 +278,18 @@ module Metal : Framework_sig.PLUGIN_BASE = struct
           ~source
           ()
       in
-      match Hashtbl.find_opt cache key with
-      | Some k -> k
-      | None ->
-          let k = compile device ~name ~source in
-          Hashtbl.add cache key k ;
-          k
+      (* [~device_id] is the same backend-local index the key already carries;
+         without it the entry is not grouped by device and [evict_device] can
+         never reach it. *)
+      Spoc_framework.Guarded_cache.find_or_build
+        cache
+        ~key
+        ~device_id:device.Metal_api.Device.id
+        (fun () -> compile device ~name ~source)
 
     let clear_cache () =
-      Hashtbl.iter
-        (fun _ k ->
-          Metal_api.Library.release k.library ;
-          Metal_api.ComputePipeline.release k.pipeline)
-        cache ;
-      Hashtbl.clear cache
+      Spoc_framework.Cache_hooks.around_clear (fun () ->
+          Spoc_framework.Guarded_cache.clear cache)
 
     let load_from_ptx ~name:_ ~ptx:_ =
       Metal_error.raise_error (Metal_error.feature_not_supported "PTX kernels")

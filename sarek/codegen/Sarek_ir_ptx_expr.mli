@@ -15,9 +15,10 @@ open Sarek_ir_ptx_types
 (** [emit_expr buf alloc env expr] emits PTX instructions for [expr] into [buf]
     and returns the register name holding the result.
 
-    Raises {!Ptx_codegen_error} for IR constructs not yet covered by the PTX
-    backend (variants, records, recursive device functions, etc.). Non-recursive
-    helper-function calls (EApp) are inlined at the call site. *)
+    Raises {!Sarek_ir_ptx_types.Ptx_codegen_error} for IR constructs not yet
+    covered by the PTX backend (variants, records, recursive device functions,
+    etc.). Non-recursive helper-function calls (EApp) are inlined at the call
+    site. *)
 val emit_expr : Buffer.t -> reg_alloc -> env -> expr -> string
 
 (** [emit_value buf alloc env expr] is the aggregate-aware emitter: scalar
@@ -33,8 +34,8 @@ val emit_value : Buffer.t -> reg_alloc -> env -> expr -> binding
     selp, FR-022); tuple/record/scalar scrutinees support exactly one
     destructuring arm. [emit_arm] emits one arm body (expression or statement)
     with the arm's pattern variables bound arm-scoped. Raises
-    {!Ptx_codegen_error} on a non-exhaustive variant match (no catch-all arm and
-    at least one constructor uncovered). *)
+    {!Sarek_ir_ptx_types.Ptx_codegen_error} on a non-exhaustive variant match
+    (no catch-all arm and at least one constructor uncovered). *)
 val emit_match_arms :
   Buffer.t ->
   reg_alloc ->
@@ -56,6 +57,49 @@ val emit_cast : Buffer.t -> reg_alloc -> string -> elttype -> string
 (** [emit_intrinsic buf alloc env path name args] emits the PTX sequence for the
     named Sarek intrinsic. [path] disambiguates module-qualified names ("of_int"
     resolves to f32 or f64 by its Float32/Float64 path). Raises
-    {!Ptx_codegen_error} for unknown intrinsic names. *)
+    {!Sarek_ir_ptx_types.Ptx_codegen_error} for unknown intrinsic names. *)
 val emit_intrinsic :
   Buffer.t -> reg_alloc -> env -> string list -> string -> expr list -> string
+
+(** {1 Intrinsic dispatch registry}
+
+    Each intrinsic is one entry in a per-category handler registry: the names it
+    answers to paired with the closure that lowers them. {!emit_intrinsic}
+    dispatches by looking a name up there, so {!intrinsic_registry} is what the
+    backend actually lowers; the tables below are pinned to it entry for entry
+    by a value-level test. A name absent from the registry raises
+    {!Sarek_ir_ptx_types.Ptx_codegen_error}; a name claimed by two handlers is
+    an internal error. Exposed so the ptxas sweep gate can assemble one kernel
+    per intrinsic name and so a new intrinsic is covered automatically. *)
+
+(** The per-category handler registries, in dispatch order. *)
+type intrinsic_category =
+  | Index
+  | Transcendental
+  | Float_ops
+  | Bitcast
+  | Convert
+  | Atomic
+
+(** Every intrinsic name the PTX backend lowers, with the registry that owns it,
+    in dispatch order. Derived from the handler values themselves: an entry here
+    is a handler that exists, and every handler has its entries here. The name
+    tables below are checked against it — over these values, not over source
+    text — by sarek/tests/unit/test_ptx_intrinsic_sweep.ml. *)
+val intrinsic_registry : (string * intrinsic_category) list
+
+val index_intrinsic_names : string list
+
+val transcendental_intrinsic_names : string list
+
+val float_ops_intrinsic_names : string list
+
+val bitcast_intrinsic_names : string list
+
+val convert_intrinsic_names : string list
+
+val atomic_intrinsic_names : string list
+
+(** All of the above concatenated, in dispatch order — i.e. the names of
+    {!intrinsic_registry}. *)
+val intrinsic_names : string list

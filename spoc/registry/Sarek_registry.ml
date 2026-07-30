@@ -162,14 +162,22 @@ let fun_device_code ?(module_path = []) name dev =
       let path = String.concat "." (module_path @ [name]) in
       failwith ("Unknown intrinsic function: " ^ path)
 
-(** Get device code template for a function, using a minimal device. This is for
-    V2 IR codegens that don't have SPOC device objects. *)
-let fun_device_template ?(module_path = []) name =
+(** Get the device-code template for a function on a given backend. This is for
+    V2 IR codegens that don't have SPOC device objects.
+
+    [framework] is the caller's backend tag ("CUDA", "OpenCL", "Metal", …). It
+    used to be hardcoded to "generic", which [cuda_or_opencl] resolves to the
+    CUDA branch — so every backend reaching this fallback got the CUDA spelling,
+    and an OpenCL or Metal kernel calling e.g. [Float32.abs_float] was emitted
+    as [fabsf(...)]. Neither OpenCL C nor MSL declares [fabsf]; both spell it
+    [fabs]. The stdlib already declares both spellings ([dev "fabsf" "fabs"]);
+    only this lookup was discarding the caller's framework.
+
+    [?framework] defaults to "generic" so existing non-backend callers keep the
+    previous behaviour. *)
+let fun_device_template ?(module_path = []) ?(framework = "generic") name =
   match find_fun ~module_path name with
-  | Some fi ->
-      (* Pass "generic" as the framework string: cuda_or_opencl maps
-         "generic" to the CUDA/default branch, preserving byte-identical output. *)
-      Some (fi.fi_device "generic")
+  | Some fi -> Some (fi.fi_device framework)
   | None -> None
 
 (** Find a record by short name (last component after '.'). This handles cases
@@ -225,11 +233,70 @@ let () =
  * Helper function for device-specific code
  ******************************************************************************)
 
+(** Raised when a shading-language framework asks this two-way dispatch for a
+    spelling it cannot supply. See {!cuda_or_opencl}. *)
+exception No_device_spelling of {framework : string; cuda : string}
+
 let cuda_or_opencl (framework : string) cuda_code opencl_code =
   match framework with
-  | "OpenCL" -> opencl_code
+  (* Metal joins OpenCL, not CUDA: across the whole stdlib these two branches
+     differ ONLY in the CUDA `f` suffix (sinf/fabsf/…) — the operator and cast
+     templates are byte-identical in both — and MSL, like OpenCL C, declares the
+     unsuffixed overloads and has no `fabsf`/`sinf`. This matches the spelling
+     Sarek_pure_registry already emits for Metal via its `generic_name`. *)
+  | "OpenCL" | "Metal" -> opencl_code
+  (* GLSL and WGSL get NEITHER branch. This dispatch has exactly two, and both
+     are C-family: the wildcard below sends anything unrecognised to CUDA, so a
+     shading language asking here would be handed `sinf`, `fabsf`, `powf` —
+     names no GLSL or WGSL compiler declares.
+
+     Today nothing reaches this arm: Sarek_ir_glsl and Sarek_ir_wgsl set
+     `post_hook = (fun _ _ _ _ -> false)`, so on fall-through they raise
+     `unknown_intrinsic` instead of consulting this registry. That inert
+     post_hook is the SAFE behaviour and must stay: the three C-family backends
+     wire `Dispatch.emit_registry_template` there, and doing the same for
+     GLSL/WGSL — which reads like an obvious symmetry, and which an earlier
+     backlog entry of mine explicitly recommended — would replace a loud refusal
+     with silently-invalid shader source, on all 133 stdlib intrinsics
+     registered through this helper (Float32 35, Float64 42, Gpu 21, Int32 16,
+     Int64 16, Math 3).
+
+     So this arm is a landmine guard, not a live path: it makes that mistake
+     fail immediately and by name rather than emit C into a shader. It raises
+     rather than returning a value because there is no correct value to return —
+     a spelling for these frameworks has to be REGISTERED, not derived. The
+     model to copy is Sarek_pure_registry, which dispatches on framework and
+     carries the GLSL exceptions explicitly (`glsl_override_name`: fabs→abs,
+     rsqrt→inversesqrt, atan2→atan); the un-suffixed OpenCL branch happens to be
+     right for most GLSL builtins, which is exactly why guessing here is
+     dangerous — it would be right often enough to look correct.
+
+     This is an OCaml exception rather than a located Codegen_error because this
+     module sits below codegen and must not depend on it. Reaching it is a
+     programming error in the dispatcher wiring, not a user error in a kernel. *)
+  | ("GLSL" | "WGSL") as fw ->
+      raise (No_device_spelling {framework = fw; cuda = cuda_code})
   | "CUDA" | "Native" | "Interpreter" | _ -> cuda_code
-(* Use CUDA syntax for CUDA, interpreter, and native *)
+(* Use CUDA syntax for CUDA, interpreter, and native. The wildcard also covers
+   the "generic" default of [fun_device_template] and is deliberately NOT a
+   refusal: "generic" is a live value with C-family semantics. Only the two
+   shading languages above are refused, because only they are MEASURED to be
+   mis-served by both branches. *)
+
+let () =
+  Printexc.register_printer (function
+    | No_device_spelling {framework; cuda} ->
+        Some
+          (Printf.sprintf
+             "Sarek_registry.cuda_or_opencl: no %s spelling for an intrinsic \
+              registered with only CUDA/OpenCL templates (CUDA form: %S). This \
+              two-way dispatch cannot serve a shading language — register a %s \
+              template instead of routing %s through the FFI registry."
+             framework
+             cuda
+             framework
+             framework)
+    | _ -> None)
 
 (* Note: All intrinsics (Float32, Float64, Int32, Int64, GPU) are defined in
    Sarek_stdlib modules and auto-register via %sarek_intrinsic when that

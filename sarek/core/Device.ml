@@ -40,7 +40,8 @@ let resolve_framework fw_name =
 (** Initialize all available backends and enumerate devices *)
 let init
     ?(frameworks =
-      ["CUDA"; "OpenCL"; "Vulkan"; "Metal"; "Native"; "Interpreter"]) () =
+      ["CUDA"; "HIP"; "OpenCL"; "Vulkan"; "Metal"; "Native"; "Interpreter"]) ()
+    =
   if !initialized then !devices
   else begin
     let all_devices = ref [] in
@@ -128,7 +129,10 @@ let by_framework framework =
 (** Filter devices by capability *)
 let with_fp64 () =
   all () |> Array.to_list
-  |> List.filter (fun d -> d.capabilities.supports_fp64)
+  |> List.filter (fun d ->
+      List.mem
+        Sarek_ir_analysis.Float64
+        d.capabilities.Framework_sig.device_features)
   |> Array.of_list
 
 (** CUDA backends register as "CUDA/PTX" and "CUDA/C"; match the family name or
@@ -144,8 +148,26 @@ let best () =
       let opencl = by_framework "OpenCL" in
       if Array.length opencl > 0 then Some opencl.(0) else first ()
 
-(** Reset initialization state (for testing) *)
+(** Reset initialization state (for testing).
+
+    Retires the global id space, so every cache keyed on it must be dropped in
+    the same breath. [init] restarts [global_id] at 0 over whichever frameworks
+    it is handed, so the same id routinely denotes a DIFFERENT physical device
+    after a reset: with [~frameworks:["OpenCL"]] then
+    [~frameworks:["Native"; "OpenCL"]], the single Native device shifts OpenCL
+    down one and id 1 moves from the second OpenCL device to the first. A
+    surviving entry keyed on id 1 is then served to the wrong device, silently —
+    a compiled kernel carries no device check — which is exactly the aliasing
+    class this cache was keyed by device to prevent.
+
+    Only [Sarek.Runtime]'s outer memo is affected: it keys on the global
+    [Device.t.id], while every per-backend cache keys on its own backend-local
+    device index, which a reset does not perturb. So the notification here is
+    enough, and it releases nothing — the listeners drop memoization only (see
+    {!Spoc_framework.Cache_hooks}), so unlike [Kernel.clear_cache] this cannot
+    invalidate a handle a caller still holds. *)
 let reset () =
+  Spoc_framework.Cache_hooks.notify_clear_all () ;
   devices := [||] ;
   initialized := false
 
@@ -178,11 +200,22 @@ let is_native d = d.framework = "Native"
 let is_cpu d = d.capabilities.is_cpu || is_native d
 
 let is_gpu d =
-  (is_cuda d || is_opencl d || d.framework = "Vulkan") && not (is_cpu d)
+  (is_cuda d || is_opencl d || d.framework = "Vulkan" || d.framework = "HIP")
+  && not (is_cpu d)
 
 (** {2 Capability Queries} *)
 
-let allows_fp64 d = d.capabilities.supports_fp64
+(* Derived from [device_features] rather than stored beside it, so the list
+   stays the single source of truth (#142). The predecessor of this accessor
+   read a [supports_fp64] bool that had no int64 counterpart, which is how an
+   int64 kernel reached a device that had never enabled shaderInt64. *)
+let provides d f = List.mem f d.capabilities.Framework_sig.device_features
+
+let allows_fp64 d = provides d Sarek_ir_analysis.Float64
+
+let allows_int64 d = provides d Sarek_ir_analysis.Int64
+
+let allows_fp16 d = provides d Sarek_ir_analysis.Float16
 
 let supports_atomics d = d.capabilities.supports_atomics
 

@@ -225,7 +225,12 @@ end = struct
         total_global_mem = total_mem;
         compute_capability = (0, 0);
         (* Native has no compute capability *)
-        supports_fp64 = true;
+        (* Host execution: OCaml floats are binary64 and Int64.t is native. *)
+        device_features = [Sarek_ir_analysis.Float64; Sarek_ir_analysis.Int64];
+        (* backlog-62: no cooperative-matrix probe on this backend. [None] is
+           "not probed", which Sarek_coopmat.verdict maps to Unknown and therefore
+           refuses; an empty list would be a positive claim nobody measured. *)
+        coopmat = None;
         supports_atomics = true;
         warp_size = 1;
         max_registers_per_block = 0;
@@ -281,6 +286,13 @@ end = struct
       let arr = Bigarray.Array1.create kind Bigarray.c_layout size in
       (* Pattern match on kind to determine element_kind - each branch has matching types *)
       match kind with
+      | Bigarray.Float16 ->
+          {
+            storage = Bigarray_storage arr;
+            kind = Scalar_kind Spoc_core.Vector_types.Float16;
+            size;
+            device;
+          }
       | Bigarray.Float32 ->
           {
             storage = Bigarray_storage arr;
@@ -351,6 +363,10 @@ end = struct
               Native_error.(
                 raise_error (feature_not_supported "custom type set accessor")));
           name = "custom";
+          (* Placeholder descriptor: [alloc_custom] is given only [elem_size],
+             no element type, and its accessors raise. There is no field list
+             to state. *)
+          ir_fields = None;
         }
       in
       {
@@ -369,6 +385,14 @@ end = struct
      fun device ba kind ->
       let size = Bigarray.Array1.dim ba in
       match kind with
+      | Bigarray.Float16 ->
+          Some
+            {
+              storage = Bigarray_storage ba;
+              kind = Scalar_kind Spoc_core.Vector_types.Float16;
+              size;
+              device;
+            }
       | Bigarray.Float32 ->
           Some
             {
@@ -468,7 +492,7 @@ end = struct
             dst_char_ptr +@ i <-@ !@(src_char_ptr +@ i)
           done
       | Bigarray_storage dst_arr ->
-          let dst_ptr = bigarray_start array1 dst_arr |> to_voidp in
+          let dst_ptr = Spoc_core.Memory.bigarray_void_ptr dst_arr in
           let dst_char_ptr = from_voidp char dst_ptr in
           let src_char_ptr = from_voidp char src_ptr in
           for i = 0 to byte_size - 1 do
@@ -488,7 +512,7 @@ end = struct
             dst_char_ptr +@ i <-@ !@(src_char_ptr +@ i)
           done
       | Bigarray_storage src_arr ->
-          let src_ptr = bigarray_start array1 src_arr |> to_voidp in
+          let src_ptr = Spoc_core.Memory.bigarray_void_ptr src_arr in
           let src_char_ptr = from_voidp char src_ptr in
           let dst_char_ptr = from_voidp char dst_ptr in
           for i = 0 to byte_size - 1 do
@@ -521,8 +545,7 @@ end = struct
       match buf.storage with
       | Bigarray_storage arr ->
           (* Bigarray storage - get pointer from bigarray *)
-          let ptr = Ctypes.bigarray_start Ctypes.array1 arr in
-          Ctypes.to_voidp ptr |> Ctypes.raw_address_of_ptr
+          Ctypes.raw_address_of_ptr (Spoc_core.Memory.bigarray_void_ptr arr)
       | Ctypes_storage ptr ->
           (* Ctypes storage - data is already a pointer *)
           Ctypes.raw_address_of_ptr ptr
@@ -572,9 +595,14 @@ end = struct
 
     let set_arg_buffer : type a. args -> int -> a Memory.buffer -> unit =
      fun args idx buf ->
+      (* Float16 is admitted here because [Memory.alloc] /
+         [alloc_zero_copy] admit it: a kind that can be allocated but not
+         bound is an API inconsistency, and the omission was silent rather
+         than diagnosed. *)
       (match (buf.Memory.kind, buf.Memory.storage) with
       | Memory.Scalar_kind Spoc_core.Vector_types.Int32, Bigarray_storage _
       | Memory.Scalar_kind Spoc_core.Vector_types.Int64, Bigarray_storage _
+      | Memory.Scalar_kind Spoc_core.Vector_types.Float16, Bigarray_storage _
       | Memory.Scalar_kind Spoc_core.Vector_types.Float32, Bigarray_storage _
       | Memory.Scalar_kind Spoc_core.Vector_types.Float64, Bigarray_storage _
       | Memory.Custom_kind _, Ctypes_storage _ ->
@@ -622,6 +650,18 @@ end = struct
               Typed_value.TV_Scalar
                 (Typed_value.SV
                    ((module Typed_value.Int64_type), Bigarray.Array1.get ba i))
+          | ( Memory.Scalar_kind Spoc_core.Vector_types.Float16,
+              Bigarray_storage ba ) ->
+              (* f16 is a STORAGE type: there is deliberately no Float16
+                 scalar in Typed_value. The Bigarray.Float16 cell rounds to
+                 binary16 on store and hands the rounded value back on load,
+                 so the element enters as an f32 scalar. Same "reuse the f32
+                 accessor, let the storage kind do the rounding" decision
+                 that Sarek_ir_interp.vector_to_array already makes for f16
+                 VECTORS -- keeping the two paths on one rule, not two. *)
+              Typed_value.TV_Scalar
+                (Typed_value.SV
+                   ((module Typed_value.Float32_type), Bigarray.Array1.get ba i))
           | ( Memory.Scalar_kind Spoc_core.Vector_types.Float32,
               Bigarray_storage ba ) ->
               Typed_value.TV_Scalar
@@ -657,6 +697,17 @@ end = struct
                   Native_error.(
                     raise_error
                       (feature_not_supported "int64 buffer set conversion")))
+          | ( Typed_value.TV_Scalar (Typed_value.SV ((module S), x)),
+              Memory.Scalar_kind Spoc_core.Vector_types.Float16,
+              Bigarray_storage ba ) -> (
+              (* The narrowing to binary16 happens in the Bigarray cell, not
+                 here -- see the matching note on [get]. *)
+              match S.to_primitive x with
+              | Typed_value.PFloat f -> Bigarray.Array1.set ba i f
+              | _ ->
+                  Native_error.(
+                    raise_error
+                      (feature_not_supported "float16 buffer set conversion")))
           | ( Typed_value.TV_Scalar (Typed_value.SV ((module S), x)),
               Memory.Scalar_kind Spoc_core.Vector_types.Float32,
               Bigarray_storage ba ) -> (
@@ -768,7 +819,15 @@ end = struct
                  kernel.name
                  (Printf.sprintf "kernel '%s' not registered" kernel.name)))
 
-    let clear_cache () = Hashtbl.clear native_kernels
+    (* Wrapped like every other backend's clear (see Cache_hooks.mli). This
+       table holds no releasable driver handle, so nothing here can dangle —
+       but the outer memos above it close over these closures and must be
+       dropped with them, and a caller that reaches this through
+       [Framework_registry] gets the same guarantee as one going through
+       [Sarek.Kernel.clear_cache]. *)
+    let clear_cache () =
+      Spoc_framework.Cache_hooks.around_clear (fun () ->
+          Hashtbl.clear native_kernels)
 
     let load_from_ptx ~name:_ ~ptx:_ =
       failwith "PTX kernels not supported by Native backend"

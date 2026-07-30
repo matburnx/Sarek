@@ -108,8 +108,14 @@ let map_stdlib_path = function
   | ["Float32"] | ["Sarek_stdlib"; "Float32"] ->
       ["Sarek"; "Sarek_cpu_runtime"; "Float32"]
   | ["Float64"] | ["Sarek_stdlib"; "Float64"] ->
-      (* Float64 is just OCaml float, use stdlib *)
-      ["Float"]
+      (* NOT OCaml's [Stdlib.Float]: that module shares most of the Float64
+         stdlib's names but not all of them, and the mapping below copies the
+         intrinsic name verbatim. [abs_float], [rsqrt], [fmod], [copysign],
+         [of_int32]/[to_int32], [of_float32]/[to_float32], the four [*_float64]
+         arithmetic names and the eight operator forms have no [Float.<name>],
+         so those kernels failed to compile. Sarek_float64_native mirrors the
+         declared surface exactly; see sarek/tests/unit/test_intrinsic_surface.ml. *)
+      ["Sarek"; "Sarek_cpu_runtime"; "Float64"]
   | ["Int32"] | ["Sarek_stdlib"; "Int32"] -> ["Int32"]
   | ["Int64"] | ["Sarek_stdlib"; "Int64"] -> ["Int64"]
   (* Note: Gpu module functions stay as Gpu.* - only specific functions like
@@ -247,6 +253,40 @@ let gen_intrinsic_fun ~loc ~gen_mode (ref : intrinsic_ref) args =
               [%expr Sarek.Sarek_cpu_runtime.global_idx_x [%e state]]
           | "global_size" ->
               [%expr Sarek.Sarek_cpu_runtime.global_size_x [%e state]]
+          (* f16 width conversions on the NATIVE path (#57 slice 1). Without
+             these two arms the catch-all below emits `Gpu.float16_of_float32`,
+             which does not exist -- a native f16 kernel fails to compile with
+             "Unbound module Gpu".
+
+             Narrowing MUST round: it shares Sarek_float16.to_float16 with the
+             interpreter and with the Bigarray.Float16 store. That is what makes
+             native, interpreter and GPU agree bit-for-bit ON THE VALUES A KERNEL
+             CAN PRODUCE — i.e. f32 values, which is all f16 arithmetic ever sees
+             (f16 is a storage type; every operand is widened to f32 first). The
+             claim is scoped to that: to_float16 is an f32 -> binary16 narrowing
+             and double-rounds an f64 argument (f64 -> f32 -> binary16), so a
+             HOST caller passing an f64 that is not exactly an f32 value can see
+             a result differing from a single correctly-rounded f64 -> binary16
+             step. See Sarek_float16.to_float16's docstring: the double rounding
+             is shared with Bigarray.Float16's own set, so it preserves rather
+             than breaks the cross-backend equivalence.
+
+             Widening is the identity because an f16 value is already carried as
+             an OCaml float. *)
+          | "float16_of_float32" -> (
+              match args with
+              | [x] -> [%expr Sarek.Sarek_float16.to_float16 [%e x]]
+              | _ ->
+                  Location.raise_errorf
+                    ~loc
+                    "float16_of_float32 expects exactly one argument")
+          | "float32_of_float16" -> (
+              match args with
+              | [x] -> x
+              | _ ->
+                  Location.raise_errorf
+                    ~loc
+                    "float32_of_float16 expects exactly one argument")
           | _ ->
               (* Try Gpu module *)
               let fn = evar_qualified ~loc ["Gpu"] name in

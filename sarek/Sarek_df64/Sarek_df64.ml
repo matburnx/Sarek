@@ -25,25 +25,240 @@
  *   Sarek_df64.Host to fill/read them.
  *
  * PRECISION CONTRACT
- *   - Relative error of add/sub/mul/div/sqrt: ~2^-48 .. 2^-47 (48-49
- *     significant bits), i.e. roughly double the 24-bit float32 precision.
- *   - Exponent range is that of float32 (~1e-38 .. ~3e38 normalised);
- *     overflow/underflow follow float32, NOT IEEE-754 binary64.
+ *   - Worst-case relative error, per operation, as MEASURED by test_df64.ml
+ *     over ITS OWN input set, on the specific devices and toolchains listed in
+ *     PER-BACKEND STATUS: add 5.3e-15, sub 6.5e-15 (~2^-47); mul 9.1e-15,
+ *     div 5.1e-15 (~2^-46.6 .. 2^-47.8); sqrt 8.5e-15 on the devices where it
+ *     was measured after the correctly-rounded lowering, but see KNOWN
+ *     RESIDUAL - it still reaches 1.8e-14 on the NVIDIA OpenCL and Vulkan
+ *     paths. Roughly double the 24-bit float32 precision.
+ *
+ *     These are SAMPLED MAXIMA, not bounds and not guarantees. They say what
+ *     the worst input in one test happened to produce on one device under one
+ *     toolchain; a different input set, device or compiler may be worse. Do
+ *     not quote a single "2^-47" figure for the whole op set, and do not
+ *     restate any figure here for a device it was not measured on - that
+ *     generalisation is the exact mistake described under PER-BACKEND STATUS.
+ *   - Exponent range is that of float32 (~1e-38 .. ~3e38 normalised).
+ *     Underflow follows float32. OVERFLOW DOES NOT: once a leading product
+ *     or sum reaches an infinity, the error term becomes an infinity of the
+ *     opposite sign and the closing quick_two_sum yields NaN, where plain
+ *     float32 would have given a signed infinity. Keep operands well inside
+ *     the float32 range. (Pre-existing, and unchanged by the contraction
+ *     barrier - verified bit-identical before and after it.)
  *   - Requires IEEE-exact float32 ops and a correctly rounded float32 fma
  *     (used for exact TwoProd error extraction). The interpreter emulates
  *     float32 rounding (incl. Float.fma-based fma) and meets the contract.
+ *   - Also requires that the backend compiler NOT contract a multiply into a
+ *     neighbouring add or subtract. Every backend here contracts BY DEFAULT,
+ *     so the transformations below are written to make contraction
+ *     impossible rather than to ask the compiler to refrain; see
+ *     "Contraction barrier". That barrier covers df64's own bodies only -
+ *     read "CALLER-SIDE HAZARD" there for what it does not cover.
  *   - Results are NOT bit-exact with IEEE-754 binary64 arithmetic.
  *
- * Per-backend status (measured by sarek/tests/e2e/test_df64.ml):
- *   - OpenCL, CUDA/PTX, Interpreter: full contract (~2^-47).
- *   - Native: evaluates float32 at OCaml binary64 precision, so the
- *     error-free transformations cancel and results degrade to plain f32
- *     storage precision (~2^-24). Harmless in practice - Native has real
- *     float64 - but do not use df64 for extra precision there.
- *   - Vulkan: add/sub/sqrt meet the contract (float locals are emitted
- *     with the GLSL [precise] qualifier); mul/div currently degrade to
- *     ~2^-24 on RADV (fma error-term loss in composed helpers, under
- *     investigation).
+ * PER-BACKEND STATUS
+ *
+ * Precision is a property of the backend COMPILER AND THE DEVICE, not of this
+ * source. Every line below names the hardware and toolchain it was measured
+ * on; a backend measured on one vendor says nothing about the same backend on
+ * another. An earlier version of this header claimed "OpenCL, CUDA/PTX,
+ * Interpreter: full contract" without naming hardware - that had only ever
+ * been run on an AMD box (CUDA/PTX through ZLUDA, AMD OpenCL), and it is why
+ * a real-NVIDIA collapse to ~2^-24 went unnoticed. Do not restate a result
+ * more broadly than it was measured.
+ *
+ * Measured by sarek/tests/e2e/test_df64.ml. "mul/div/sqrt" below are that
+ * test's max relative errors; its tolerance is 7.11e-15 (2^-47) for add/sub
+ * and 1.42e-14 (2^-46) for mul/div/sqrt.
+ *
+ * Those tolerances now apply to EVERY device (task #118). The deviating
+ * entries below are not given a wider ceiling: they are an allowlist of STRICT
+ * expected failures in Test_helpers.df64_known_deviation, checked against a
+ * two-sided band whose upper end is 2^-23 (twice the float32 unit roundoff)
+ * and reported as KNOWN-DEVIATION, never as PASS. Consequences:
+ *   - degrading further than plain float32 FAILs even on an allowlisted device;
+ *   - a device NOT on the allowlist - NVIDIA Vulkan included - is held to the
+ *     full contract;
+ *   - an allowlisted device that starts MEETING the contract also fails the
+ *     run (strict XPASS), naming the match arm to delete. So if a Mesa release
+ *     fixes RADV's fma, the tests go red until the entry below is pruned -
+ *     deliberately, so the allowlist cannot rot while the suite stays green.
+ * Before that change the deviating backends were checked against
+ * 2^-22 = 2.38e-07, which a fully collapsed df64 (~5.8e-08) also satisfied:
+ * the gate could not tell the bug from the fix.
+ *
+ *   Interpreter, sequential and parallel (any host)
+ *       full contract. mul 9.07e-15, div 5.08e-15, sqrt 8.53e-15.
+ *
+ *   CUDA/PTX on NVIDIA Pascal
+ *   (GTX 1070 Max-Q, sm_61, CUDA 12.9, driver 580.119.02)
+ *       Measured worst-case relative error over test_df64's input set:
+ *       mul 9.07e-15, div 5.08e-15, sqrt 8.53e-15 - contract met on this
+ *       device and toolchain.
+ *       The sqrt figure is post-[sqrt.rn.f32] and EXECUTED on that device
+ *       (2026-07-26). With the older [sqrt.approx.f32] lowering, measured on
+ *       the same box in the same session, it was 1.42e-14 and test_df64
+ *       recorded it as failing.
+ *       That 8.53e-15 equals the figure the interpreter reports for the same
+ *       input set. Read that precisely: it is agreement between two SUMMARY
+ *       STATISTICS - the max over the inputs - not a demonstration that the
+ *       device and the interpreter produce identical results element by
+ *       element. No per-element device-vs-interpreter comparison was run for
+ *       df64 (unlike the f16 sweep, which did compare bit patterns). What it
+ *       licenses is: the seed was large enough to account for the whole
+ *       pre-fix gap, and nothing detectable BY THIS TEST remains. It does not
+ *       license "the device matches the software reference".
+ *       Before the contraction barrier: mul 5.92e-08, div 5.64e-08,
+ *       sqrt 2.88e-08, i.e. plain float32.
+ *
+ *   OpenCL on NVIDIA Pascal (same GPU and driver)
+ *       mul 9.07e-15, div 5.08e-15, sqrt 9.80e-15 - contract met in
+ *       test_df64. Before the barrier it showed the same collapse as CUDA/PTX
+ *       (mul 5.92e-08, div 5.85e-08, sqrt 2.88e-08). No OpenCL-specific
+ *       change was needed: FP_CONTRACT is defeated by the same barrier.
+ *       test_real64's df64 fallback still fails here at sqrt 1.81e-14; that
+ *       is the SAME bug class as the PTX one, in a different backend, and it
+ *       is not fixed - see KNOWN RESIDUAL.
+ *
+ *   Vulkan on NVIDIA Pascal (same GPU and driver)
+ *       mul 9.07e-15, div 5.08e-15, sqrt 1.24e-14 - contract met, and met
+ *       before the barrier too. NVIDIA's GLSL [fma] is exact and the
+ *       [precise] qualifier on float locals already blocked contraction.
+ *
+ *   OpenCL on AMD (RX 7900 XTX and Raphael iGPU, Mesa rusticl/radeonsi)
+ *       full contract. mul 9.07e-15, div 5.08e-15, sqrt 1.08e-14.
+ *
+ *   CUDA/PTX on AMD through ZLUDA (RX 7900 XTX)
+ *       full contract. NOT evidence for real NVIDIA hardware - this is the
+ *       configuration whose result was previously generalised to "CUDA/PTX".
+ *
+ *   Vulkan on AMD (RX 7900 XTX and Raphael iGPU, Mesa RADV)
+ *       add/sub/sqrt meet the contract, mul/div degrade to ~5.8e-08. RADV's
+ *       GLSL [fma] is not correctly rounded, so TwoProd's error term is lost.
+ *       UNFIXED, and unrelated to the contraction bug - the barrier below
+ *       does not help, and extending it to two_sum/quick_two_sum makes RADV
+ *       strictly worse (see "Contraction barrier").
+ *
+ *   Vulkan on Intel (Mesa ANV)
+ *       add/sub/sqrt meet the contract, mul/div degrade to ~5.8e-08, same
+ *       shape as RADV. UNFIXED.
+ *
+ *       Two devices, two generations, and they agree - but the second does
+ *       NOT confirm the first, it stands beside it:
+ *         - UHD Graphics 630 (CFL GT2, Gen9.5): mul/div ~5.8e-08. QUOTED.
+ *         - Arc Graphics (Meteor Lake-P, Xe-LPG), Mesa 26.1.2-arch3.1,
+ *           Vulkan 1.4.348: MEASURED 2026-07-27, test_df64 mul 5.84e-08 /
+ *           div 5.86e-08 against add 5.33e-15, sub 6.51e-15, sqrt 9.57e-15;
+ *           test_real64 mul 5.93e-08 / div 5.83e-08.
+ *       Different architecture, different generation, a decade of driver work
+ *       apart. Had they disagreed, that would have been a finding about
+ *       generation-dependence, not a correction of either.
+ *
+ *       Cause: same as RADV - a GLSL [fma] that is not correctly rounded.
+ *       Contraction is RULED OUT rather than assumed: on the Arc device
+ *       test_vulkan_no_contraction reports 0 of 7 contraction shapes
+ *       contracted with AND without [precise]. That is an inference from
+ *       elimination plus an identical error signature, not a direct sweep of
+ *       [fma] correct-rounding. See docs/fp-contraction-policy.md 11.1.
+ *
+ *   Native (OCaml host code)
+ *       evaluates float32 at OCaml binary64 precision, so the error-free
+ *       transformations cancel and results degrade to plain f32 storage
+ *       precision (~2^-24). Harmless in practice - Native has real float64 -
+ *       but do not use df64 for extra precision there.
+ *
+ *   Metal, WGSL: UNTESTED.
+ *
+ * KNOWN RESIDUAL: df64_sqrt on NVIDIA
+ *   (CUDA/PTX: cause found, fixed, REMEASURED and closed 2026-07-26.
+ *    OpenCL and Vulkan: same bug class, still open.)
+ *
+ *   After the contraction barrier, sqrt still landed at or just above the
+ *   2^-46 tolerance on several NVIDIA paths: 1.42e-14 (CUDA/PTX, test_df64),
+ *   1.68e-14 (CUDA/PTX, test_real64's df64 fallback), 1.81e-14 (OpenCL, same
+ *   test) and 1.68e-14 (Vulkan, same test). All four reproduced on a GTX 1070
+ *   Max-Q (sm_61, CUDA 12.9, driver 580.119.02) before any change.
+ *
+ *   It is NOT the contraction bug - that cost sqrt 2.88e-08, and the barrier
+ *   removed it - and it pre-dates the barrier: Vulkan on the same GPU, never
+ *   affected by contraction, already failed test_real64's sqrt at 1.68e-14
+ *   beforehand. Across the devices measured here sqrt spans 8.5e-15
+ *   (interpreter) to 1.81e-14, with NVIDIA OpenCL at 9.80e-15 and AMD OpenCL
+ *   at 1.08e-14 - it is NOT uniformly poor, and that spread is itself part of
+ *   the evidence below.
+ *
+ *   STATUS: mechanism established, lowering changed, and the resulting
+ *   precision EXECUTED on NVIDIA hardware on 2026-07-26 (GTX 1070 Max-Q,
+ *   sm_61, CUDA 12.9, driver 580.119.02). Both CUDA/PTX rows are closed. The
+ *   OpenCL and Vulkan rows are NOT - they are the same bug class in backends
+ *   this change does not touch, and they are still failing.
+ *
+ *   ESTABLISHED (by dumping the generated PTX for a df64_sqrt kernel, offline,
+ *   no device needed - see sarek/tests/e2e/test_df64_no_contraction.ml):
+ *   the PTX backend lowered the float32 [sqrt] intrinsic to [sqrt.approx.f32]
+ *   (~1 ulp, not correctly rounded), df64_sqrt used that as its Newton seed
+ *   [y], and [sqrt.approx.f32] was the ONLY non-correctly-rounded instruction
+ *   in the whole emitted df64_sqrt body - every other operation is
+ *   [fma.rn.f32] (the contraction barrier), [div.rn.f32] (audit finding M2),
+ *   or an exact add/sub. A Karp correction step cannot recover an error that
+ *   is already in its own seed.
+ *
+ *   Three observations fit that mechanism:
+ *     - the interpreter runs the identical algorithm with a correctly
+ *       rounded sqrt and reaches 8.53e-15;
+ *     - on the SAME GPU, OpenCL reaches 9.80e-15 while CUDA/PTX sits at
+ *       1.42e-14, a backend split that an algorithmic margin problem in the
+ *       Karp/Newton step could not produce;
+ *     - the identical bug class was already found and fixed one operator
+ *       over: [div.approx.f32] was replaced by [div.rn.f32] in the same
+ *       emitter precisely because it "eroded Sarek_df64's error budget"
+ *       (audit finding M2). [sqrt.rn.f32] exists and was already emitted
+ *       elsewhere in that file (hypot).
+ *
+ *   DONE: the emitter now issues [sqrt.rn.f32] for the f32 [sqrt] intrinsic,
+ *   which also brings the "IEEE-exact float32 ops" requirement above back
+ *   into force for [sqrt] on PTX. This is a GLOBAL change - it affects every
+ *   f32 sqrt in every PTX kernel, not only df64.
+ *
+ *   MEASURED worst-case relative error on a GTX 1070 Max-Q (sm_61, CUDA 12.9,
+ *   driver 580.119.02), one line changed and everything else equal, both
+ *   directions built and executed in the same session. Each figure is the max
+ *   over that test's own input set, on that one device and toolchain:
+ *     - test_df64 CUDA/PTX sqrt:          1.42e-14 FAIL -> 8.53e-15 PASS
+ *       (test_df64 goes from FAILED(1) to PASSED as a whole)
+ *     - test_real64 CUDA/PTX fallback:    1.68e-14 FAIL -> 8.87e-15 PASS
+ *   Both post-fix figures coincide with what the interpreter reports for the
+ *   same input sets. That is agreement between two summary statistics, not
+ *   evidence of element-wise identity - no per-element comparison was run.
+ *   The honest reading: the seed accounted for the whole gap this test can
+ *   see, and no FURTHER contributor is detectable by it. A different input
+ *   set could still expose one.
+ *
+ *   COST, measured (bench_nbody n=4096, sqrt-dominated inner loop, sm_61):
+ *   1.535 ms / 10.93 GFLOP/s with [sqrt.approx.f32] against 1.722 ms /
+ *   9.75 GFLOP/s with [sqrt.rn.f32] - about 12% more kernel time, stable to
+ *   ~0.2% across repeats. At sm_61 SASS the hot path goes from 1 MUFU.SQRT +
+ *   2 FMUL (18 instructions) to 1 MUFU.RSQ + 4 FMUL/FFMA and a not-taken
+ *   branch into a cold denormal/inf/nan slowpath (48 instructions). Both
+ *   issue exactly one MUFU on the hot path, which is why the cost is ~12%
+ *   and not ~2.7x. Correctness is the right trade here; code that wants the
+ *   fast form still has [rsqrt], which is unchanged.
+ *
+ *   STILL OPEN - the same bug class in two other backends, both measured
+ *   failing on the same GPU by test_real64's df64 fallback:
+ *     - OpenCL, sqrt 1.81e-14. CAUSE IDENTIFIED AND CONFIRMED BY EXPERIMENT:
+ *       the OpenCL backend calls clBuildProgram with NO build options
+ *       (Opencl_plugin_base.ml), and OpenCL's default permits a sqrt of up to
+ *       3 ulp. Building with [-cl-fp32-correctly-rounded-divide-sqrt] moves
+ *       it to 8.87e-15 PASS - executed on sm_61 on 2026-07-26. That one-line
+ *       change is deliberately NOT part of this fix; it is a different
+ *       backend and belongs in its own change.
+ *     - Vulkan, sqrt 1.68e-14. Same shape, cause not yet established. Note
+ *       Intel UHD 630 Vulkan passes at 1.17e-14 on the same test, so this is
+ *       NVIDIA-glslang-specific, not a Vulkan-wide property.
+ *
+ *   Do not paper over either by widening the tolerance.
  *
  * References:
  *   - T.J. Dekker, "A floating-point technique for extending the available
@@ -71,6 +286,107 @@ let fma = Float.fma
 let float x = float_of_int (Int32.to_int x)
 
 (******************************************************************************
+ * Contraction barrier
+ *
+ * Cross-backend policy this implements, including what each OTHER backend does
+ * about contraction and which of those claims are measured rather than
+ * believed: docs/fp-contraction-policy.md.
+ *
+ * An error-free transformation is only error-free if the backend compiler
+ * evaluates it as written. Floating-point CONTRACTION - fusing a multiply into
+ * a neighbouring add or subtract - is enabled by default in PTX, CUDA C and
+ * OpenCL C, and it silently destroys these transformations.
+ *
+ * WHAT WAS MEASURED (sm_61 / GTX 1070, ptxas 12.9 -arch=sm_61 -O3, offline).
+ * The [quick_two_sum p.hi err] that closes [df64_mul] compiled to
+ *
+ *     FFMA R11, a_hi,  b_hi, err    ; "s"       = fl(a_hi*b_hi + err)
+ *     FFMA R0,  a_hi, -b_hi, R11    ; "s - p_hi"
+ *
+ * Both operands were rebuilt from the EXACT product a_hi*b_hi instead of the
+ * rounded [p.hi] that [two_prod] had just separated from its error term. Since
+ * [err] already carries that rounding error, adding it back doubles it: the
+ * result is (true product + p.lo), and the relative error jumps from ~2^-47 to
+ * ~2^-24 - plain float32. Simulating that instruction sequence in float32
+ * reproduces the hardware failure exactly: 5.92e-08 measured, 5.92e-08
+ * simulated. The same simulation run uncontracted gives 7.28e-15. NOTE that
+ * figure is from the simulation harness, not from test_df64, and it does not
+ * match the 9.07e-15 this header quotes for measured mul; the two were never
+ * reconciled to a common input set. Use it as evidence that contraction is
+ * the mechanism, not as a precision figure.
+ *
+ * The [fma] inside [two_prod] is NOT the casualty - ptxas keeps it and the
+ * error term is correct. It is the surrounding add/sub that get fused. This is
+ * also why add/sub survived while mul/div/sqrt collapsed: contraction needs a
+ * multiply to fuse, and in the failing kernels [df64_add]'s inputs were loads,
+ * not products.
+ *
+ * CALLER-SIDE HAZARD - what this barrier does NOT cover. [@sarek.module]
+ * bodies are inlined into the calling kernel, so the barrier only guarantees
+ * that df64's OWN code hands the compiler no fusable multiply. A caller can
+ * still reintroduce the exact pattern by passing a live float32 product into
+ * an add-based entry point:
+ *
+ *     df64_add_f32 acc (x *. y)     (* [two_sum acc.hi b] with b a mul.f32 *)
+ *
+ * Here ptxas may fuse the caller's multiply into [two_sum]'s leading add, and
+ * the error-free transformation breaks the same way. A [let] binding does NOT
+ * help - contraction happens well below the source level. The fix is to deny
+ * the multiply in the caller too: write [mul_rn x y] (or [two_prod x y] if the
+ * error term is wanted) instead of [x *. y] on any product that flows into a
+ * df64 entry point. The regression guard cannot see this case: its kernels
+ * contain no caller-level float multiply.
+ *
+ * THE FIX. Deny the compiler the multiply. [mul_rn] computes the same product
+ * through [fma], which is already fused and therefore cannot be fused again,
+ * so every add and subtract downstream of a [two_prod] has nothing to contract
+ * with. One instruction changes (FMUL -> FFMA, same rate on NVIDIA); the SASS
+ * instruction count for df64_mul and df64_sqrt is unchanged at sm_61.
+ *
+ * CONFIRMED ON HARDWARE (GTX 1070 Max-Q, sm_61, CUDA 12.9, driver
+ * 580.119.02), not only in SASS: CUDA/PTX mul 5.92e-08 -> 9.07e-15 and
+ * div 5.64e-08 -> 5.08e-15; NVIDIA OpenCL mul 5.92e-08 -> 9.07e-15,
+ * div 5.85e-08 -> 5.08e-15, sqrt 2.88e-08 -> 9.80e-15. The same barrier
+ * fixes OpenCL with no OpenCL-specific change. Throughput on that GPU is
+ * unchanged: the df64 poly benchmark runs 6.04 ms before and 6.03 ms after
+ * (CUDA/PTX, 2^20 x 512 iters, steady state of 3 runs).
+ *
+ * WHY IT IS NOT APPLIED MORE WIDELY. Rewriting [two_sum] and [quick_two_sum]
+ * in terms of [fma] as well was tried and MEASURED TO REGRESS RADV/Vulkan
+ * (add 5.33e-15 -> 1.15e-07, sub 6.51e-15 -> 1.06e-07, sqrt 1.08e-14 ->
+ * 8.17e-08 on RX 7900 XTX, Mesa RADV): RADV's GLSL [fma] is not correctly
+ * rounded, which is exactly the pre-existing Vulkan mul/div deviation recorded
+ * in the header. Confining the barrier to [two_prod] keeps the new dependency
+ * inside the one transformation that already required a correct [fma].
+ *
+ * That is not quite "no backend is newly exposed", and the difference is worth
+ * stating precisely: before, [two_prod]'s HIGH limb was [fl(a*b)] on every
+ * backend regardless of fma quality, and only the low limb depended on the
+ * fma. Now the high limb is [fma a b 0.0] too, so on a backend whose [fma] is
+ * not correctly rounded (RADV, and ANV by the same elimination argument) the
+ * high limb can in
+ * principle differ from [fl(a*b)]. No measurable impact: those backends were
+ * already at ~5.8e-08 for mul/div before this change and are byte-identical
+ * after it. The exposure is newly present but not newly observable.
+ ******************************************************************************)
+
+(** [a * b], correctly rounded, and - unlike [a *. b] - not a multiply the
+    backend can fuse into a later add or subtract.
+
+    Value-identical to [a *. b] on every input, with exactly one exception: an
+    EXACTLY zero product ([+0.0 *. -1.0] and friends) comes back [+0.0] here
+    rather than [-0.0], because the fma adds [+0.0]. A nonzero product that
+    UNDERFLOWS to zero keeps its sign under both forms - the fma rounds the
+    exact product once, so the sign survives. Verified over the signed zeros,
+    infinities, NaN, subnormals and 3e6 random float32 pairs: the exact-zero
+    sign is the only divergence, and it is not observable at any df64 entry
+    point, because the [quick_two_sum] that closes [df64_mul]/[df64_mul_f32]
+    adds [+0.0] to it and yields [+0.0] either way.
+
+    See the comment block above before changing this. *)
+let[@sarek.module] mul_rn (a : float32) (b : float32) : float32 = fma a b 0.0
+
+(******************************************************************************
  * Error-free transformations (Dekker 1971, Knuth TAOCP v2 4.2.2)
  ******************************************************************************)
 
@@ -90,7 +406,7 @@ let[@sarek.module] quick_two_sum (a : float32) (b : float32) : df64 =
 
 (** Split-free TwoProd via fma: [a * b] as an exact [hi + lo] pair, 3 flops. *)
 let[@sarek.module] two_prod (a : float32) (b : float32) : df64 =
-  let p = a *. b in
+  let p = mul_rn a b in
   let err = fma a b (0.0 -. p) in
   {hi = p; lo = err}
 
@@ -238,8 +554,14 @@ module Host = struct
     let s = a +% b in
     {hi = s; lo = b -% (s -% a)}
 
+  (* Mirrors the device [mul_rn]: OCaml never contracts, so the barrier is not
+     needed here for its own sake, but this module's contract is to be a
+     bit-faithful op-for-op reference. Using [a *% b] instead would diverge
+     from the device on an exactly-zero product's sign. *)
+  let mul_rn a b = fma_f32 a b 0.0
+
   let two_prod a b =
-    let p = a *% b in
+    let p = mul_rn a b in
     {hi = p; lo = fma_f32 a b (-.p)}
 
   let neg a = {hi = -.a.hi; lo = -.a.lo}

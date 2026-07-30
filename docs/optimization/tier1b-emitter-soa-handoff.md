@@ -5,7 +5,7 @@ the correctness/benchmark evidence, and the precise Tier 1c handoff._
 
 Companion to [tier1a-soa-pinned-handoff.md](tier1a-soa-pinned-handoff.md)
 (host + transfer half) and [opt-spoc-runtime.md](opt-spoc-runtime.md) §1
-(SoA) / [opt-ptx-passes.md](opt-ptx-passes.md) (#3 `ld.global.nc`, warp prims).
+(SoA) / [opt-ptx-passes.md](opt-ptx-passes.md) (pass 3, `ld.global.nc`, and warp prims).
 
 ## What shipped — the PTX emitter's SoA lowering
 
@@ -115,6 +115,44 @@ a single custom-vector argument.)
 The emitter is ready; what remains is making SoA reachable without the
 codegen-level `~soa_params` knob:
 
+> **STATUS (2026-07-29) — partly superseded.** The host and launch halves were
+> since built, but NOT by the design sketched below. `Spoc_core.Soa_vector` layers
+> SoA storage *above* `Vector` + `Soa` (an AoS vector as source of truth + N
+> width-matched scalar leaf vectors) instead of adding a `host_storage` GADT
+> constructor, and `Sarek.Soa_launch.run_soa` is a separate CUDA/PTX-only entry
+> point instead of generalising `Execute.run`. That deliberately avoided the ~25
+> forced GADT match sites and the 1-buffer-per-device table, at the cost of not
+> being *transparent*. So what actually remains of this item is the transparency
+> itself — `Vector.create ~layout:SoA` and auto-dispatch from the generic
+> `Execute.run` — and the bullets below describe the design that would be needed
+> for it, not work that is wholly outstanding. Read them as the plan for
+> transparency, not as a to-do list of missing plumbing.
+>
+> Separately shipped on the launch path: the layout is CHECKED there (PR #366)
+> rather than documented — `run_soa` compares the vector's plan against the
+> kernel's authoritative `TRecord` and refuses a mismatch instead of transposing
+> silently-corrupt data.
+>
+> **UPDATE — the `~fields` argument is gone (slice 1 of this item).**
+> `Soa_vector.create` no longer takes the field layout; it DERIVES it from
+> `custom_type.ir_fields`, which the PPX populates for every `[@@sarek.type]`
+> record from the same `aligned_record_offsets` call that produces
+> `elem_size`/`get`/`set`. The premise both this doc and the code stated — "the
+> PPX `custom_type` carries no record layout" — was stale. That closes the
+> hazard at the source instead of intercepting it: there is no longer a second
+> description of the layout available to disagree with the first, so a
+> caller-supplied wrong list is not expressible.
+>
+> The PR #366 launch check STAYS, on a different axis. `create` sees only the
+> vector's element type; the launch also holds the kernel's `DParam`. `SA_Soa` is
+> existential, so binding a vector of one record type to a parameter of another
+> still typechecks — and that is what the check now refuses. The wiring test was
+> re-expressed accordingly (a `dpair` vector bound to a `point3d` parameter),
+> because its old mechanism, passing a permuted `~fields`, became impossible.
+>
+> So of the transparency bullets below, the LAYOUT blocker is closed. What
+> remains is the backend threading and the 1-buffer-per-device table.
+
 - **Host storage variant** (`Spoc_core_base.host_storage`, GADT at
   `sarek/core_base/Spoc_core_base.ml:111-120`): add `Custom_storage_soa` holding
   the AoS host buffer (keep host `get`/`set` and the PPX accessors **unchanged**
@@ -144,26 +182,43 @@ bulk of the SoA cost; it was descoped here so the emitter could ship complete
 and proven. When it lands, extend `test_soa_emitter_equiv` to drive SoA through
 `Vector.create ~layout:SoA` + `run_vectors`, and add the i32/i64 device rows.
 
-> **PRECONDITION — generated param-name namespace (latent today, MUST fix in
-> Tier 1c).** The emitter mangles each SoA leaf param as
-> `param_<vec>_soa_<field>` (`Sarek_ir_ptx_kernel.emit_params`). This can
-> **collide** with a distinct user vector/scalar parameter whose own generated
-> name is `param_<vec>_soa_<field>` — e.g. a user param literally named
-> `x_soa_y` alongside a SoA vector `x` with field `y`. The reserved `sarek_`
-> prefix does **not** cover this infix mangle. It is unreachable today because
-> `~soa_params` is only ever passed by the emitter's own tests (never from user
-> code), but the moment Tier 1c lets a user opt a vector into SoA it becomes a
-> real (silently-wrong-PTX) hazard. Tier 1c **MUST** close it, by either:
-> (a) `sarek_`-prefixing the generated SoA params
-> (`param_sarek_soa_<vec>_<field>`) so they live in the already-reserved
-> namespace and cannot alias a user name; or (b) validating the kernel's param
-> names against the generated SoA pattern and rejecting a collision with a
-> precise error. Option (a) is preferred (no user-facing rejection, consistent
-> with the existing `sarek_<vec>_length` convention). Add a regression test that
-> a kernel mixing a SoA vector `x` (field `y`) with a scalar param `x_soa_y`
-> compiles to distinct PTX operands.
+> **✅ CLOSED (2026-07-29) — was: PRECONDITION, generated param-name namespace.**
+> Option (a) shipped in `63ab6df1`: the emitter now mangles leaves as
+> `param_sarek_soa_<vec>_<field>`, inside the already-reserved `sarek_`
+> namespace, so it cannot alias a user name. The requested regression test exists
+> — `test_soa_param_name_collision_safe` in `sarek/tests/unit/test_ptx_snapshot.ml`
+> — and was re-verified as a real gate rather than a passing formality: reverting
+> the mangle to the old infix form turns that case red (5 failures), restoring it
+> returns 64/64. The collision is one-directional and fully closed, because a user
+> param cannot itself be `sarek_`-prefixed (#258 reserves it).
+>
+> Do NOT redo this as part of Tier 1c.
+>
+> #### Historical record — why the hazard was real, and why (a) beat (b)
+>
+> Rewritten into the past tense after review on PR #366: the paragraph below used
+> to be a live "MUST fix in Tier 1c" instruction, and leaving it in the
+> imperative next to a CLOSED banner is exactly how completed work gets reopened
+> by a reader who skims. Kept for the rationale, not as a task.
+>
+> The emitter **used to** mangle each SoA leaf param as `param_<vec>_soa_<field>`
+> (`Sarek_ir_ptx_kernel.emit_params`). That **could** collide with a distinct user
+> vector/scalar parameter whose own generated name was `param_<vec>_soa_<field>` —
+> e.g. a user param literally named `x_soa_y` alongside a SoA vector `x` with
+> field `y`. The reserved `sarek_` prefix did **not** cover that infix mangle. It
+> was unreachable at the time because `~soa_params` was only ever passed by the
+> emitter's own tests, never from user code — but it would have become a real
+> silently-wrong-PTX hazard the moment Tier 1c let a user opt a vector into SoA.
+>
+> Two closures were considered: (a) `sarek_`-prefixing the generated SoA params so
+> they live in the already-reserved namespace and cannot alias a user name; or
+> (b) validating the kernel's param names against the generated SoA pattern and
+> rejecting a collision with a precise error. **(a) was chosen** — no user-facing
+> rejection, and consistent with the existing `sarek_<vec>_length` convention.
+> (b) would have made a legal program fail for a reason the user could not act on
+> without renaming their own parameter.
 
-### 2. `ld.global.nc` for read-only params (roadmap #3 — High, cost S)
+### 2. `ld.global.nc` for read-only params (opt-ptx-passes.md pass 3 — High, cost S)
 
 Independent of SoA. A single write-set pass over `kern_body` (+ inlined
 `hf_body`s) collecting `DParam` array names ever used as an `EArrayWrite` /
@@ -174,7 +229,8 @@ static), 1.1–1.3× on multi-pointer-param bandwidth-bound kernels. Not started
 
 ### 3. Warp primitives (roadmap "half-built")
 
-`SWarpBarrier` / the `warp_barrier` intrinsic exist and emit `bar.warp.sync`;
+`SWarpBarrier` exists and emits `bar.warp.sync`, but there is no `warp_barrier`
+intrinsic: no PPX syntax constructs the statement, so it is emitter-only today;
 warp **shuffle** (`shfl.sync`) is not modelled in the IR or emitted. Adding it
 is an IR-surface + typer + emitter change (a new intrinsic family), larger than
 either item above and not blocking SoA. Scope as its own task.

@@ -18,12 +18,131 @@
   model restated for the aligned ABI (0 admits)
 - float32 `fma` intrinsic on all backends; GLSL `precise` qualifier on
   float locals
+- CI installs `cuda-nvdisasm-12-6` and `ci/assert-toolchain.sh` asserts
+  `nvdisasm` (version + a ptxas→nvdisasm probe). It was absent from the built
+  image, so `test_cuda_f16_sass` — the gate the NVIDIA f16 guarantee rests on,
+  and the only one that could surface a 12.6-vs-13.3 ptxas divergence —
+  self-skipped in CI while reporting green.
+- `docs/fp-contraction-policy.md` — cross-backend floating-point contraction
+  policy: what each backend may contract, what actually prevents it, and
+  whether that mechanism is verified or merely believed. The interpreter is
+  named as the cross-backend oracle. Linked from every site that previously
+  carried an ad-hoc contraction comment. §7 ("what cannot be verified without
+  NVIDIA hardware") is now partly closed: an f16 kernel HAS been executed on
+  an NVIDIA GPU — GTX 1070 Max-Q, sm_61, CUDA 12.9, driver 580.119.02 —
+  agreeing with the interpreter on all 63488 finite binary16 inputs, with a
+  liveness control (63085 mismatches on deliberately mismatched kernels)
+  proving the sweep can go red. That also settles the tie-rounding question
+  the section named, exercises the *driver's* ptxas rather than the offline
+  one, adds a second toolkit version (12.9, between CI's 12.6 and the
+  document's 13.3), and independently confirms on hardware that the CUDA
+  barrier removed in #110 was inert. sm_61 is below the sm_75…sm_121 range
+  the host-side sweeps cover, so it is a new sample, not a repeat.
+- FP-conformance guard on the CUDA/nvrtc path: `-use_fast_math`, `-ftz=true`,
+  `--prec-div=false` and `--prec-sqrt=false` are now REJECTED at the point an
+  option array reaches `nvrtcCompileProgram` (`--fmad=true` warns). The guard
+  screens the whole ARRAY, because nvrtc accepts an option and its value as two
+  elements: `["--ftz"; "true"]` compiled a subnormal-flushing kernel past a
+  per-element check (confirmed against libnvrtc 13.3, `.ftz` in the emitted
+  PTX). A value-taking name consumes the next element and is fail-closed. They flush
+  binary32 subnormals or downgrade div/sqrt, and no later flag undoes that.
+  `sarek-cuda/test/test_cuda_fp_conformance.ml` reproduces the hazard
+  host-side (`-ftz=true` turns `FMUL`/`FADD` into `FMUL.FTZ`/`FADD.FTZ` at
+  sm_90, CUDA 13.3) and each of its four cases was proved red by mutation.
+- `sarek/tests/e2e/test_vulkan_no_contraction.ml` (on the `e2e-gpu` alias, so
+  it executes rather than merely building) — settles whether a Vulkan driver
+  honours SPIR-V `NoContraction` (#126). Same shader compiled twice,
+  differing only by `precise`, run on the same device/driver/process; the
+  contracted target is taken from the device's own `fma()` rather than an IEEE
+  model, because RADV's `fma` is not correctly rounded and a modelled target
+  can make a genuinely contracted result read as clean. **Measured on RX 7900
+  XTX (RADV NAVI31) and the Raphael iGPU, Mesa 26.1.4-arch3.1: 0 of 7
+  contraction shapes contracted with or without `precise`, and the emitted RDNA
+  ISA is opcode-identical between the two builds.** Both in-tree claims are
+  refuted: RADV neither ignores the decoration nor needs it. Mesa ANV remains
+  unmeasured — no Intel GPU on this machine.
+- `sarek-hip/test/test_hip_f16_shapes.ml` + `scripts/f16_shape_isa_audit.sh` —
+  exhaustive f16 expression-shape audit for AMDGPU fusion demotion (#106). All
+  20 shapes the DSL can emit, each swept over all 63488 finite binary16 inputs,
+  on gfx1100 and gfx1036: **0 disagreements as shipped**. Removing the opacity
+  barrier breaks 9 of 20 and reproduces the original 620 exactly — the harness
+  was calibrated against that known positive before its nulls were trusted, and
+  it fails closed if the barrier-removed control stops going red. Disassembly
+  additionally shows *four* demotion opcodes, not two (`v_mul_f16` and
+  `v_sub_f16` are new), and three shapes that are demoted in machine code yet
+  numerically clean — which a numeric-only audit would have mis-reported as
+  unaffected. See `docs/optimization/amdgpu-f16-fusion-shape-audit.md`.
 - ZLUDA/AMD support for the CUDA/PTX backend (PTX launch ABI fix)
 - T3-SEMANTIC milestone lock for both formal projects; conformance +
   mutation tests wired into `dune runtest`
 
+### Changed
+
+- The CUDA branch of `sarek_f32_barrier` no longer emits
+  `asm volatile("" : "+f"(x))`. At an f16 narrowing it contributes zero PTX
+  instructions, so `ptxas` receives an identical instruction stream and the
+  cubins are byte-identical with and without it — re-measured on CUDA 13.3 for
+  sm_75 through sm_121. What keeps the f32 multiply out of the narrowing on
+  NVIDIA is `ptxas`, machine-checked by `test_cuda_f16_sass`. NOTE the same
+  barrier is *not* inert at a `mul`→`add` site (PTX `mul.f32`+`add.f32` instead
+  of `fma.rn.f32`), but `ptxas -O1`+ re-contracts that under the default
+  `-fmad=true`, so it is still not a usable contraction barrier on NVIDIA — use
+  `Sarek_df64`'s `mul_rn`. The AMDGPU `"+v"` barrier, which IS load-bearing, is
+  unchanged. Removing a no-op that read as protection; no behaviour change.
+
 ### Fixed
 
+- `Sarek_df64` silently ran at plain float32 precision on real NVIDIA
+  hardware (CUDA/PTX and NVIDIA OpenCL): `ptxas` contracted the multiply in
+  `two_prod` into the `add`/`sub` of the `quick_two_sum` closing `df64_mul`,
+  rebuilding the exact product and cancelling the TwoProd error term.
+  `mul`/`div`/`sqrt` degraded from ~2^-47 to ~2^-24 with no error reported.
+  `two_prod` now forms its product with `fma a b 0.0`, which cannot be fused
+  again. Measured on a GTX 1070 (sm_61, CUDA 12.9): mul 5.92e-08 → 9.07e-15,
+  div 5.64e-08 → 5.08e-15, throughput unchanged. A CPU-only regression guard
+  (`test_df64_no_contraction`) asserts the emitted PTX contains no
+  contractable `mul.f32`. The df64 per-backend precision table now names the
+  device and toolchain behind every figure — the previous table generalised
+  AMD-only measurements to "CUDA/PTX", which is why this went unseen.
+- df64 precision gates could not distinguish a working df64 from a collapsed
+  one. `test_df64`, `test_real64` and `test_real64_single_source` all widened
+  their tolerance to `0x1p-22` (2.38e-07 — four times the float32 unit
+  roundoff) on the backends with a documented deviation, so a df64 that had
+  degraded all the way to plain float32 (measured 5.84e-08 on RADV) and one
+  meeting its contract (9.07e-15) both read PASS. The widening also keyed on
+  the bare `Vulkan` framework tag, sweeping in NVIDIA Vulkan, which meets the
+  full contract. All three tests now hold every device to the derived contract
+  bound (2^-47 add/sub, 2^-46 mul/div/sqrt) and express the documented
+  deviations as an explicit expected-failure band — upper end 2^-23, twice the
+  float32 unit roundoff — keyed on driver identity (Mesa RADV, Mesa ANV) in
+  `Test_helpers.df64_known_deviation`. Degrading past plain float32 now FAILs
+  even on an allowlisted device, and so does an allowlisted device that starts
+  MEETING the contract (strict XPASS, as in pytest's `xfail(strict=True)`) —
+  the run goes red naming the match arm to delete, so the allowlist cannot rot
+  behind a green exit code. Red-proved twice: replacing `df64_mul` with a plain
+  float32 multiply (old gate PASS on both RADV devices and Native at 1.43e-07
+  vs tol 2.38e-07, new gate FAIL), and adding a bogus allowlist entry for an op
+  that already meets the contract (all three tests exit 1 with the stale-entry
+  message).
+- PTX backend emits `sqrt.rn.f32` rather than `sqrt.approx.f32` for the float32
+  `sqrt` intrinsic — the same correctness fix already applied to division
+  (`div.approx.f32` → `div.rn.f32`, audit finding M2), which had missed `sqrt`.
+  Dumping the generated PTX showed `sqrt.approx.f32` (~1 ulp) was the only
+  non-correctly-rounded instruction in the whole `df64_sqrt` body, where it
+  serves as the Newton seed. This is a global change: every f32 sqrt in every
+  PTX kernel is now correctly rounded. Measured worst-case relative error over
+  each test's own input set, on a GTX 1070 Max-Q (sm_61, CUDA 12.9, driver
+  580.119.02): `df64_sqrt` 1.42e-14 (failing) → 8.53e-15 in `test_df64`, and
+  1.68e-14 (failing) → 8.87e-15 in `test_real64`'s df64 fallback. Both post-fix
+  figures coincide with the interpreter's for the same inputs — agreement
+  between summary statistics, not element-wise identity — so the seed accounted
+  for the whole gap these tests can see. Sampled maxima on one device and
+  toolchain, not bounds. Costs ~12% kernel time on a sqrt-dominated benchmark
+  (`bench_nbody` n=4096: 1.535 ms → 1.722 ms); `rsqrt` is unchanged for code
+  that wants the fast form. The same bug class remains open in the OpenCL
+  backend (no `-cl-fp32-correctly-rounded-divide-sqrt`, sqrt 1.81e-14) and the
+  Vulkan backend (1.68e-14 on NVIDIA); see the `KNOWN RESIDUAL` block in
+  `sarek/Sarek_df64/Sarek_df64.ml`.
 - Indexed kernel-argument container with strict launch validation, honored
   across all six backends (out-of-order/sparse `set_arg` now correct)
 - Unambiguous, collision-resistant compile-cache keys (kernel name included,

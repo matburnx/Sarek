@@ -27,6 +27,25 @@ let soa_leaves_of_param param_name (elt : elttype) : (string * elttype) list =
         (fun (fname, fty) ->
           match fty with
           | TInt32 | TBool | TFloat32 | TInt64 | TFloat64 -> ()
+          | TFloat16 ->
+              fail
+                (Printf.sprintf
+                   "PTX codegen: SoA parameter '%s': float16 field '%s' \
+                    unsupported (#57 slice 2)"
+                   param_name
+                   fname)
+          | TUint8 ->
+              (* Not a width limitation: a uint8 field is a cooperative-matrix
+                 operand element, and the statements that give it meaning are
+                 refused by this backend, so splitting it into its own SoA leaf
+                 would manufacture a buffer nothing can read. *)
+              fail
+                (Printf.sprintf
+                   "PTX codegen: SoA parameter '%s': uint8 field '%s' is a \
+                    cooperative-matrix operand element type, emitted only by \
+                    the Vulkan backend"
+                   param_name
+                   fname)
           | TRecord _ ->
               fail
                 (Printf.sprintf
@@ -70,10 +89,11 @@ let soa_leaves_of_param param_name (elt : elttype) : (string * elttype) list =
 
     [~soa_params] lists vector parameters to lower as Structure-of-Arrays: each
     such custom (record) vector expands to one [.param .u64] base pointer per
-    scalar leaf (named [param_<name>_soa_<field>]) followed by the shared
-    [.param .u32 param_sarek_<name>_length], instead of the single AoS
-    [(ptr, length)] pair. The N leaf base registers are recorded in
-    [alloc.arr_soa] for the element load/store paths. Parameters absent from
+    scalar leaf (named [param_sarek_soa_<name>_<field>], in the reserved
+    [sarek_] namespace so it can never alias a user parameter's generated name)
+    followed by the shared [.param .u32 param_sarek_<name>_length], instead of
+    the single AoS [(ptr, length)] pair. The N leaf base registers are recorded
+    in [alloc.arr_soa] for the element load/store paths. Parameters absent from
     [~soa_params] are unchanged (packed AoS). *)
 let emit_params buf alloc (env : env) ~(soa_params : string list)
     (params : decl list) : string =
@@ -117,7 +137,7 @@ let emit_params buf alloc (env : env) ~(soa_params : string list)
                     Buffer.add_string
                       param_decls
                       (Printf.sprintf
-                         "    .param .u64 param_%s_soa_%s"
+                         "    .param .u64 param_sarek_soa_%s_%s"
                          v.var_name
                          field))
                   leaves ;
@@ -130,7 +150,7 @@ let emit_params buf alloc (env : env) ~(soa_params : string list)
                       let r = new_u64 alloc in
                       emit
                         buf
-                        "ld.param.u64 %s, [param_%s_soa_%s];"
+                        "ld.param.u64 %s, [param_sarek_soa_%s_%s];"
                         r
                         v.var_name
                         field ;
@@ -212,6 +232,25 @@ let emit_params buf alloc (env : env) ~(soa_params : string list)
               let r = new_u32 alloc in
               env_bind env v.var_name r ;
               emit buf "ld.param.u32 %s, [param_%s];" r v.var_name
+          | TFloat16 ->
+              fail
+                (Printf.sprintf
+                   "PTX codegen: kernel parameter '%s' has type float16, which \
+                    the PTX backend does not support (#57 slice 2 — needs a \
+                    %%h register class)"
+                   v.var_name)
+          | TUint8 ->
+              (* A scalar uint8 parameter is not something the surface language
+                 can build; the type exists only as a cooperative-matrix operand
+                 buffer element, so seeing one here means the kernel targeted
+                 the wrong backend rather than that PTX is missing a width. *)
+              fail
+                (Printf.sprintf
+                   "PTX codegen: kernel parameter '%s' has type uint8, a \
+                    cooperative-matrix operand element type emitted only by \
+                    the Vulkan backend; the PTX backend has no \
+                    cooperative-matrix path"
+                   v.var_name)
           | TRecord (tname, _) | TVariant (tname, _) ->
               (* C-17 / FR-030: by-value aggregate params have no host
                  marshalling; a TVec of the same type IS accepted (EC-11). *)
@@ -351,6 +390,30 @@ let make_ptx_header ?(sm_target = "sm_86") ?(ptx_version = "8.0") () =
     ptx_version
     sm_target
 
+(* Slice-2 deferral. PTX keeps its OWN raiser rather than going through
+   {!Sarek_ir_codegen.reject_feature}'s composed message: the wording in
+   [Sarek_ir_ptx_types.unsupported_elttype] explains the %h register-class audit
+   and is shared verbatim with the expression emitter, so one f16 message for the
+   whole backend is better than two. The detector is still the shared choke
+   point — see reject_feature's docstring for why a whole-kernel gate is needed.
+   [_kernel] distinguishes this from [Sarek_typer.reject_float16], which rejects
+   an f16 OPERAND. *)
+let reject_float16_kernel (k : kernel) : unit =
+  if Sarek_ir_analysis.kernel_uses Sarek_ir_analysis.Float16 k then
+    Sarek_ir_ptx_types.unsupported_elttype TFloat16 "kernel-level float16 usage"
+
+(* The cooperative-matrix gate, sharing the f16 gate's placement and its reason
+   for existing: a per-node refusal names whichever node the emitter happened to
+   reach, and a [TUint8] operand buffer that is only ever stored to reaches
+   none. It also covers helper bodies, which [emit_stmt] visits through a
+   different entry. *)
+let reject_coopmat_kernel (k : kernel) : unit =
+  if Sarek_ir_analysis.kernel_uses Sarek_ir_analysis.Coopmat k then
+    Sarek_ir_ptx_types.unsupported
+      "kernel-level cooperative-matrix usage: cooperative matrices and their \
+       uint8 operand buffers are emitted only by the Vulkan backend \
+       (backlog-62)"
+
 (** Generate PTX for a single kernel. Three-phase: (1) emit body to count
     registers, (2) build header with correct register counts, (3) concatenate.
     @param sm_target Override the default [sm_86] target for older hardware.
@@ -361,6 +424,8 @@ let make_ptx_header ?(sm_target = "sm_86") ?(ptx_version = "8.0") () =
       to [[]] (all AoS) — so the standard backend path emits byte-identical PTX
       to before. *)
 let generate ?(sm_target = "sm_86") ?(soa_params = []) (k : kernel) : string =
+  reject_float16_kernel k ;
+  reject_coopmat_kernel k ;
   let alloc = make_alloc () in
   List.iter
     (fun hf ->

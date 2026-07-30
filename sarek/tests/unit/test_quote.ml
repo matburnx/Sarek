@@ -25,6 +25,8 @@ let dummy_sarek_loc : Sarek_ast.loc =
     loc_col = 10;
     loc_end_line = 42;
     loc_end_col = 20;
+    loc_bol = 0;
+    loc_end_bol = 0;
   }
 
 (* Helper to check expression structure - handles extension nodes and nested expressions *)
@@ -113,41 +115,6 @@ let test_quote_bool_false () =
   | Pexp_construct ({txt = Lident "false"; _}, None) -> ()
   | Pexp_extension _ -> ()
   | _ -> Alcotest.fail "expected false constant"
-
-(* Test: quote_elttype generates Kirc_Ast constructors *)
-let test_quote_elttype_int32 () =
-  let e = Sarek_quote.quote_elttype ~loc:dummy_loc Kirc_Ast.EInt32 in
-  (* [%expr Sarek.Kirc_Ast.EInt32] expands to Pexp_construct *)
-  match e.pexp_desc with
-  | Pexp_construct _ -> ()
-  | Pexp_ident _ -> ()
-  | Pexp_extension _ -> ()
-  | _ -> Alcotest.fail "expected constructor, identifier or extension node"
-
-let test_quote_elttype_float32 () =
-  let e = Sarek_quote.quote_elttype ~loc:dummy_loc Kirc_Ast.EFloat32 in
-  match e.pexp_desc with
-  | Pexp_construct _ -> ()
-  | Pexp_ident _ -> ()
-  | Pexp_extension _ -> ()
-  | _ -> Alcotest.fail "expected constructor, identifier or extension node"
-
-(* Test: quote_memspace generates Kirc_Ast constructors *)
-let test_quote_memspace_local () =
-  let e = Sarek_quote.quote_memspace ~loc:dummy_loc Kirc_Ast.LocalSpace in
-  match e.pexp_desc with
-  | Pexp_construct _ -> ()
-  | Pexp_ident _ -> ()
-  | Pexp_extension _ -> ()
-  | _ -> Alcotest.fail "expected constructor, identifier or extension node"
-
-let test_quote_memspace_shared () =
-  let e = Sarek_quote.quote_memspace ~loc:dummy_loc Kirc_Ast.Shared in
-  match e.pexp_desc with
-  | Pexp_construct _ -> ()
-  | Pexp_ident _ -> ()
-  | Pexp_extension _ -> ()
-  | _ -> Alcotest.fail "expected constructor, identifier or extension node"
 
 (* Test: quote_list generates list construction *)
 let test_quote_list_empty () =
@@ -385,19 +352,30 @@ let test_quote_sarek_expr_var () =
   | Pexp_record _ -> ()
   | _ -> Alcotest.fail "expected extension or record"
 
-(* Test: expr_of_intrinsic_ref generates intrinsic references *)
+(* Test: expr_of_intrinsic_ref_opt generates STDLIB intrinsic references *)
 let test_expr_of_intrinsic_ref_module () =
   let ref = Sarek_env.IntrinsicRef (["Float32"], "sin") in
-  let e = Sarek_quote.expr_of_intrinsic_ref ~loc:dummy_loc ref in
-  Alcotest.(check bool) "contains sin" true (expr_contains_ident e "sin")
+  match Sarek_quote.expr_of_intrinsic_ref_opt ~loc:dummy_loc ref with
+  | Some e ->
+      Alcotest.(check bool) "contains sin" true (expr_contains_ident e "sin")
+  | None -> Alcotest.fail "a stdlib intrinsic must still get a witness"
 
 let test_expr_of_intrinsic_ref_core () =
+  (* Core primitives get NO witness (#57 slice 1 review, MF4c): they live in the
+     PPX's own Sarek_core_primitives table, not in a stdlib module, and the old
+     unqualified [Gpu.<name>] named a module that is not in scope at the user's
+     expansion site — which broke `let x = float32_of_float16 a.(tid) in ...`
+     with "Unbound module Gpu". *)
   let ref = Sarek_env.CorePrimitiveRef "thread_idx_x" in
-  let e = Sarek_quote.expr_of_intrinsic_ref ~loc:dummy_loc ref in
   Alcotest.(check bool)
-    "contains thread_idx_x"
+    "core primitive gets no stdlib witness"
     true
-    (expr_contains_ident e "thread_idx_x")
+    (Sarek_quote.expr_of_intrinsic_ref_opt ~loc:dummy_loc ref = None) ;
+  let f16 = Sarek_env.CorePrimitiveRef "float32_of_float16" in
+  Alcotest.(check bool)
+    "f16 conversion gets no stdlib witness"
+    true
+    (Sarek_quote.expr_of_intrinsic_ref_opt ~loc:dummy_loc f16 = None)
 
 (* Test suite *)
 let () =
@@ -413,25 +391,6 @@ let () =
           Alcotest.test_case "quote_string" `Quick test_quote_string;
           Alcotest.test_case "quote_bool true" `Quick test_quote_bool_true;
           Alcotest.test_case "quote_bool false" `Quick test_quote_bool_false;
-        ] );
-      ( "kirc_ast_quoting",
-        [
-          Alcotest.test_case
-            "quote_elttype int32"
-            `Quick
-            test_quote_elttype_int32;
-          Alcotest.test_case
-            "quote_elttype float32"
-            `Quick
-            test_quote_elttype_float32;
-          Alcotest.test_case
-            "quote_memspace local"
-            `Quick
-            test_quote_memspace_local;
-          Alcotest.test_case
-            "quote_memspace shared"
-            `Quick
-            test_quote_memspace_shared;
         ] );
       ( "collection_quoting",
         [

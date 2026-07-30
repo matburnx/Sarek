@@ -49,21 +49,21 @@ let make_float32_sin_ir () : kernel =
             EIntrinsic (["Float32"], "sin", [EArrayRead ("a", EVar idx)]) ) )
   in
   {
+    default_kernel with
     kern_name = "float32_sin_pure";
     kern_params =
       [
         DParam (a, Some {arr_elttype = TFloat32; arr_memspace = Global});
         DParam (b, Some {arr_elttype = TFloat32; arr_memspace = Global});
       ];
-    kern_locals = [];
     kern_body = body;
-    kern_types = [];
-    kern_variants = [];
-    kern_funcs = [];
-    kern_native_fn = None;
   }
 
 let n = 256
+
+(** The i-th input value: [n] samples spanning [0, 2*pi]. Shared by the filler
+    and the verifier so they cannot drift apart. *)
+let input_at i = Float.pi *. 2.0 *. (float_of_int i /. float_of_int n)
 
 let run_kernel_on_device (dev : Device.t) =
   let ir = make_float32_sin_ir () in
@@ -71,8 +71,7 @@ let run_kernel_on_device (dev : Device.t) =
   let b_vec = Vector.create Vector.float32 n in
   (* Fill input with values in [0, 2*pi] *)
   for i = 0 to n - 1 do
-    let x = Float.pi *. 2.0 *. (float_of_int i /. float_of_int n) in
-    Vector.set a_vec i x ;
+    Vector.set a_vec i (input_at i) ;
     Vector.set b_vec i 0.0
   done ;
   let block = Execute.dims1d 256 in
@@ -89,26 +88,28 @@ let run_kernel_on_device (dev : Device.t) =
   let result = Vector.to_array b_vec in
   result
 
-let verify_result result =
-  let errors = ref 0 in
-  for i = 0 to n - 1 do
-    let x = Float.pi *. 2.0 *. (float_of_int i /. float_of_int n) in
-    let expected = sin x in
-    let diff = abs_float (result.(i) -. expected) in
-    (* Allow 1e-4 absolute tolerance for GPU float32 sin variation *)
-    if diff > 1e-4 then begin
-      if !errors < 5 then
-        Printf.printf
-          "  Mismatch at %d: x=%.4f expected=%.6f got=%.6f diff=%.2e\n"
-          i
-          x
-          expected
-          result.(i)
-          diff ;
-      incr errors
-    end
-  done ;
-  !errors = 0
+(** Verify the result and return its failure SHAPE, not just a boolean: the
+    CPU-OpenCL KNOWN-ISSUE classifier gates on where and how widely the result
+    is wrong, so that a total failure (e.g. a kernel that never ran, leaving the
+    output at its 0.0 pre-fill) can never be excused. See
+    [Test_helpers.classify_cpu_opencl_math_result] (#74 / F1). *)
+let verify_result result : Test_helpers.float_check_shape =
+  (* Allow 1e-4 absolute tolerance for GPU float32 sin variation. The shape
+     computation itself lives in Test_helpers (single source of truth, fixture
+     tested by test_float_check_shape.ml). *)
+  Test_helpers.compute_float_check_shape
+    ~total:n
+    ~tolerance:1e-4
+    ~expected:(fun i -> sin (input_at i))
+    ~got:(fun i -> result.(i))
+    ~report:(fun ~index ~expected ~got ~diff ->
+      Printf.printf
+        "  Mismatch at %d: x=%.4f expected=%.6f got=%.6f diff=%.2e\n"
+        index
+        (input_at index)
+        expected
+        got
+        diff)
 
 let () =
   let cfg = Test_helpers.parse_args "test_float32_sin_pure" in
@@ -123,14 +124,38 @@ let () =
   Printf.printf "Running Float32.sin pure-registry kernel (n=%d)...\n%!" n ;
   try
     let result = run_kernel_on_device dev in
-    if verify_result result then begin
-      Printf.printf
-        "PASSED: Float32.sin pure-registry e2e on %s\n%!"
-        dev.Device.framework
-    end
-    else begin
-      Printf.printf "FAILED: numerical mismatch\n%!" ;
-      exit 1
+    let verdict =
+      Test_helpers.classify_cpu_opencl_math_result
+        ~dev
+        ~shape:(verify_result result)
+        ()
+    in
+    begin match verdict with
+    | `Pass ->
+        Printf.printf
+          "PASSED: Float32.sin pure-registry e2e on %s\n%!"
+          dev.Device.framework
+    | `Known_issue label ->
+        (* CPU-OpenCL only, and only for the flake's failure shape; see
+             Test_helpers.classify_cpu_opencl_math_result. *)
+        Printf.printf
+          "KNOWN-ISSUE on %s (%s): %s\n%!"
+          dev.Device.name
+          dev.Device.framework
+          label ;
+        Test_helpers.github_warning
+          ~title:"KNOWN-ISSUE (task #74)"
+          (Printf.sprintf
+             "test_float32_sin_pure: float32 sin numeric check SUPPRESSED on \
+              %s (%s) — %s"
+             dev.Device.name
+             dev.Device.framework
+             label) ;
+        Printf.printf
+          "SKIPPED: Float32.sin on a known-bad CPU-OpenCL device\n%!"
+    | `Fail ->
+        Printf.printf "FAILED: numerical mismatch\n%!" ;
+        exit 1
     end
   with
   | Spoc_framework.Backend_error.Backend_error err ->

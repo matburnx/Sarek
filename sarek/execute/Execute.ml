@@ -99,6 +99,13 @@ let exec_arg_of_vector : type a b. (a, b) Vector.t -> Framework_sig.exec_arg =
       | Vector.Scalar Vector.Int64 ->
           Typed_value.TV_Scalar
             (Typed_value.SV ((module Typed_value.Int64_type), Vector.get v i))
+      | Vector.Scalar Vector.Float16 ->
+          (* f16 has no Typed_value module of its own: it is a storage width,
+             and [Vector.get] already returns the binary16-rounded value as an
+             OCaml float. Surfacing it as Float32_type is what makes "compute in
+             f32" automatic on the native path. *)
+          Typed_value.TV_Scalar
+            (Typed_value.SV ((module Typed_value.Float32_type), Vector.get v i))
       | Vector.Scalar Vector.Float32 ->
           Typed_value.TV_Scalar
             (Typed_value.SV ((module Typed_value.Float32_type), Vector.get v i))
@@ -148,6 +155,22 @@ let exec_arg_of_vector : type a b. (a, b) Vector.t -> Framework_sig.exec_arg =
           | Typed_value.PFloat _ -> type_error "int64" "float"
           | Typed_value.PBool _ -> type_error "int64" "bool"
           | Typed_value.PBytes _ -> type_error "int64" "bytes")
+      | ( Typed_value.TV_Scalar (Typed_value.SV ((module S), x)),
+          Vector.Scalar Vector.Float16 ) -> (
+          (* Mirrors the [get] arm above: f16 has no Typed_value module of its
+             own (it is a storage width, not a compute type), so the value
+             arrives as a Float32_type float and [Vector.set] narrows it to
+             binary16 on store. Without this arm, writing an f16 element through
+             the framework's exec-arg interface fell into the catch-all below
+             with "unknown combination" — so an f16 kernel could not run on the
+             Interpreter DEVICE at all, even though test_hip_f16 passes: that
+             test uses [run_interpreter_vectors], which bypasses this path. *)
+          match S.to_primitive x with
+          | Typed_value.PFloat f -> Vector.set v i f
+          | Typed_value.PInt32 _ -> type_error "float16" "int32"
+          | Typed_value.PInt64 _ -> type_error "float16" "int64"
+          | Typed_value.PBool _ -> type_error "float16" "bool"
+          | Typed_value.PBytes _ -> type_error "float16" "bytes")
       | ( Typed_value.TV_Scalar (Typed_value.SV ((module S), x)),
           Vector.Scalar Vector.Float32 ) -> (
           match S.to_primitive x with
@@ -262,6 +285,387 @@ let expand_to_run_source_args ?(inject_lengths = true) (args : vector_arg list)
 
 (** {1 Execution Dispatch} *)
 
+(** {1 Launch-time argument check}
+
+    The [Vec] constructor of {!vector_arg} is existential
+    ([Vec : ('a, 'b) Vector.t -> vector_arg]), so a vector's element type is
+    ERASED the moment it enters an [~args] list. No OCaml type constraint on the
+    generated kernel closure can therefore catch passing a [float32 vector]
+    where the kernel declared a [float16 vector] — the mismatch happens on a
+    path where the types are already gone. Executed on gfx1100: such a launch
+    compiled clean and read/wrote 2N bytes of a 4N-byte buffer, producing
+    [1 2 0 0] for input [1 2 3 4], with the Native path catching it only by
+    accident.
+
+    The IR is the one place where the DECLARED parameters and the SUPPLIED
+    arguments meet, so the check lives here, and it covers every element type.
+
+    ARITY IS CHECKED FIRST, and is an error rather than a precondition for the
+    rest. An earlier version ran the per-argument checks only [if] the counts
+    matched, which made a wrong count silently disable every other check — the
+    conservatism was also a bypass. Worse, a SHORT argument list is a
+    memory-safety problem in its own right and independent of f16: both
+    [Cuda_api.Kernel.launch] and [Hip_api.Kernel.launch] size the
+    kernel-argument array with [CArray.make (ptr void) (List.length args)] and
+    hand [cuLaunchKernel] / [hipModuleLaunchKernel] a bare [CArray.start params]
+    with NO count (the trailing [extra] pointer is NULL). The driver then reads
+    as many entries as the COMPILED signature declares, so a short list makes it
+    read past the end of that array and dereference whatever it finds as a
+    parameter — for a pointer parameter, an arbitrary device address. Rejecting
+    the arity here is what keeps that unreachable.
+
+    Element types are compared exactly where the runtime kind has an IR
+    counterpart. Where it does not, the check does NOT silently pass: it falls
+    back to comparing PHYSICAL ELEMENT WIDTHS, which is the property that
+    actually matters for buffer striding. That closes the wildcard:
+    [Vector.Char] holds 1-byte elements while source [char] lowers to [TInt32],
+    so a Char vector is accessed through a 4-byte [int*]. (That lowering is
+    PRE-EXISTING — [Sarek_lower_ir.elttype_of_typ] mapped
+    [TReg Char -> Ir.TInt32] before this branch — and is NOT fixed here; the
+    check simply refuses to be the thing that hides it.)
+
+    Still conservative where it must be: a [Custom] (record/variant) element is
+    nominal and both sides derive it from the same registered layout, so its
+    element comparison is skipped deliberately rather than by omission. *)
+let ir_elttype_of_vector_kind : type a b.
+    (a, b) Vector.kind -> Sarek_ir_types.elttype option = function
+  | Vector.Scalar Vector.Float16 -> Some Sarek_ir_types.TFloat16
+  | Vector.Scalar Vector.Float32 -> Some Sarek_ir_types.TFloat32
+  | Vector.Scalar Vector.Float64 -> Some Sarek_ir_types.TFloat64
+  | Vector.Scalar Vector.Int32 -> Some Sarek_ir_types.TInt32
+  | Vector.Scalar Vector.Int64 -> Some Sarek_ir_types.TInt64
+  (* No IR constructor: these fall through to the byte-width comparison, not to
+     an implicit pass. *)
+  | Vector.Scalar (Vector.Char | Vector.Complex32) -> None
+  | Vector.Custom _ -> None
+
+let elttype_label (t : Sarek_ir_types.elttype) : string =
+  Sarek_ir_pp.string_of_elttype t
+
+(** Byte width of an IR element type, when it is a scalar. [None] for aggregates
+    (whose width comes from the registered layout, not from this table). *)
+let ir_scalar_width (t : Sarek_ir_types.elttype) : int option =
+  match Sarek_ir_layout.scalar_size t with
+  | n -> Some n
+  | exception Invalid_argument _ -> None
+
+let is_custom_kind : type a b. (a, b) Vector.kind -> bool = function
+  | Vector.Custom _ -> true
+  | Vector.Scalar _ -> false
+
+(** IR element type a SCALAR launch argument is tagged with on the host. [Int]
+    and [Int32] denote the same 32-bit slot. [None] for [Vec], which is handled
+    by the vector arms.
+
+    This tag is exactly what decides how many bytes the launch writes into the
+    argument slot, so it is the host side of the same width contract the vector
+    check enforces — see {!check_launch_args}. *)
+let ir_elttype_of_scalar_arg = function
+  | Int _ | Int32 _ -> Some Sarek_ir_types.TInt32
+  | Int64 _ -> Some Sarek_ir_types.TInt64
+  | Float32 _ -> Some Sarek_ir_types.TFloat32
+  | Float64 _ -> Some Sarek_ir_types.TFloat64
+  | Vec _ -> None
+
+let arg_label = function
+  | Vec _ -> "a vector"
+  | Int _ | Int32 _ -> "an int32 scalar"
+  | Int64 _ -> "an int64 scalar"
+  | Float32 _ -> "a float32 scalar"
+  | Float64 _ -> "a float64 scalar"
+
+let check_launch_args ~(kernel : string) (ir : Sarek_ir_types.kernel)
+    (args : vector_arg list) : unit =
+  let params = Array.of_list ir.Sarek_ir_types.kern_params in
+  let n_params = Array.length params and n_args = List.length args in
+  (* 1. Arity, unconditionally and first. *)
+  if n_params <> n_args then
+    Execute_error.raise_error
+      (Type_mismatch
+         {
+           expected = Printf.sprintf "%d argument(s)" n_params;
+           actual = Printf.sprintf "%d" n_args;
+           context =
+             Printf.sprintf
+               "kernel %S: the launch builds its device argument array from \
+                the SUPPLIED count while the driver reads the COMPILED \
+                parameter count, so a mismatch is unsafe, not merely wrong"
+               kernel;
+         }) ;
+  (* 2. Per position: shape, then element type or physical width. *)
+  List.iteri
+    (fun i arg ->
+      let mismatch ~expected ~actual ~why =
+        let pname =
+          match params.(i) with
+          | Sarek_ir_types.DParam (pv, _) -> pv.Sarek_ir_types.var_name
+          | _ -> "?"
+        in
+        Execute_error.raise_error
+          (Type_mismatch
+             {
+               expected;
+               actual;
+               context =
+                 Printf.sprintf
+                   "kernel %S argument %d (parameter %S): %s"
+                   kernel
+                   i
+                   pname
+                   why;
+             })
+      in
+      match (arg, params.(i)) with
+      | Vec v, Sarek_ir_types.DParam (_, Some info) -> (
+          let want = info.Sarek_ir_types.arr_elttype in
+          match ir_elttype_of_vector_kind (Vector.kind v) with
+          | Some got ->
+              if got <> want then
+                mismatch
+                  ~expected:(elttype_label want ^ " vector")
+                  ~actual:(elttype_label got ^ " vector")
+                  ~why:
+                    "the element types differ, so the device would read the \
+                     buffer at the wrong stride or interpret its bits as the \
+                     wrong type"
+          | None -> (
+              if
+                (* No IR constructor for this kind. Compare the physical element
+                 widths instead of passing silently. *)
+                not (is_custom_kind (Vector.kind v))
+              then
+                let got_w = Vector.elem_size (Vector.kind v) in
+                match ir_scalar_width want with
+                | None ->
+                    (* [want] has no scalar width, i.e. it is an AGGREGATE
+                       (record/variant/array). We are already inside the
+                       non-[Custom] branch, so the supplied vector holds plain
+                       scalars: there is no layout under which a Char or
+                       Complex32 buffer is a valid record/variant buffer. This
+                       used to fall through to [()], which made the width
+                       fallback silently inapplicable exactly where the shapes
+                       are most different. *)
+                    mismatch
+                      ~expected:(elttype_label want ^ " vector")
+                      ~actual:
+                        (Printf.sprintf
+                           "a scalar vector (%d-byte elements)"
+                           got_w)
+                      ~why:
+                        "the kernel declares an aggregate element type, which \
+                         a scalar vector cannot supply at any width"
+                | Some want_w ->
+                    if got_w <> want_w then
+                      mismatch
+                        ~expected:
+                          (Printf.sprintf
+                             "%s vector (%d-byte elements)"
+                             (elttype_label want)
+                             want_w)
+                        ~actual:(Printf.sprintf "%d-byte elements" got_w)
+                        ~why:
+                          "the host element width does not match the width the \
+                           kernel accesses the buffer with"))
+      | Vec _, Sarek_ir_types.DParam (_, None) ->
+          mismatch
+            ~expected:"a scalar"
+            ~actual:"a vector"
+            ~why:"the kernel declares a scalar parameter here"
+      | ( ((Int _ | Int32 _ | Int64 _ | Float32 _ | Float64 _) as a),
+          Sarek_ir_types.DParam (_, Some _) ) ->
+          mismatch
+            ~expected:"a vector"
+            ~actual:(arg_label a)
+            ~why:"the kernel declares a vector parameter here"
+      | ( ((Int _ | Int32 _ | Int64 _ | Float32 _ | Float64 _) as a),
+          Sarek_ir_types.DParam (pv, None) ) -> (
+          (* Scalar against scalar. This is the SAME hazard as the vector arm,
+             not a lesser one: the host tag fixes how wide a slot the launch
+             writes, the driver reads the COMPILED parameter's width, and a
+             narrower host tag against a wider compiled parameter makes the
+             driver read past the value it was given. Leaving this to the
+             catch-all meant scalars had no type check at all. *)
+          let want = pv.Sarek_ir_types.var_type in
+          match ir_elttype_of_scalar_arg a with
+          | None -> ()
+          | Some got -> (
+              match want with
+              | Sarek_ir_types.TInt32 | Sarek_ir_types.TInt64
+              | Sarek_ir_types.TFloat32 | Sarek_ir_types.TFloat64 ->
+                  (* The four types the host can name exactly: compare
+                     exactly, so int-vs-float confusion at equal width is
+                     caught too, matching the vector arm's discipline. *)
+                  if got <> want then
+                    mismatch
+                      ~expected:(elttype_label want ^ " scalar")
+                      ~actual:(elttype_label got ^ " scalar")
+                      ~why:
+                        "the host tags the argument slot with a different type \
+                         than the kernel declares, so the driver reads the \
+                         slot at the wrong width or interprets its bits as the \
+                         wrong type"
+              | _ -> (
+                  (* Not one of the four: [TBool]/[TUnit] share the 32-bit slot
+                     with [TInt32] and are legitimately reached through [Int],
+                     so an exact comparison would reject correct launches.
+                     Fall back to the physical width, which is the property the
+                     driver actually depends on. Aggregates have no scalar
+                     width; they are left alone here rather than guessed at,
+                     the same deliberate conservatism the [Custom] vector case
+                     gets. *)
+                  match (ir_scalar_width got, ir_scalar_width want) with
+                  | Some got_w, Some want_w when got_w <> want_w ->
+                      mismatch
+                        ~expected:
+                          (Printf.sprintf
+                             "%s scalar (%d-byte slot)"
+                             (elttype_label want)
+                             want_w)
+                        ~actual:
+                          (Printf.sprintf
+                             "%s scalar (%d-byte slot)"
+                             (elttype_label got)
+                             got_w)
+                        ~why:
+                          "the host writes a differently-sized argument slot \
+                           than the driver reads"
+                  | _ -> ())))
+      | Vec _, _
+      | Int _, _
+      | Int32 _, _
+      | Int64 _, _
+      | Float32 _, _
+      | Float64 _, _ ->
+          (* Remaining shapes are non-[DParam] declarations (locals/shared),
+             which are not launch arguments. *)
+          ())
+    args
+
+(** Render a non-permitting verdict and raise it as a [Backend_error].
+
+    Shared by {!check_device_capabilities} and {!check_interpreter_capabilities}
+    so the two launch gates cannot drift into describing the same refusal
+    differently — which is a real hazard here, since backlog-154 was two gates
+    disagreeing about the same kernel. *)
+let raise_capability_refusal ~(backend : string) ~(target : string)
+    (verdict : Sarek_capability.verdict) : 'a =
+  let message =
+    match verdict with
+    | Sarek_capability.Unavailable cap -> Sarek_capability.explain ~target cap
+    | Sarek_capability.Unknown why -> Printf.sprintf "%s: %s" target why
+    | Sarek_capability.Available ->
+        (* [first_refusal] returns only non-permitting verdicts. *)
+        assert false
+  in
+  Execute_error.raise_error (Backend_error {backend; message})
+
+(** Refuse a launch whose kernel needs a wide element type the target device
+    does not provide (#142).
+
+    WHY THIS IS A LAUNCH GATE AND NOT A CODEGEN REFUSAL. These are
+    {!Sarek_capability.Device_optional} capabilities:
+    [kind_needs_device Device_optional = true], and
+    [Framework_sig.generate_source] takes no device, so codegen is structurally
+    the wrong place to ask. The device is first in scope here, next to
+    {!check_launch_args}.
+
+    WHAT IT REPLACES. Nothing — that is the defect. Before #142 an int64 kernel
+    on Vulkan reached [vkCreateShaderModule] with SPIR-V declaring
+    [OpCapability Int64] and no [shaderInt64] enabled on the logical device. On
+    an RX 7900 XTX (RADV, Mesa 26.1.4-arch3.1) that is not a crash and not a
+    wrong answer: results are correct and the violation is visible only under
+    VK_LAYER_KHRONOS_validation (VUID-VkShaderModuleCreateInfo-pCode-08740).
+    Silent undefined behaviour on the driver that happens to cope is exactly the
+    failure mode a capability model exists to convert into a diagnostic.
+
+    Routed through {!Sarek_capability.permits} rather than a membership test so
+    an {!Sarek_capability.Unknown} verdict refuses instead of falling through to
+    permitted. *)
+let check_device_capabilities ~(device : Device.t) (ir : Sarek_ir_types.kernel)
+    : unit =
+  let provided =
+    Some device.Device.capabilities.Framework_sig.device_features
+  in
+  (* Deliberately NOT [all_features]. [Float16] is governed by the existing
+     codegen-time refusals (Toolchain_semantic + Policy — the measured ACO
+     narrowing), and nothing probes shaderFloat16 or CUDA sm_53 yet, so no
+     backend can honestly claim f16 in [device_features]. Gating on it here
+     would refuse every working f16 kernel on Native, Interpreter, CUDA and HIP
+     on the strength of a probe that was never written — a refusal with no
+     evidence behind it, which is the mirror image of the #142 defect rather
+     than a fix for it. Widening this list is the work that must come WITH the
+     f16 probe, not before it. *)
+  let gated = [Sarek_ir_analysis.Float64; Sarek_ir_analysis.Int64] in
+  let required =
+    List.filter (fun f -> Sarek_ir_analysis.kernel_uses f ir) gated
+  in
+  (* backlog-62 slice 3. Cooperative matrices are gated HERE and not in
+     [gated] above, because they are not a [device_features] flag: they are
+     decided per CONFIGURATION. The same RX 7900 XTX that permits
+     [u8 x u8 + s32 -> s32] refuses [f16 x f16 -> f16 saturating], so a boolean
+     "this device has coopmat" would be [Available] for a request the device
+     cannot run — which is the #142 defect in a new place.
+
+     WHY IT IS WIDENED NOW AND WAS NOT AT SLICE 2. Gating at slice 2 would have
+     been a refusal with nothing to refuse: no kernel could reach a
+     cooperative-matrix instruction, so the branch was unreachable and an
+     unreachable gate is not a gate. After this slice a kernel CAN require one.
+
+     [capabilities.coopmat = None] means the backend never probed, which
+     {!Sarek_coopmat.verdict} turns into [Unknown] and
+     {!Sarek_capability.permits} refuses. That is the safe direction and it is
+     load-bearing: every backend other than Vulkan leaves it [None], so a
+     coopmat kernel aimed at CUDA is refused here by the capability model even
+     before the CUDA backend's own codegen refusal — and the diagnostic names
+     the device rather than the emitter. *)
+  let coopmat_verdicts =
+    List.map
+      (Sarek_coopmat.verdict
+         ~support:device.Device.capabilities.Framework_sig.coopmat)
+      (Sarek_ir_analysis.kernel_coopmat_configs ir)
+  in
+  match
+    Sarek_capability.first_refusal
+      (List.map (Sarek_capability.device_verdict ~provided) required
+      @ coopmat_verdicts)
+  with
+  | None -> ()
+  | Some verdict ->
+      raise_capability_refusal
+        ~backend:device.Device.framework
+        ~target:device.Device.name
+        verdict
+
+(** The launch gate for {!run_interpreter_vectors} (backlog-154).
+
+    [run_interpreter_vectors] applied {!check_launch_args} and NOT
+    {!check_device_capabilities}, so the interpreter — the cross-backend numeric
+    oracle — was the one execution path with no capability gate on it. The
+    asymmetry was observable: in one run of [test_coopmat_integer_e2e] on this
+    workstation, [check_device_capabilities] printed
+    [launch gate refuses on CPU Interpreter (Sequential)] for the same kernel
+    [run_interpreter_vectors] then evaluated to 65536 bit-exact results.
+
+    Note what could NOT be done about that: calling {!check_device_capabilities}
+    here. It needs a [Device.t], this entry point has none by design, and — the
+    substantive half — the interpreter's [Framework_sig.capabilities] says
+    [coopmat = None], which means "not probed", which refuses. Wiring the device
+    gate in would have taken the oracle offline rather than closed a hole. The
+    bypass was load-bearing, which is why the fix is a capability answer for the
+    interpreter and not a call to someone else's.
+
+    {!Sarek_interp_capability} is that answer, and it lives beside the evaluator
+    that justifies it. See its interface for the argument about what an
+    interpreter should advertise. *)
+let check_interpreter_capabilities (ir : Sarek_ir_types.kernel) : unit =
+  match Sarek_interp_capability.first_refusal ir with
+  | None -> ()
+  | Some verdict ->
+      raise_capability_refusal
+        ~backend:"Interpreter"
+        ~target:"CPU Interpreter"
+        verdict
+
 (** Execute a kernel on a device using the unified dispatch mechanism.
 
     @param device Target device
@@ -298,6 +702,11 @@ let run ~(device : Device.t) ~(name : string)
           | None -> Execute_error.raise_error (Missing_ir {kernel = name})
           | Some ir_lazy -> (
               let ir = Lazy.force ir_lazy in
+              check_launch_args ~kernel:name ir args ;
+              (* Before generate_source, so the diagnostic names the missing
+                 device capability rather than letting the backend emit a
+                 shader the device cannot legally load. *)
+              check_device_capabilities ~device ir ;
               match B.generate_source ~block ir with
               | None ->
                   Execute_error.raise_error
@@ -340,15 +749,19 @@ let run ~(device : Device.t) ~(name : string)
           (* Direct path: call native function or interpret IR *)
           let dev = B.Device.get device.backend_id in
           B.Device.set_current dev ;
-          let exec_args = vector_args_to_exec_array args in
           let ir_val = Option.map Lazy.force ir in
+          Option.iter (fun ir -> check_launch_args ~kernel:name ir args) ir_val ;
+          Option.iter (fun ir -> check_device_capabilities ~device ir) ir_val ;
+          let exec_args = vector_args_to_exec_array args in
           B.execute_direct ~native_fn ~ir:ir_val ~block ~grid exec_args
       | Framework_sig.Custom ->
           (* Custom path: delegate to backend with IR *)
           let dev = B.Device.get device.backend_id in
           B.Device.set_current dev ;
-          let exec_args = vector_args_to_exec_array args in
           let ir_val = Option.map Lazy.force ir in
+          Option.iter (fun ir -> check_launch_args ~kernel:name ir args) ir_val ;
+          Option.iter (fun ir -> check_device_capabilities ~device ir) ir_val ;
+          let exec_args = vector_args_to_exec_array args in
           B.execute_direct ~native_fn ~ir:ir_val ~block ~grid exec_args)
 
 (** {1 V2 Vector Execution Helpers} *)
@@ -408,6 +821,9 @@ let vector_to_interp_array : type a b.
       Array.init len (fun i -> Sarek_ir_interp.VInt32 (Vector.get vec i))
   | Vector.Scalar Vector.Int64 ->
       Array.init len (fun i -> Sarek_ir_interp.VInt64 (Vector.get vec i))
+  | Vector.Scalar Vector.Float16 ->
+      (* See the Float16 arm of [get] above: f16 reads as an f32 value. *)
+      Array.init len (fun i -> Sarek_ir_interp.VFloat32 (Vector.get vec i))
   | Vector.Scalar Vector.Float32 ->
       Array.init len (fun i -> Sarek_ir_interp.VFloat32 (Vector.get vec i))
   | Vector.Scalar Vector.Float64 ->
@@ -451,6 +867,11 @@ let interp_array_to_vector : type a b.
   | Vector.Scalar Vector.Int64 ->
       for i = 0 to len - 1 do
         Vector.set vec i (Sarek_ir_interp.to_int64 arr.(i))
+      done
+  | Vector.Scalar Vector.Float16 ->
+      (* Round-on-store: the Bigarray.Float16 cell narrows to binary16. *)
+      for i = 0 to len - 1 do
+        Vector.set vec i (Sarek_ir_interp.to_float32 arr.(i))
       done
   | Vector.Scalar Vector.Float32 ->
       for i = 0 to len - 1 do
@@ -499,6 +920,25 @@ let interp_array_to_vector : type a b.
 let run_interpreter_vectors ~(ir : Sarek_ir_types.kernel)
     ~(args : vector_arg list) ~(block : Framework_sig.dims)
     ~(grid : Framework_sig.dims) ~(parallel : bool) : unit =
+  (* The SAME launch-time check the three {!run} dispatch paths apply. This
+     entry point used to skip it, which was the worst place to skip it: the
+     interpreter is the ORACLE the GPU backends are checked against, so an
+     unchecked mismatch here does not just produce a wrong answer, it produces a
+     wrong answer that the f16 agreement gates then compare the GPU to.
+
+     Concretely, without this an f32 vector passed to an f16-declared kernel
+     ran to completion: [vector_to_interp_array] yields [VFloat32] from the f32
+     host vector and [interp_array_to_vector] dispatches on the HOST vector's
+     kind, so the writeback never narrows and the interpreter silently returns
+     f32-precision results. The positional zip below would also have quietly
+     renamed or dropped arguments on an arity mismatch (it falls back to
+     "param%d") instead of reporting it. *)
+  check_launch_args ~kernel:ir.Sarek_ir_types.kern_name ir args ;
+  (* The capability half of the same discipline (backlog-154). Placed next to
+     check_launch_args because the two together are what the three [run]
+     dispatch paths apply, and this entry point had only the first. See
+     {!check_interpreter_capabilities}. *)
+  check_interpreter_capabilities ir ;
   (* Set interpreter parallel mode *)
   Sarek_ir_interp.parallel_mode := parallel ;
   (* Convert vector args to interpreter format, tracking arrays for writeback *)

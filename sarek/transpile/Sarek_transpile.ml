@@ -209,6 +209,8 @@ let dummy_loc =
       loc_col = 0;
       loc_end_line = 1;
       loc_end_col = 0;
+      loc_bol = 0;
+      loc_end_bol = 0;
     }
 
 open Sarek_codegen
@@ -250,6 +252,8 @@ let loc_of_lexing (p : Lexing.position) : Sarek_ast.loc =
       loc_col = p.pos_cnum - p.pos_bol;
       loc_end_line = p.pos_lnum;
       loc_end_col = p.pos_cnum - p.pos_bol;
+      loc_bol = p.pos_bol;
+      loc_end_bol = p.pos_bol;
     }
 
 (** Run the shared parse→native-check→type→convergence→mono→tailrec→lower
@@ -296,10 +300,7 @@ let run_pipeline (src : string) : (Sarek_ir_ppx.kernel, error) result =
                       try
                         let mono = Sarek_mono.monomorphize tkernel in
                         let tr = Sarek_tailrec.transform_kernel mono in
-                        let ir_kernel, _warnings =
-                          Sarek_lower_ir.lower_kernel tr
-                        in
-                        Ok ir_kernel
+                        Ok (Sarek_lower_ir.lower_kernel tr)
                       with exn ->
                         Error (Internal_error (Printexc.to_string exn)))))))
 

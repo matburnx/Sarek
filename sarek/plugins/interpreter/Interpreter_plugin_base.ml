@@ -216,7 +216,18 @@ end = struct
         shared_mem_per_block = 1024 * 1024;
         total_global_mem = Int64.of_int (16 * 1024 * 1024 * 1024);
         compute_capability = (0, 0);
-        supports_fp64 = true;
+        (* Read from the evaluator's own declaration rather than restated here
+           (backlog-154). It said [Float64; Int64], omitting the [Float16] that
+           Sarek_float16 implements and that interp_array_to_vector rounds
+           through a Bigarray.Float16 cell on writeback — an under-claim that
+           was harmless only because check_device_capabilities excludes Float16
+           from its gated list, for an unrelated reason. Sharing the list is
+           what stops a declaration and its evaluator drifting again. *)
+        device_features = Sarek_interp.Sarek_interp_capability.device_features;
+        (* backlog-62: no cooperative-matrix probe on this backend. [None] is
+           "not probed", which Sarek_coopmat.verdict maps to Unknown and therefore
+           refuses; an empty list would be a positive claim nobody measured. *)
+        coopmat = None;
         supports_atomics = true;
         warp_size = (if d.parallel then 32 else 1);
         max_registers_per_block = 0;
@@ -266,6 +277,13 @@ end = struct
      fun device size kind ->
       let arr = Bigarray.Array1.create kind Bigarray.c_layout size in
       match kind with
+      | Bigarray.Float16 ->
+          {
+            storage = Bigarray_storage arr;
+            kind = Scalar_kind Spoc_core.Vector_types.Float16;
+            size;
+            device;
+          }
       | Bigarray.Float32 ->
           {
             storage = Bigarray_storage arr;
@@ -332,6 +350,10 @@ end = struct
               Interpreter_error.(
                 raise_error (feature_not_supported "custom type set accessor")));
           name = "custom";
+          (* Placeholder descriptor: [alloc_custom] is given only [elem_size],
+             no element type, and its accessors raise. There is no field list
+             to state. *)
+          ir_fields = None;
         }
       in
       {
@@ -349,6 +371,14 @@ end = struct
      fun device ba kind ->
       let size = Bigarray.Array1.dim ba in
       match kind with
+      | Bigarray.Float16 ->
+          Some
+            {
+              storage = Bigarray_storage ba;
+              kind = Scalar_kind Spoc_core.Vector_types.Float16;
+              size;
+              device;
+            }
       | Bigarray.Float32 ->
           Some
             {
@@ -488,8 +518,7 @@ end = struct
      fun buf ->
       match buf.storage with
       | Bigarray_storage arr ->
-          let ptr = Ctypes.bigarray_start Ctypes.array1 arr in
-          Ctypes.to_voidp ptr |> Ctypes.raw_address_of_ptr
+          Ctypes.raw_address_of_ptr (Spoc_core.Memory.bigarray_void_ptr arr)
       | Ctypes_storage ptr -> Ctypes.raw_address_of_ptr ptr
   end
 
@@ -535,9 +564,14 @@ end = struct
 
     let set_arg_buffer : type a. args -> int -> a Memory.buffer -> unit =
      fun args idx buf ->
+      (* Float16 is admitted here because [Memory.alloc] /
+         [alloc_zero_copy] admit it: a kind that can be allocated but not
+         bound is an API inconsistency, and the omission was silent rather
+         than diagnosed. *)
       (match (buf.Memory.kind, buf.Memory.storage) with
       | Memory.Scalar_kind Spoc_core.Vector_types.Int32, Bigarray_storage _
       | Memory.Scalar_kind Spoc_core.Vector_types.Int64, Bigarray_storage _
+      | Memory.Scalar_kind Spoc_core.Vector_types.Float16, Bigarray_storage _
       | Memory.Scalar_kind Spoc_core.Vector_types.Float32, Bigarray_storage _
       | Memory.Scalar_kind Spoc_core.Vector_types.Float64, Bigarray_storage _ ->
           ()
@@ -584,6 +618,18 @@ end = struct
               Typed_value.TV_Scalar
                 (Typed_value.SV
                    ((module Typed_value.Int64_type), Bigarray.Array1.get ba i))
+          | ( Memory.Scalar_kind Spoc_core.Vector_types.Float16,
+              Bigarray_storage ba ) ->
+              (* f16 is a STORAGE type: there is deliberately no Float16
+                 scalar in Typed_value. The Bigarray.Float16 cell rounds to
+                 binary16 on store and hands the rounded value back on load,
+                 so the element enters as an f32 scalar. Same "reuse the f32
+                 accessor, let the storage kind do the rounding" decision
+                 that Sarek_ir_interp.vector_to_array already makes for f16
+                 VECTORS -- keeping the two paths on one rule, not two. *)
+              Typed_value.TV_Scalar
+                (Typed_value.SV
+                   ((module Typed_value.Float32_type), Bigarray.Array1.get ba i))
           | ( Memory.Scalar_kind Spoc_core.Vector_types.Float32,
               Bigarray_storage ba ) ->
               Typed_value.TV_Scalar
@@ -619,6 +665,17 @@ end = struct
                   Interpreter_error.(
                     raise_error
                       (feature_not_supported "int64 buffer set conversion")))
+          | ( Typed_value.TV_Scalar (Typed_value.SV ((module S), x)),
+              Memory.Scalar_kind Spoc_core.Vector_types.Float16,
+              Bigarray_storage ba ) -> (
+              (* The narrowing to binary16 happens in the Bigarray cell, not
+                 here -- see the matching note on [get]. *)
+              match S.to_primitive x with
+              | Typed_value.PFloat f -> Bigarray.Array1.set ba i f
+              | _ ->
+                  Interpreter_error.(
+                    raise_error
+                      (feature_not_supported "float16 buffer set conversion")))
           | ( Typed_value.TV_Scalar (Typed_value.SV ((module S), x)),
               Memory.Scalar_kind Spoc_core.Vector_types.Float32,
               Bigarray_storage ba ) -> (
@@ -700,7 +757,12 @@ end = struct
                  kernel.name
                  (Printf.sprintf "kernel '%s' not registered" kernel.name)))
 
-    let clear_cache () = Hashtbl.clear interpreter_kernels
+    (* Wrapped like every other backend's clear (see Cache_hooks.mli): no
+       driver handle to dangle here, but the outer memos close over these
+       closures and must be dropped with them. *)
+    let clear_cache () =
+      Spoc_framework.Cache_hooks.around_clear (fun () ->
+          Hashtbl.clear interpreter_kernels)
 
     let load_from_ptx ~name:_ ~ptx:_ =
       failwith "PTX kernels not supported by Interpreter backend"
